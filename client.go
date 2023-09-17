@@ -10,22 +10,22 @@ import (
 
 
 
-func startClient(file *os.File, serverAddress string, skipIdx uint32, blockSize uint32) {
+func startClient(file *os.File, serverAddress string, skipIdx uint32, blockSize uint32, noCompress bool) {
   fmt.Println("- startClient()")
   magicBytes := stringToFixedSizeArray(magicHead)
 
   saddr, err := net.ResolveTCPAddr("tcp", serverAddress)
-	if err != nil {
+  if err != nil {
     fmt.Println("Error resolving:", err.Error())
     return
-	}
+  }
 
   conn := NewAutoReconnectTCP(saddr)
   defer conn.Close()
 
   var blockIdx uint32 = skipIdx
   var fileSize uint64 = 0
-  
+
   buf := make([]byte, blockSize)
 
   fileSize = getDeviceSize(file)
@@ -37,10 +37,15 @@ func startClient(file *os.File, serverAddress string, skipIdx uint32, blockSize 
     fmt.Println("- block", blockIdx, "/", lastBlockNum)
 
     if debug { fmt.Println("\t- send to server blockIdx") }
-    msg, err1 := pack(&Msg{ MagicHead: magicBytes, BlockIdx: blockIdx, BlockSize: blockSize, FileSize: fileSize, DataSize: 0, Compressed: false, })
-    if err1 != nil {
-      fmt.Println("\t- cant pack msg->", err1)
-    }
+    msg, err1 := pack(&Msg{ 
+      MagicHead: magicBytes,
+      BlockIdx: blockIdx,
+      BlockSize: blockSize,
+      FileSize: fileSize,
+      DataSize: 0,
+      Compressed: false,
+    })
+    if err1 != nil { fmt.Println("\t- cant pack msg->", err1) }
     if debug { fmt.Println("\t- sending packed msg->", msg, len(msg)) }
 
     // read file block 1M
@@ -75,62 +80,17 @@ func startClient(file *os.File, serverAddress string, skipIdx uint32, blockSize 
     } else {
       // fmt.Println("\t- hash differs -> compress block, orig", readedBytes)
 
-      lzmaBuf, err := compressData(buf[:readedBytes])
-      if err != nil {
-        fmt.Println("\t- error compressing data:", err)
-        return
-      }
-
-      lzmaBytes := uint32(len(lzmaBuf))
-
-      if lzmaBytes < blockSize {
-        // fmt.Println("\t\t- send to server compressed bytes", lzmaBytes, "(<", blockSize, ")")
-        m := &Msg{
-          MagicHead: magicBytes,
-          BlockIdx: blockIdx,
-          BlockSize: blockSize,
-          FileSize: fileSize,
-          DataSize: lzmaBytes,
-          Compressed: true,
-        }
-        msg, err1 := pack(m)
-        if err1 != nil {
-          fmt.Println("\t- cant pack msg->", err)
-        }
-
-        n, err2 := conn.Write(msg) // writeConn(conn, b)
-        if err2 != nil && err2 != io.EOF {
-          fmt.Println("\t- error writing net:", n, err2.Error())
-          break
-        }
-
-        // fmt.Println("\t\t- send to server full block")
-        n, err3 := conn.Write(lzmaBuf) // writeConn(conn, b)
-        if err3 != nil && err3 != io.EOF {
-          fmt.Println("\t- error writing net:", n, err3.Error())
-          break
-        }
-      } else {
-        // fmt.Println("\t\t- send to server non-compressed bytes", readedBytes)
-
-        m := &Msg{
+      if noCompress {
+        msg, err1 := pack(&Msg{
           MagicHead: magicBytes,
           BlockIdx: blockIdx,
           BlockSize: blockSize,
           FileSize: fileSize,
           DataSize: uint32(readedBytes),
           Compressed: false,
-        }
-        msg, err1 := pack(m)
-        if err1 != nil {
-          fmt.Println("\t- cant pack msg->", err)
-        }
-        /*
-        b := make([]byte, 16)
-        binary.LittleEndian.PutUint32(b[0:], uint32(readedBytes))
-        binary.LittleEndian.PutUint32(b[4:], blockIdx)
-        binary.LittleEndian.PutUint64(b[8:], fileSize)
-        */
+        })
+        if err1 != nil { fmt.Println("\t- cant pack msg->", err) }
+
         n, err2 := conn.Write(msg) // writeConn(conn, b)
         if err2 != nil && err2 != io.EOF {
           fmt.Println("\t- error writing net:", n, err2.Error())
@@ -141,6 +101,65 @@ func startClient(file *os.File, serverAddress string, skipIdx uint32, blockSize 
         if err3 != nil && err3 != io.EOF {
           fmt.Println("\t- error writing net:", n, err3.Error())
           break
+        }
+
+      } else {
+        compBuf, err := compressData(buf[:readedBytes])
+        if err != nil {
+          fmt.Println("\t- error compressing data:", err)
+          return
+        }
+
+        compressedBytes := uint32(len(compBuf))
+
+        if compressedBytes < blockSize {
+          // fmt.Println("\t\t- send to server compressed bytes", compressedBytes, "(<", blockSize, ")")
+          msg, err1 := pack(&Msg{
+            MagicHead: magicBytes,
+            BlockIdx: blockIdx,
+            BlockSize: blockSize,
+            FileSize: fileSize,
+            DataSize: compressedBytes,
+            Compressed: true,
+          })
+          if err1 != nil { fmt.Println("\t- cant pack msg->", err) }
+
+          n, err2 := conn.Write(msg) // writeConn(conn, b)
+          if err2 != nil && err2 != io.EOF {
+            fmt.Println("\t- error writing net:", n, err2.Error())
+            break
+          }
+
+          // fmt.Println("\t\t- send to server full block")
+          n, err3 := conn.Write(compBuf) // writeConn(conn, b)
+          if err3 != nil && err3 != io.EOF {
+            fmt.Println("\t- error writing net:", n, err3.Error())
+            break
+          }
+        } else {
+          // fmt.Println("\t\t- send to server non-compressed bytes", readedBytes)
+
+          msg, err1 := pack(&Msg{
+            MagicHead: magicBytes,
+            BlockIdx: blockIdx,
+            BlockSize: blockSize,
+            FileSize: fileSize,
+            DataSize: uint32(readedBytes),
+            Compressed: false,
+          })
+          if err1 != nil { fmt.Println("\t- cant pack msg->", err) }
+
+          n, err2 := conn.Write(msg) // writeConn(conn, b)
+          if err2 != nil && err2 != io.EOF {
+            fmt.Println("\t- error writing net:", n, err2.Error())
+            break
+          }
+
+          n, err3 := conn.Write(buf[:readedBytes]) // writeConn(conn, b)
+          if err3 != nil && err3 != io.EOF {
+            fmt.Println("\t- error writing net:", n, err3.Error())
+            break
+          }
         }
 
       }

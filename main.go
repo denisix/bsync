@@ -17,12 +17,14 @@ func main() {
   var bSize uint
   var skipIdx uint
   var port string
+  var noCompress bool
 
   flag.StringVar(&device, "f", "/dev/zero", "specify file or device, i.e. '/dev/vda'")
   flag.StringVar(&remoteAddr, "r", "", "specify remote address of server")
   flag.UintVar(&bSize, "b", uint(blockSize), "block size, default 100M")
   flag.UintVar(&skipIdx, "s", 0, "skip blocks, default 0")
   flag.StringVar(&port, "p", "8080", "bind to port, default 8080")
+  flag.BoolVar(&noCompress, "n", false, "do not compress blocks (by default compress)")
 
   flag.Parse()  // after declaring flags we need to call it
 
@@ -39,7 +41,7 @@ func main() {
     }
     defer file.Close()
 
-    startClient(file, remoteAddr, uint32(skipIdx), blockSize)
+    startClient(file, remoteAddr, uint32(skipIdx), blockSize, noCompress)
 
   } else {
     // SERVER: destination file
