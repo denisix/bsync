@@ -1,5 +1,5 @@
 # bsync
-Block sync between two server's devices
+Transfer data between two block devices (or files) between servers, block by block: each block is compared by a checksum and transmitted with compression if they differ.
 
 ### Usage
 To compile the program just issue:
