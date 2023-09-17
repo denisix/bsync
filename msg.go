@@ -10,6 +10,7 @@ const magicHead = "blockSync-ver0.01"
 type Msg struct {
   MagicHead [magicLen]byte
   BlockIdx  uint32
+  BlockSize uint32
   FileSize  uint64
   DataSize  uint32
   Compressed bool

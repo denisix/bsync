@@ -1,26 +1,52 @@
 package main
 
 import (
-  "github.com/pierrec/lz4"
+  "sync"
+  "github.com/klauspost/compress/zstd"
 )
 
-func compressData(data []byte) ([]byte, error) {
-  buf := make([]byte, lz4.CompressBlockBound(len(data)))
+var (
+	encoder *zstd.Encoder
+	decoder *zstd.Decoder
+	initOnce sync.Once
+)
 
-  var c lz4.Compressor
-  n, err := c.CompressBlock(data, buf)
-  if err != nil {
-    return nil, err
-  }
-  return buf[:n], nil
+func initEncoderDecoder() {
+	var err error
+	encoder, err = zstd.NewWriter(nil,
+		zstd.WithEncoderLevel(zstd.SpeedFastest),
+		//zstd.WithEncoderLevel(zstd.SpeedBestCompression),
+		zstd.WithWindowSize(1<<18), // Setting a window size of 1MB. Adjust as needed.
+	)
+	if err != nil {
+		panic(err)
+	}
+
+	decoder, err = zstd.NewReader(nil)
+	if err != nil {
+		panic(err)
+	}
+}
+
+func compressData(data []byte) ([]byte, error) {
+	initOnce.Do(initEncoderDecoder)
+
+	// Pre-allocate a buffer with the same size as the input data.
+	// This is a basic heuristic; you might want to adjust based on your data characteristics.
+	buffer := make([]byte, 0, len(data))
+
+	return encoder.EncodeAll(data, buffer), nil
 }
 
 func decompressData(data []byte) ([]byte, error) {
-  out := make([]byte, blockSize)
-  n, err := lz4.UncompressBlock(data, out)
-  if err != nil {
-    return nil, err
-  }
-  return out[:n], nil // uncompressed data
-}
+	initOnce.Do(initEncoderDecoder)
 
+	// Pre-allocate a buffer with the same size as the input data for decompression.
+	buffer := make([]byte, 0, len(data)*2) // Assuming a conservative 2:1 compression ratio.
+
+	decompressed, err := decoder.DecodeAll(data, buffer)
+	if err != nil {
+		return nil, err
+	}
+	return decompressed, nil
+}

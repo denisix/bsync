@@ -6,11 +6,11 @@ import (
   "os"
   "net"
   "bytes"
-  "crypto/md5"
 )
 
 
-func startClient(file *os.File, serverAddress string, skipIdx uint32) {
+
+func startClient(file *os.File, serverAddress string, skipIdx uint32, blockSize uint32) {
   fmt.Println("- startClient()")
   magicBytes := stringToFixedSizeArray(magicHead)
 
@@ -34,10 +34,10 @@ func startClient(file *os.File, serverAddress string, skipIdx uint32) {
   fmt.Printf("- source size: %d bytes, block %d bytes, blockNum: %d\n", fileSize, blockSize, lastBlockNum)
 
   for {
-    fmt.Println("- block", blockIdx, " / ", lastBlockNum)
+    fmt.Println("- block", blockIdx, "/", lastBlockNum)
 
     if debug { fmt.Println("\t- send to server blockIdx") }
-    msg, err1 := pack(&Msg{ MagicHead: magicBytes, BlockIdx: blockIdx, FileSize: fileSize, DataSize: 0, Compressed: false, })
+    msg, err1 := pack(&Msg{ MagicHead: magicBytes, BlockIdx: blockIdx, BlockSize: blockSize, FileSize: fileSize, DataSize: 0, Compressed: false, })
     if err1 != nil {
       fmt.Println("\t- cant pack msg->", err1)
     }
@@ -58,11 +58,11 @@ func startClient(file *os.File, serverAddress string, skipIdx uint32) {
       break
     }
 
-    hash := md5.Sum(buf[:readedBytes])
+    hash := checksum(buf[:readedBytes])
     if debug { fmt.Println("\t- calc local hash ->", hash) }
 
     // buffer to get data
-    serverHash := make([]byte, 16)
+    serverHash := make([]byte, len(hash))
     _, err = conn.Read(serverHash)
     if err != nil {
       println("\t- read data from net failed:", err.Error())
@@ -88,6 +88,7 @@ func startClient(file *os.File, serverAddress string, skipIdx uint32) {
         m := &Msg{
           MagicHead: magicBytes,
           BlockIdx: blockIdx,
+          BlockSize: blockSize,
           FileSize: fileSize,
           DataSize: lzmaBytes,
           Compressed: true,
@@ -115,6 +116,7 @@ func startClient(file *os.File, serverAddress string, skipIdx uint32) {
         m := &Msg{
           MagicHead: magicBytes,
           BlockIdx: blockIdx,
+          BlockSize: blockSize,
           FileSize: fileSize,
           DataSize: uint32(readedBytes),
           Compressed: false,
@@ -145,7 +147,12 @@ func startClient(file *os.File, serverAddress string, skipIdx uint32) {
 
     }
 
-    // time.Sleep(1 * time.Second)
+    if blockIdx > lastBlockNum {
+      fmt.Println("- transfer done, exiting..")
+      os.Exit(0)
+    }
+
     blockIdx++
+
   }
 }
