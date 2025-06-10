@@ -9,7 +9,7 @@ import (
   "time"
 )
 
-func serverHandleReq(conn net.Conn, file *os.File) {
+func serverHandleReq(conn net.Conn, file *os.File, checksumCache *ChecksumCache) {
   fmt.Println("- serverHandleReq()")
   defer conn.Close()
   magicBytes := stringToFixedSizeArray(magicHead)
@@ -33,7 +33,9 @@ func serverHandleReq(conn net.Conn, file *os.File) {
     _, err1 := io.ReadFull(c, msgBuf)
     if err1 != nil {
       fmt.Println("\t- connection closed:", err1)
-      break
+			os.Exit(0)
+			return
+      // break
     }
 
     msg, err2 := unpack(msgBuf)
@@ -85,7 +87,7 @@ func serverHandleReq(conn net.Conn, file *os.File) {
     if msg.DataSize > 0 {
       fmt.Printf("- block %d/%d (%0.2f%%) [w] size=%d ratio=%0.2f %0.2f MB/s ETA=%d min\n", msg.BlockIdx, lastBlockNum, percent, msg.FileSize, compressRatio, mbs, eta)
     } else {
-      fmt.Printf("- block %d/%d (%0.2f%%) [-] size=%d ratio=%0.2f %0.2f MB/s ETA=%d min\n", msg.BlockIdx, lastBlockNum, percent, msg.FileSize, compressRatio, mbs, eta)
+      fmt.Printf("- block %d/%d (%0.2f%%) [K] size=%d ratio=%0.2f %0.2f MB/s ETA=%d min\n", msg.BlockIdx, lastBlockNum, percent, msg.FileSize, compressRatio, mbs, eta)
     }
 
     if msg.DataSize == 0 {
@@ -97,8 +99,11 @@ func serverHandleReq(conn net.Conn, file *os.File) {
         break
       }
 
-      if debug { fmt.Println("\t- calc hash", n) }
-      hash := checksum(filebuf[:n])
+      // if debug { fmt.Println("\t- calc hash", n) }
+      // hash := checksum(filebuf[:n])
+			if debug { fmt.Println("\t- wait for precomputed hash") }
+      hash := checksumCache.WaitFor(msg.BlockIdx)
+
       if debug { fmt.Println("\t- send hash", hash) }
       connWrite(conn, hash[:])
     }
@@ -109,7 +114,9 @@ func serverHandleReq(conn net.Conn, file *os.File) {
       _, err1 := io.ReadFull(c, filebuf[:msg.DataSize])
       if err1 != nil {
         fmt.Println("\t- connection closed:", err1)
-        break
+        // break
+				os.Exit(0)
+				return
       }
 
       if msg.Compressed {
@@ -146,3 +153,24 @@ func serverHandleReq(conn net.Conn, file *os.File) {
 
   }
 }
+
+func startServer(file *os.File, port string, checksumCache *ChecksumCache) {
+  portStr := ":" + port
+  listener, err := net.Listen("tcp", portStr)
+  if err != nil {
+    fmt.Println("Error listening:", err.Error())
+    return
+  }
+  defer listener.Close()
+  fmt.Println("- listening on 0.0.0.0" + portStr)
+
+  for {
+    conn, err := listener.Accept()
+    if err != nil {
+      fmt.Println("Error accepting: ", err.Error())
+      return
+    }
+    go serverHandleReq(conn, file, checksumCache)
+  }
+}
+

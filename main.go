@@ -4,7 +4,6 @@ import (
   "flag"
   "fmt"
   "os"
-  "net"
 )
 
 var debug bool = false
@@ -40,8 +39,14 @@ func main() {
       return
     }
     defer file.Close()
+	
+		fileSize := getDeviceSize(file)
+		lastBlockNum := uint32(fileSize / uint64(blockSize))
 
-    startClient(file, remoteAddr, uint32(skipIdx), blockSize, noCompress)
+		checksumCache := NewChecksumCache()
+		go precomputeChecksums(file, blockSize, lastBlockNum, checksumCache)
+
+    startClient(file, remoteAddr, uint32(skipIdx), blockSize, noCompress, checksumCache)
 
   } else {
     // SERVER: destination file
@@ -53,26 +58,12 @@ func main() {
     }
     defer file.Close()
 
-    startServer(file, port)
-  }
-}
+		fileSize := getDeviceSize(file)
+		lastBlockNum := uint32(fileSize / uint64(blockSize))
 
-func startServer(file *os.File, port string) {
-  portStr := ":" + port
-  listener, err := net.Listen("tcp", portStr)
-  if err != nil {
-    fmt.Println("Error listening:", err.Error())
-    return
-  }
-  defer listener.Close()
-  fmt.Println("- listening on 0.0.0.0" + portStr)
+		checksumCache := NewChecksumCache()
+		go precomputeChecksums(file, blockSize, lastBlockNum, checksumCache)
 
-  for {
-    conn, err := listener.Accept()
-    if err != nil {
-      fmt.Println("Error accepting: ", err.Error())
-      return
-    }
-    go serverHandleReq(conn, file)
+    startServer(file, port, checksumCache)
   }
 }

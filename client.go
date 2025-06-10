@@ -8,11 +8,9 @@ import (
   "bytes"
 )
 
-
-
-func startClient(file *os.File, serverAddress string, skipIdx uint32, blockSize uint32, noCompress bool) {
+func startClient(file *os.File, serverAddress string, skipIdx uint32, blockSize uint32, noCompress bool, checksumCache *ChecksumCache) {
   fmt.Println("- startClient()")
-  magicBytes := stringToFixedSizeArray(magicHead)
+	magicBytes := stringToFixedSizeArray(magicHead)
 
   saddr, err := net.ResolveTCPAddr("tcp", serverAddress)
   if err != nil {
@@ -23,7 +21,7 @@ func startClient(file *os.File, serverAddress string, skipIdx uint32, blockSize 
   conn := NewAutoReconnectTCP(saddr)
   defer conn.Close()
 
-  var blockIdx uint32 = skipIdx
+  // var blockIdx uint32 = skipIdx
   var fileSize uint64 = 0
 
   buf := make([]byte, blockSize)
@@ -33,8 +31,9 @@ func startClient(file *os.File, serverAddress string, skipIdx uint32, blockSize 
 
   fmt.Printf("- source size: %d bytes, block %d bytes, blockNum: %d\n", fileSize, blockSize, lastBlockNum)
 
-  for {
-    fmt.Println("- block", blockIdx, "/", lastBlockNum)
+  for blockIdx := uint32(skipIdx); blockIdx <= lastBlockNum; blockIdx++ {
+  // for {
+    // fmt.Println("- block", blockIdx, "/", lastBlockNum)
 
     if debug { fmt.Println("\t- send to server blockIdx") }
     msg, err1 := pack(&Msg{ 
@@ -63,7 +62,9 @@ func startClient(file *os.File, serverAddress string, skipIdx uint32, blockSize 
       break
     }
 
-    hash := checksum(buf[:readedBytes])
+    // hash := checksum(buf[:readedBytes])
+		hash := checksumCache.WaitFor(blockIdx)
+
     if debug { fmt.Println("\t- calc local hash ->", hash) }
 
     // buffer to get data
@@ -76,11 +77,14 @@ func startClient(file *os.File, serverAddress string, skipIdx uint32, blockSize 
     if debug { fmt.Println("\t- rcvd server hash:", serverHash) }
 
     if bytes.Equal(hash[:], serverHash) {
+    	fmt.Println("- block", blockIdx, "/", lastBlockNum, "ok")
       // fmt.Println("\t- hash equal -> skip to next")
     } else {
       // fmt.Println("\t- hash differs -> compress block, orig", readedBytes)
 
       if noCompress {
+    		fmt.Println("- block", blockIdx, "/", lastBlockNum, "sync")
+
         msg, err1 := pack(&Msg{
           MagicHead: magicBytes,
           BlockIdx: blockIdx,
@@ -113,6 +117,7 @@ func startClient(file *os.File, serverAddress string, skipIdx uint32, blockSize 
         compressedBytes := uint32(len(compBuf))
 
         if compressedBytes < blockSize {
+    			fmt.Println("- block", blockIdx, "/", lastBlockNum, "sync compress")
           // fmt.Println("\t\t- send to server compressed bytes", compressedBytes, "(<", blockSize, ")")
           msg, err1 := pack(&Msg{
             MagicHead: magicBytes,
@@ -137,6 +142,7 @@ func startClient(file *os.File, serverAddress string, skipIdx uint32, blockSize 
             break
           }
         } else {
+    			fmt.Println("- block", blockIdx, "/", lastBlockNum, "sync")
           // fmt.Println("\t\t- send to server non-compressed bytes", readedBytes)
 
           msg, err1 := pack(&Msg{
@@ -161,17 +167,17 @@ func startClient(file *os.File, serverAddress string, skipIdx uint32, blockSize 
             break
           }
         }
-
       }
-
     }
 
-    if blockIdx > lastBlockNum {
-      fmt.Println("- transfer done, exiting..")
-      os.Exit(0)
-    }
-
-    blockIdx++
+    // if blockIdx > lastBlockNum {
+    //   fmt.Println("- transfer done, exiting..")
+    //   os.Exit(0)
+    // }
+    //
+    // blockIdx++
 
   }
+	fmt.Println("- transfer done, exiting..")
+	os.Exit(0)
 }
