@@ -43,10 +43,10 @@ func main() {
 		fileSize := getDeviceSize(file)
 		lastBlockNum := uint32(fileSize / uint64(blockSize))
 
-		checksumCache := NewChecksumCache()
+		checksumCache := NewChecksumCache(lastBlockNum)
 		go precomputeChecksums(file, blockSize, lastBlockNum, checksumCache)
 
-    startClient(file, remoteAddr, uint32(skipIdx), blockSize, noCompress, checksumCache)
+    startClient(file, remoteAddr, uint32(skipIdx), fileSize, blockSize, noCompress, checksumCache)
 
   } else {
     // SERVER: destination file
@@ -61,7 +61,7 @@ func main() {
 		fileSize := getDeviceSize(file)
 		lastBlockNum := uint32(fileSize / uint64(blockSize))
 
-		checksumCache := NewChecksumCache()
+		checksumCache := NewChecksumCache(lastBlockNum)
 		go precomputeChecksums(file, blockSize, lastBlockNum, checksumCache)
 
     startServer(file, port, checksumCache)

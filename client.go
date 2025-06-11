@@ -8,7 +8,7 @@ import (
   "bytes"
 )
 
-func startClient(file *os.File, serverAddress string, skipIdx uint32, blockSize uint32, noCompress bool, checksumCache *ChecksumCache) {
+func startClient(file *os.File, serverAddress string, skipIdx uint32, fileSize uint64, blockSize uint32, noCompress bool, checksumCache *ChecksumCache) {
   fmt.Println("- startClient()")
 	magicBytes := stringToFixedSizeArray(magicHead)
 
@@ -22,11 +22,11 @@ func startClient(file *os.File, serverAddress string, skipIdx uint32, blockSize 
   defer conn.Close()
 
   // var blockIdx uint32 = skipIdx
-  var fileSize uint64 = 0
+  var totCompSize uint64 = 0
+  var totOrigSize uint64 = 0
 
   buf := make([]byte, blockSize)
 
-  fileSize = getDeviceSize(file)
   lastBlockNum := uint32(fileSize / uint64(blockSize))
 
   fmt.Printf("- source size: %d bytes, block %d bytes, blockNum: %d\n", fileSize, blockSize, lastBlockNum)
@@ -77,13 +77,17 @@ func startClient(file *os.File, serverAddress string, skipIdx uint32, blockSize 
     if debug { fmt.Println("\t- rcvd server hash:", serverHash) }
 
     if bytes.Equal(hash[:], serverHash) {
-    	fmt.Println("- block", blockIdx, "/", lastBlockNum, "ok")
+			fmt.Printf("- block %d/%d: ok\r", blockIdx, lastBlockNum)
+			totCompSize = totCompSize + uint64(blockSize)
+			totOrigSize = totOrigSize + uint64(blockSize)
       // fmt.Println("\t- hash equal -> skip to next")
     } else {
       // fmt.Println("\t- hash differs -> compress block, orig", readedBytes)
 
       if noCompress {
-    		fmt.Println("- block", blockIdx, "/", lastBlockNum, "sync")
+				totCompSize = totCompSize + uint64(blockSize)
+				totOrigSize = totOrigSize + uint64(blockSize)
+				fmt.Printf("- block %d/%d: sync\r", blockIdx, lastBlockNum)
 
         msg, err1 := pack(&Msg{
           MagicHead: magicBytes,
@@ -115,9 +119,12 @@ func startClient(file *os.File, serverAddress string, skipIdx uint32, blockSize 
         }
 
         compressedBytes := uint32(len(compBuf))
+				totCompSize = totCompSize + uint64(compressedBytes)
+				totOrigSize = totOrigSize + uint64(blockSize)
 
         if compressedBytes < blockSize {
-    			fmt.Println("- block", blockIdx, "/", lastBlockNum, "sync compress")
+					ratio := float32(100 * (float64(totCompSize) / float64(totOrigSize)))
+					fmt.Printf("- block %d/%d: sync compress %0.2f%%\r", blockIdx, lastBlockNum, ratio)
           // fmt.Println("\t\t- send to server compressed bytes", compressedBytes, "(<", blockSize, ")")
           msg, err1 := pack(&Msg{
             MagicHead: magicBytes,
@@ -142,7 +149,7 @@ func startClient(file *os.File, serverAddress string, skipIdx uint32, blockSize 
             break
           }
         } else {
-    			fmt.Println("- block", blockIdx, "/", lastBlockNum, "sync")
+					fmt.Printf("- block %d/%d: sync\r", blockIdx, lastBlockNum)
           // fmt.Println("\t\t- send to server non-compressed bytes", readedBytes)
 
           msg, err1 := pack(&Msg{
@@ -178,6 +185,6 @@ func startClient(file *os.File, serverAddress string, skipIdx uint32, blockSize 
     // blockIdx++
 
   }
-	fmt.Println("- transfer done, exiting..")
+	fmt.Println("\n- transfer done, exiting..")
 	os.Exit(0)
 }

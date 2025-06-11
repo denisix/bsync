@@ -20,12 +20,14 @@ type ChecksumCache struct {
 	ready map[uint32]bool
 	mu    sync.Mutex
 	cond  *sync.Cond
+	maxId uint32
 }
 
-func NewChecksumCache() *ChecksumCache {
+func NewChecksumCache(maxId uint32) *ChecksumCache {
 	cc := &ChecksumCache{
-		data:  make(map[uint32][]byte),
-		ready: make(map[uint32]bool),
+		data:   make(map[uint32][]byte),
+		ready:  make(map[uint32]bool),
+		maxId: maxId,
 	}
 	cc.cond = sync.NewCond(&cc.mu)
 	return cc
@@ -41,26 +43,40 @@ func (cc *ChecksumCache) Set(idx uint32, checksum []byte) {
 
 func (cc *ChecksumCache) WaitFor(idx uint32) []byte {
 	cc.mu.Lock()
-  defer cc.mu.Unlock()
+	defer cc.mu.Unlock()
+
+	if idx > cc.maxId {
+		// Out of bounds — return placeholder or nil
+		return make([]byte, 32) // all-zero hash
+	}
+
 	for !cc.ready[idx] {
 		cc.cond.Wait()
 	}
+
 	return cc.data[idx]
 }
 
 func precomputeChecksums(file *os.File, blockSize uint32, lastBlockNum uint32, cache *ChecksumCache) {
 	fmt.Println("- checksums: start computing..")
-    buf := make([]byte, blockSize)
-    for idx := uint32(0); idx <= lastBlockNum; idx++ {
-        offset := int64(idx) * int64(blockSize)
-        n, err := file.ReadAt(buf, offset)
-        if err != nil && err != io.EOF {
-            fmt.Println("Checksum reader error:", err)
-            break
-        }
-        hash := checksum(buf[:n])
-        cache.Set(idx, hash)
-    }
-		fmt.Println("- checksums: done")
+	for idx := uint32(0); idx <= lastBlockNum; idx++ {
+		buf := make([]byte, blockSize)
+		offset := int64(idx) * int64(blockSize)
+
+		n, err := file.ReadAt(buf, offset)
+		if err != nil && err != io.EOF {
+			fmt.Printf("Checksum error at block %d: %v\n", idx, err)
+			cache.Set(idx, []byte("ERR"))
+			continue
+		}
+		if n == 0 && err == io.EOF {
+			cache.Set(idx, []byte("EOF"))
+			continue
+		}
+
+		hash := checksum(buf[:n])
+		cache.Set(idx, hash)
+	}
+	// fmt.Println("- checksums: done")
 }
 

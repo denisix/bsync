@@ -32,7 +32,7 @@ func serverHandleReq(conn net.Conn, file *os.File, checksumCache *ChecksumCache)
   for {
     _, err1 := io.ReadFull(c, msgBuf)
     if err1 != nil {
-      fmt.Println("\t- connection closed:", err1)
+      fmt.Println("\t- (1) connection ended", err1)
 			os.Exit(0)
 			return
       // break
@@ -78,16 +78,16 @@ func serverHandleReq(conn net.Conn, file *os.File, checksumCache *ChecksumCache)
       
       mbs = mbsDelta / secs
 
-      eta = int(mbsLeft / mbs / 60)
+			if mbs > 0 { eta = int(mbsLeft / mbs / 60) }
       // fmt.Println("- eta", msg.BlockSize, blocksLeft, mbsLeft, mbs)
       if eta < 0 { eta = 0 }
-      if msg.BlockIdx > lastBlockNum { eta = 0 }
+      if msg.BlockIdx >= lastBlockNum { eta = 0 }
     }
 
     if msg.DataSize > 0 {
-      fmt.Printf("- block %d/%d (%0.2f%%) [w] size=%d ratio=%0.2f %0.2f MB/s ETA=%d min\n", msg.BlockIdx, lastBlockNum, percent, msg.FileSize, compressRatio, mbs, eta)
+      fmt.Printf("- block %d/%d (%0.2f%%) [w] size=%d ratio=%0.2f %0.2f MB/s ETA=%d min\r", msg.BlockIdx, lastBlockNum, percent, msg.FileSize, compressRatio, mbs, eta)
     } else {
-      fmt.Printf("- block %d/%d (%0.2f%%) [K] size=%d ratio=%0.2f %0.2f MB/s ETA=%d min\n", msg.BlockIdx, lastBlockNum, percent, msg.FileSize, compressRatio, mbs, eta)
+      fmt.Printf("- block %d/%d (%0.2f%%) [K] size=%d ratio=%0.2f %0.2f MB/s ETA=%d min\r", msg.BlockIdx, lastBlockNum, percent, msg.FileSize, compressRatio, mbs, eta)
     }
 
     if msg.DataSize == 0 {
@@ -113,7 +113,7 @@ func serverHandleReq(conn net.Conn, file *os.File, checksumCache *ChecksumCache)
 
       _, err1 := io.ReadFull(c, filebuf[:msg.DataSize])
       if err1 != nil {
-        fmt.Println("\t- connection closed:", err1)
+        fmt.Println("\t- (2) connection closed:", err1)
         // break
 				os.Exit(0)
 				return
@@ -134,7 +134,7 @@ func serverHandleReq(conn net.Conn, file *os.File, checksumCache *ChecksumCache)
         }
       } else {
 
-        fmt.Println("\t- write non-compressed bytes:", msg.DataSize)
+        if debug { fmt.Println("\t- write non-compressed bytes:", msg.DataSize) }
         n, err2 := file.WriteAt(filebuf[:msg.DataSize], offset)
         if err2 != nil && err2 != io.EOF {
           fmt.Println("\t- error reading from file:", err2.Error(), n)
@@ -146,8 +146,8 @@ func serverHandleReq(conn net.Conn, file *os.File, checksumCache *ChecksumCache)
     }
 
     // last piece?
-    if msg.BlockIdx > lastBlockNum {
-      fmt.Println("- transfer done, exiting..")
+    if msg.BlockIdx >= lastBlockNum {
+      fmt.Println("\n- transfer DONE")
       os.Exit(0)
     }
 
