@@ -8,12 +8,13 @@ const magicLen = 17
 const magicHead = "blockSync-ver0.01"
 
 type Msg struct {
-  MagicHead [magicLen]byte
-  BlockIdx  uint32
-  BlockSize uint32
-  FileSize  uint64
-  DataSize  uint32
+  MagicHead  [magicLen]byte
+  BlockIdx   uint32
+  BlockSize  uint32
+  FileSize   uint64
+  DataSize   uint32
   Compressed bool
+	Zero       bool
 }
 
 func stringToFixedSizeArray(s string) [magicLen]byte {
