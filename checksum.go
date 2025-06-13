@@ -8,6 +8,8 @@ import (
 	"io"
 )
 
+var zeroBlockHash = make([]byte, 16) // FNV-128a length
+
 // compute FNV1a checksum
 func checksum(data []byte) []byte {
 	hasher := fnv.New128a() // Using 128-bit FNV-1a. You can also use New32a(), New64a() for smaller sizes.
@@ -72,6 +74,11 @@ func precomputeChecksums(file *os.File, blockSize uint32, lastBlockNum uint32, c
 		if n == 0 && err == io.EOF {
 			cache.Set(idx, []byte("EOF"))
 			continue
+		}
+
+		if isZeroBlock(buf[:n]) {
+    	cache.Set(idx, zeroBlockHash)
+    	continue
 		}
 
 		hash := checksum(buf[:n])
