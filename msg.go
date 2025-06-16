@@ -14,7 +14,6 @@ type Msg struct {
   FileSize   uint64
   DataSize   uint32
   Compressed bool
-	Zero       bool
 }
 
 func stringToFixedSizeArray(s string) [magicLen]byte {

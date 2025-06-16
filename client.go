@@ -6,6 +6,7 @@ import (
   "os"
   "net"
   "bytes"
+	"time"
 )
 
 func startClient(file *os.File, serverAddress string, skipIdx uint32, fileSize uint64, blockSize uint32, noCompress bool, checksumCache *ChecksumCache) {
@@ -176,5 +177,8 @@ func startClient(file *os.File, serverAddress string, skipIdx uint32, fileSize u
 		}
   }
 	fmt.Println("\n- transfer done, exiting..")
-	os.Exit(0)
+
+	// wait connection closed
+	time.Sleep(2 * time.Second)
+	return
 }

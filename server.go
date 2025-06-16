@@ -33,9 +33,7 @@ func serverHandleReq(conn net.Conn, file *os.File, checksumCache *ChecksumCache)
     _, err1 := io.ReadFull(c, msgBuf)
     if err1 != nil {
       fmt.Println("\t- (1) connection ended", err1)
-			os.Exit(0)
 			return
-      // break
     }
 
     msg, err2 := unpack(msgBuf)
@@ -114,8 +112,6 @@ func serverHandleReq(conn net.Conn, file *os.File, checksumCache *ChecksumCache)
       _, err1 := io.ReadFull(c, filebuf[:msg.DataSize])
       if err1 != nil {
         fmt.Println("\t- (2) connection closed:", err1)
-        // break
-				os.Exit(0)
 				return
       }
 
@@ -148,6 +144,7 @@ func serverHandleReq(conn net.Conn, file *os.File, checksumCache *ChecksumCache)
     // last piece?
     if msg.BlockIdx >= lastBlockNum {
       fmt.Println("\n- transfer DONE")
+			time.Sleep(2 * time.Second)
       os.Exit(0)
     }
 
