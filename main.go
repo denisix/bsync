@@ -4,11 +4,10 @@ import (
   "flag"
   "os"
   "os/exec"
-	"time"
 )
 
 var debug bool = false
-var blockSize uint32 = 104857600
+var blockSize uint32 = 10485760
 var mb1 float64 = 1048576.0
 
 func main() {
@@ -47,15 +46,12 @@ func main() {
     if sshTarget != "" {
 			Log("launching remote server via SSH: %s\n", sshTarget)
 			var err error
-			sshCmd, err = startRemoteSSH(sshTarget, port)
+			sshCmd, err = startRemoteSSH(sshTarget, port, blockSize)
 			if err != nil {
 					Log("Error: SSH launch failed: %s\n", err)
 					return
 			}
 			defer sshCmd.Wait()
-
-			// wait server start
-			time.Sleep(5 * time.Second)
     }
 
     file, err := os.OpenFile(device, os.O_RDONLY, 0666)

@@ -4,6 +4,9 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"bufio"
+	"io"
+	"strconv"
 )
 
 func parseSSHTarget(input string) (user, host, file string) {
@@ -27,7 +30,7 @@ func parseSSHTarget(input string) (user, host, file string) {
 	return user, host, file
 }
 
-func startRemoteSSH(targetPath, port string) (*exec.Cmd, error) {
+func startRemoteSSH(targetPath, port string, blockSize uint32) (*exec.Cmd, error) {
 	// split sshTarget "user@host:/remote/path" -> "user@host" and "/remote/path"
 	user, host, file := parseSSHTarget(targetPath)
 
@@ -36,15 +39,35 @@ func startRemoteSSH(targetPath, port string) (*exec.Cmd, error) {
 	}
 
 	// run SSH command
-	args := []string{"ssh", host, "bsync", "-f", file, "-p", port}
+	args := []string{"ssh", host, "bsync", "-f", file, "-p", port, "-b", strconv.FormatUint(uint64(blockSize), 10)}
 	Log("spawning ssh with args: %s\n", args)
 	cmd := exec.Command(args[0], args[1:]...)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+	
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, err
+	}
+	// cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr // pass stderr through
 
 	if err := cmd.Start(); err != nil {
 		return nil, err
 	}
+
+	// wait for the "READY" signal from server
+	Log("waiting for server..\n")
+	scanner := bufio.NewScanner(stdout)
+	for scanner.Scan() {
+		line := scanner.Text()
+		// Log("SSH server output: %s\n", line)
+		if strings.Contains(line, "READY") {
+			Log("remote server is READY\n")
+			break
+		}
+	}
+	cmd.Stdout = os.Stdout
+
+	go io.Copy(os.Stdout, stdout) // keeps reading and printing
 
 	return cmd, nil
 }

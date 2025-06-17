@@ -63,10 +63,8 @@ func startClient(file *os.File, serverAddress string, skipIdx uint32, fileSize u
       break
     }
 
-    // hash := checksum(buf[:readedBytes])
 		hash := checksumCache.WaitFor(blockIdx)
-
-    if debug { Log("\t- calc local hash -> %s\n", hash) }
+    if debug { Log("\t- calc local hash -> [%d] %x\n", blockIdx, hash) }
 
     // buffer to get data
     serverHash := make([]byte, len(hash))
@@ -75,7 +73,7 @@ func startClient(file *os.File, serverAddress string, skipIdx uint32, fileSize u
       println("[client]\t- read data from net failed:", err.Error())
 			return
     }
-    if debug { Log("\t- rcvd server hash: %s\n", serverHash) }
+    if debug { Log("\t- rcvd server hash: [%d] %x\n", blockIdx, serverHash) }
 
 		// ETA, stats
 		totOrigSize = totOrigSize + uint64(blockSize)
@@ -96,7 +94,7 @@ func startClient(file *os.File, serverAddress string, skipIdx uint32, fileSize u
 			totCompSize = totCompSize + uint64(blockSize)
 			ratio := float32(100 * (float64(totCompSize) / float64(totOrigSize)))
     
-			Log("block %d/%d (%0.2f%%) [k] size=%d ratio=%0.2f %0.2f MB/s ETA=%d min\r", blockIdx, lastBlockNum, percent, fileSize, ratio, mbs, eta)
+			Log("block %d/%d (%0.2f%%) [-] size=%d ratio=%0.2f %0.2f MB/s ETA=%d min\r", blockIdx, lastBlockNum, percent, fileSize, ratio, mbs, eta)
 			continue
     }
 
@@ -190,7 +188,9 @@ func startClient(file *os.File, serverAddress string, skipIdx uint32, fileSize u
 			}
 		}
   }
-	Log("\ntransfer done, exiting..\n")
+
+	// if file was sparse / empty -> finalize it by writing just end
+	Log("\nDONE, exiting..\n\n")
 
 	// wait connection closed
 	time.Sleep(2 * time.Second)

@@ -12,7 +12,7 @@ func getDeviceSize(file *os.File) uint64 {
     os.Exit(1)
   }
   file.Seek(0, io.SeekStart)
-  Log("- getDeviceSize() -> %d bytes.\n", pos)
+  Log("file size -> %d bytes.\n", pos)
   return uint64(pos)
 }
 
@@ -24,4 +24,23 @@ func isZeroBlock(b []byte) bool {
 		}
 	}
 	return true
+}
+
+func truncateIfRegularFile(file *os.File, size uint64) {
+	info, err := file.Stat()
+	if err != nil {
+		Log("Error: file stat failed: %w\n", err)
+	}
+
+	mode := info.Mode()
+	isBlock := mode&os.ModeDevice != 0 && mode&os.ModeCharDevice == 0
+
+	if !isBlock && mode.IsRegular() {
+		if err := file.Truncate(int64(size)); err != nil {
+			Log("Error: truncate failed: %w\n", err)
+		}
+		Log("file truncated to %d bytes\n", size)
+	} else {
+		Log("skip truncate: destination is a block device or special file\n")
+	}
 }

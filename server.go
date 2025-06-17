@@ -16,13 +16,9 @@ func serverHandleReq(conn net.Conn, file *os.File, checksumCache *ChecksumCache)
   filebuf := make([]byte, blockSize)
   msgBuf := make([]byte, 21 + magicLen)
 
-  // var percent float32 = 0
-  // var compressRatio float32 = 100
   var lastBlockNum uint32 = 0
   var lastPartSize uint64 = 0
   var firstBlock uint32 = 0
-  // var totCompSize uint64 = 0
-  // var totOrigSize uint64 = 0
 
   t0 := time.Now()
   mbs := 0.0
@@ -56,19 +52,14 @@ func serverHandleReq(conn net.Conn, file *os.File, checksumCache *ChecksumCache)
 
     offset := int64(msg.BlockIdx) * int64(blockSize)
 
-		// totCompSize = totCompSize + uint64(msg.DataSize)
-		// totOrigSize = totOrigSize + uint64(blockSize)
-		// if (totOrigSize > 0) {
-		// 	compressRatio = float32(100 * (float64(totCompSize) / float64(totOrigSize)))
-		// }
-    // percent = float32(uint64(offset) / (msg.FileSize / 100))
-
     if msg.FileSize > 0 {
       if lastBlockNum == 0 {
         lastBlockNum = uint32(msg.FileSize / uint64(blockSize))
         lastPartSize = msg.FileSize - uint64(lastBlockNum) * uint64(blockSize)
         firstBlock = msg.BlockIdx
-        Log("\tlast part size = %d\n\tlast block = %d\n\tfirst block = %d\n\tblock size = %d\n\n", lastPartSize, lastBlockNum, firstBlock, msg.BlockSize)
+        Log("\n\tlast part size = %d\n\tlast block = %d\n\tfirst block = %d\n\tblock size = %d\n\n", lastPartSize, lastBlockNum, firstBlock, msg.BlockSize)
+				
+				truncateIfRegularFile(file, msg.FileSize)
       }
 
       secs := time.Since(t0).Seconds()
@@ -100,10 +91,10 @@ func serverHandleReq(conn net.Conn, file *os.File, checksumCache *ChecksumCache)
         break
       }
 
-			if debug { Log("\t- wait for precomputed hash\n") }
+			// if debug { Log("\t- wait for precomputed hash\n") }
       hash := checksumCache.WaitFor(msg.BlockIdx)
 
-      if debug { Log("\t- send hash %s\n", hash) }
+      if debug { Log("\t- send hash [%d] %x\n", msg.BlockIdx, hash) }
       connWrite(conn, hash[:])
     }
 
@@ -143,7 +134,7 @@ func serverHandleReq(conn net.Conn, file *os.File, checksumCache *ChecksumCache)
 
     // last piece?
     if msg.BlockIdx >= lastBlockNum {
-      Log("\ntransfer DONE\n")
+      Log("\ntransfer DONE\n\n")
 			time.Sleep(2 * time.Second)
       os.Exit(0)
     }
@@ -158,7 +149,9 @@ func startServer(file *os.File, port string, checksumCache *ChecksumCache) {
     return
   }
   defer listener.Close()
-	Log("listening on 0.0.0.0:%s\n", port)
+
+	// time.Sleep(2 * time.Second)
+	Log("READY, listening on 0.0.0.0:%s\n", port)
 
   for {
     conn, err := listener.Accept()

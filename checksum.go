@@ -48,7 +48,7 @@ func (cc *ChecksumCache) WaitFor(idx uint32) []byte {
 
 	if idx > cc.maxId {
 		// Out of bounds — return placeholder or nil
-		return make([]byte, 32) // all-zero hash
+		return make([]byte, 16) // all-zero hash
 	}
 
 	for !cc.ready[idx] {
