@@ -4,7 +4,6 @@ import (
 	"hash/fnv"
 	"sync"
 	"os"
-	"fmt"
 	"io"
 )
 
@@ -60,14 +59,14 @@ func (cc *ChecksumCache) WaitFor(idx uint32) []byte {
 }
 
 func precomputeChecksums(file *os.File, blockSize uint32, lastBlockNum uint32, cache *ChecksumCache) {
-	fmt.Println("- checksums: start computing..")
+	Log("checksums: start computing..\n")
 	for idx := uint32(0); idx <= lastBlockNum; idx++ {
 		buf := make([]byte, blockSize)
 		offset := int64(idx) * int64(blockSize)
 
 		n, err := file.ReadAt(buf, offset)
 		if err != nil && err != io.EOF {
-			fmt.Printf("Checksum error at block %d: %v\n", idx, err)
+			Log("Checksum error at block %d: %v\n", idx, err)
 			cache.Set(idx, []byte("ERR"))
 			continue
 		}
@@ -84,6 +83,5 @@ func precomputeChecksums(file *os.File, blockSize uint32, lastBlockNum uint32, c
 		hash := checksum(buf[:n])
 		cache.Set(idx, hash)
 	}
-	// fmt.Println("- checksums: done")
 }
 

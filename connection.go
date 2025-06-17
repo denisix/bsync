@@ -1,7 +1,6 @@
 package main
 
 import (
-  "fmt"
   "net"
 )
 
@@ -33,7 +32,7 @@ func (a *AutoReconnectTCP) connect() error {
   if a.conn != nil {
 		return nil
 	}
-  fmt.Println("- connecting..", a.addr)
+  Log("connecting to %s ..\n", a.addr)
 
 	var err error
 	a.conn, err = net.DialTCP("tcp", nil, a.addr)

@@ -2,7 +2,6 @@ package main
 
 import (
   "io"
-  "fmt"
   "os"
   "net"
   "bufio"
@@ -10,18 +9,20 @@ import (
 )
 
 func serverHandleReq(conn net.Conn, file *os.File, checksumCache *ChecksumCache) {
-  fmt.Println("- serverHandleReq()")
+  Log("serverHandleReq()\n")
   defer conn.Close()
   magicBytes := stringToFixedSizeArray(magicHead)
 
   filebuf := make([]byte, blockSize)
   msgBuf := make([]byte, 21 + magicLen)
 
-  var percent float32 = 0
-  var compressRatio float32 = 100
+  // var percent float32 = 0
+  // var compressRatio float32 = 100
   var lastBlockNum uint32 = 0
   var lastPartSize uint64 = 0
   var firstBlock uint32 = 0
+  // var totCompSize uint64 = 0
+  // var totOrigSize uint64 = 0
 
   t0 := time.Now()
   mbs := 0.0
@@ -32,13 +33,13 @@ func serverHandleReq(conn net.Conn, file *os.File, checksumCache *ChecksumCache)
   for {
     _, err1 := io.ReadFull(c, msgBuf)
     if err1 != nil {
-      fmt.Println("\t- (1) connection ended", err1)
+			Log("\t- (1) connection ended: %s\n", err1)
 			return
     }
 
     msg, err2 := unpack(msgBuf)
     if err2 != nil {
-      fmt.Println("\t- unpack msg failed:", err2)
+      Log("\t- unpack msg failed: %s\n", err2)
     }
 
     if msg.MagicHead != magicBytes {
@@ -46,7 +47,7 @@ func serverHandleReq(conn net.Conn, file *os.File, checksumCache *ChecksumCache)
       return
     }
 
-    if debug { fmt.Println("\t- unpacked Msg->", msg) }
+    if debug { Log("\t- unpacked Msg-> %s\n", msg) }
    
     if msg.BlockSize != blockSize {
       blockSize = msg.BlockSize
@@ -55,16 +56,19 @@ func serverHandleReq(conn net.Conn, file *os.File, checksumCache *ChecksumCache)
 
     offset := int64(msg.BlockIdx) * int64(blockSize)
 
+		// totCompSize = totCompSize + uint64(msg.DataSize)
+		// totOrigSize = totOrigSize + uint64(blockSize)
+		// if (totOrigSize > 0) {
+		// 	compressRatio = float32(100 * (float64(totCompSize) / float64(totOrigSize)))
+		// }
+    // percent = float32(uint64(offset) / (msg.FileSize / 100))
+
     if msg.FileSize > 0 {
-      percent = float32(uint64(offset) / (msg.FileSize / 100))
-
-      compressRatio = float32(100 * float32(msg.DataSize) / float32(msg.BlockSize))
-
       if lastBlockNum == 0 {
         lastBlockNum = uint32(msg.FileSize / uint64(blockSize))
         lastPartSize = msg.FileSize - uint64(lastBlockNum) * uint64(blockSize)
         firstBlock = msg.BlockIdx
-        fmt.Println("- last part size ->", lastPartSize, "lastBlock", lastBlockNum, "firstBlock", firstBlock, "blockSize", msg.BlockSize)
+        Log("\tlast part size = %d\n\tlast block = %d\n\tfirst block = %d\n\tblock size = %d\n\n", lastPartSize, lastBlockNum, firstBlock, msg.BlockSize)
       }
 
       secs := time.Since(t0).Seconds()
@@ -77,73 +81,69 @@ func serverHandleReq(conn net.Conn, file *os.File, checksumCache *ChecksumCache)
       mbs = mbsDelta / secs
 
 			if mbs > 0 { eta = int(mbsLeft / mbs / 60) }
-      // fmt.Println("- eta", msg.BlockSize, blocksLeft, mbsLeft, mbs)
       if eta < 0 { eta = 0 }
       if msg.BlockIdx >= lastBlockNum { eta = 0 }
     }
 
-    if msg.DataSize > 0 {
-      fmt.Printf("- block %d/%d (%0.2f%%) [w] size=%d ratio=%0.2f %0.2f MB/s ETA=%d min\r", msg.BlockIdx, lastBlockNum, percent, msg.FileSize, compressRatio, mbs, eta)
-    } else {
-      fmt.Printf("- block %d/%d (%0.2f%%) [K] size=%d ratio=%0.2f %0.2f MB/s ETA=%d min\r", msg.BlockIdx, lastBlockNum, percent, msg.FileSize, compressRatio, mbs, eta)
-    }
+    // if msg.DataSize > 0 {
+    //   Log("block %d/%d (%0.2f%%) [w] size=%d ratio=%0.2f %0.2f MB/s ETA=%d min\r", msg.BlockIdx, lastBlockNum, percent, msg.FileSize, compressRatio, mbs, eta)
+    // } else {
+    //   Log("block %d/%d (%0.2f%%) [K] size=%d ratio=%0.2f %0.2f MB/s ETA=%d min\r", msg.BlockIdx, lastBlockNum, percent, msg.FileSize, compressRatio, mbs, eta)
+    // }
 
     if msg.DataSize == 0 {
-      if debug { fmt.Println("\t- read block from file") }
+      if debug { Log("\t- read block from file\n") }
 
       n, err := file.ReadAt(filebuf, offset)
       if err != nil && err != io.EOF {
-        fmt.Println("\t- error reading from file:", err.Error(), n)
+        Log("\t- error reading from file: [%d] %s\n", n, err.Error())
         break
       }
 
-      // if debug { fmt.Println("\t- calc hash", n) }
-      // hash := checksum(filebuf[:n])
-			if debug { fmt.Println("\t- wait for precomputed hash") }
+			if debug { Log("\t- wait for precomputed hash\n") }
       hash := checksumCache.WaitFor(msg.BlockIdx)
 
-      if debug { fmt.Println("\t- send hash", hash) }
+      if debug { Log("\t- send hash %s\n", hash) }
       connWrite(conn, hash[:])
     }
 
     if msg.DataSize > 0 {
-      if debug { fmt.Println("\t- read block from network", msg.DataSize) }
+      if debug { Log("\t- read block from network %d\n", msg.DataSize) }
 
       _, err1 := io.ReadFull(c, filebuf[:msg.DataSize])
       if err1 != nil {
-        fmt.Println("\t- (2) connection closed:", err1)
+        Log("\t- (2) connection closed: %s\n", err1)
 				return
       }
 
       if msg.Compressed {
         decompressed, err := decompressData(filebuf[:msg.DataSize])
         if err != nil {
-          fmt.Println("\t- error uncompressing:", err.Error())
+          Log("\t- error uncompressing: %s\n", err.Error())
           break
         }
 
-        if debug { fmt.Println("\t- write uncompressed bytes:", len(decompressed), msg.DataSize) }
+        if debug { Log("\t- write uncompressed bytes: %d [%d bytes]\n", msg.DataSize, len(decompressed)) }
         n, err2 := file.WriteAt(decompressed, offset)
         if err2 != nil && err2 != io.EOF {
-          fmt.Println("\t- error reading from file:", err2.Error(), n)
+          Log("\t- error reading from file: [%d] %s\n", n, err2.Error())
           break
         }
       } else {
 
-        if debug { fmt.Println("\t- write non-compressed bytes:", msg.DataSize) }
+        if debug { Log("\t- write non-compressed bytes: %d\n", msg.DataSize) }
         n, err2 := file.WriteAt(filebuf[:msg.DataSize], offset)
         if err2 != nil && err2 != io.EOF {
-          fmt.Println("\t- error reading from file:", err2.Error(), n)
+          Log("\t- error reading from file: [%d] %s\n", n, err2.Error())
           break
         }
 
       }
-
     }
 
     // last piece?
     if msg.BlockIdx >= lastBlockNum {
-      fmt.Println("\n- transfer DONE")
+      Log("\ntransfer DONE\n")
 			time.Sleep(2 * time.Second)
       os.Exit(0)
     }
@@ -152,19 +152,18 @@ func serverHandleReq(conn net.Conn, file *os.File, checksumCache *ChecksumCache)
 }
 
 func startServer(file *os.File, port string, checksumCache *ChecksumCache) {
-  portStr := ":" + port
-  listener, err := net.Listen("tcp", portStr)
+	listener, err := net.Listen("tcp", ":" + port)
   if err != nil {
-    fmt.Println("Error listening:", err.Error())
+    Log("Error listening: %s\n", err.Error())
     return
   }
   defer listener.Close()
-  fmt.Println("- listening on 0.0.0.0" + portStr)
+	Log("listening on 0.0.0.0:%s\n", port)
 
   for {
     conn, err := listener.Accept()
     if err != nil {
-      fmt.Println("Error accepting: ", err.Error())
+      Log("Error accepting: %s\n", err.Error())
       return
     }
     go serverHandleReq(conn, file, checksumCache)
