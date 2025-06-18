@@ -6,9 +6,16 @@ import (
 )
 
 func getDeviceSize(file *os.File) uint64 {
+	_, err := file.Stat()
+	if err != nil {
+		Log("Error: source file stat failed: %s\n", err.Error())
+		return 0
+		// os.Exit(1)
+	}
+
   pos, err := file.Seek(0, io.SeekEnd)
   if err != nil {
-    Log("error seeking to end of file: %s\n", err.Error())
+		Log("Error: seeking to end of file: %s\n", err.Error())
     os.Exit(1)
   }
   file.Seek(0, io.SeekStart)

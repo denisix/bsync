@@ -55,15 +55,20 @@ func main() {
 			}
 			defer sshCmd.Wait()
 		}
-
+	
 		file, err := os.OpenFile(device, os.O_RDONLY, 0666)
 		if err != nil {
-			Log("Error: opening file: %s\n", err.Error())
+			Log("Error: opening source file: %s\n", device)
 			os.Exit(1)
 		}
 		defer file.Close()
-
+		
 		fileSize := getDeviceSize(file)
+
+		if fileSize == 0 {
+			Log("Error: zero source file: %s\n", device)
+			os.Exit(1)
+		}
 		if blockSize > uint32(fileSize) {
 			blockSize = uint32(fileSize)
 		}
