@@ -1,4 +1,6 @@
 #!/bin/bash
+PATH="$PATH:."
+export PATH
 src=/tmp/src.img
 dst=/tmp/dst.img
 

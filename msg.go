@@ -1,7 +1,8 @@
 package main
+
 import (
-  "bytes"
-  "encoding/binary"
+	"bytes"
+	"encoding/binary"
 )
 
 const magicLen = 17
@@ -9,11 +10,12 @@ const magicHead = "blockSync-ver0.01"
 
 type Msg struct {
   MagicHead  [magicLen]byte
-  BlockIdx   uint32
+  BlockIdx   uint64
   BlockSize  uint32
   FileSize   uint64
   DataSize   uint32
   Compressed bool
+  LastBlock  bool
 }
 
 func stringToFixedSizeArray(s string) [magicLen]byte {
