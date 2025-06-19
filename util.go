@@ -13,14 +13,14 @@ func getDeviceSize(file *os.File) uint64 {
 		// os.Exit(1)
 	}
 
-  pos, err := file.Seek(0, io.SeekEnd)
-  if err != nil {
+	pos, err := file.Seek(0, io.SeekEnd)
+	if err != nil {
 		Log("Error: seeking to end of file: %s\n", err.Error())
-    os.Exit(1)
-  }
-  file.Seek(0, io.SeekStart)
-  Log("file size -> %d bytes.\n", pos)
-  return uint64(pos)
+		os.Exit(1)
+	}
+	file.Seek(0, io.SeekStart)
+	Log("file size -> %d bytes.\n", pos)
+	return uint64(pos)
 }
 
 // isZeroBlock -> true if every byte is 0
@@ -34,6 +34,11 @@ func isZeroBlock(b []byte) bool {
 }
 
 func truncateIfRegularFile(file *os.File, size uint64) {
+	if file == nil {
+		Log("Error: file is nil in truncateIfRegularFile\n")
+		return
+	}
+
 	info, err := file.Stat()
 	if err != nil {
 		Log("Error: file stat failed: %s\n", err.Error())

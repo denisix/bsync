@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"os"
 	"strings"
 	"time"
 )
@@ -22,4 +23,11 @@ func Log(format string, args ...interface{}) {
 	ts := time.Now().Format("15:04:05")
 	msg := fmt.Sprintf(format, args...)
 	fmt.Printf("%s %s %s", ts, logPrefix, msg)
+}
+
+func Err(format string, args ...interface{}) {
+	ts := time.Now().Format("15:04:05")
+	msg := fmt.Sprintf(format, args...)
+	fmt.Printf("%s %s ERROR: %s", ts, logPrefix, msg)
+	os.Exit(1)
 }

@@ -3,6 +3,10 @@
 set -e
 
 TEST_DIR="/tmp/bsync_test"
+if [ -d "$TEST_DIR" ]
+then
+  rm -rf "$TEST_DIR"
+fi
 mkdir -p $TEST_DIR
 
 # Test tracking variables
@@ -50,6 +54,7 @@ run_test() {
   local src_file="$2"
   local dst_file="$3"
   local expected_exit="$4"
+  local expected_crc="$5"
   TOTAL_TESTS=$((TOTAL_TESTS + 1))
   echo "[TEST $TOTAL_TESTS] $test_name"
   echo "file src: $src_file"
@@ -69,11 +74,18 @@ run_test() {
     if [ "$expected_exit" = "0" ] && [ -f "$src_file" ] && [ -f "$dst_file" ]; then
       src_md5=$(md5sum "$src_file" | awk '{print $1}')
       dst_md5=$(md5sum "$dst_file" | awk '{print $1}')
+
       if [ "$src_md5" = "$dst_md5" ]; then
         echo "✓ PASS: Source and destination files match (md5sum: $src_md5)"
       else
-        echo "✗ FAIL: Source and destination files differ (src: $src_md5, dst: $dst_md5)"
-        test_passed=false
+        if [ "$expected_crc" = "1" ]
+        then
+          echo "✓ PASS: Source and destination files differ (src: $src_md5, dst: $dst_md5)"
+          test_passed=true
+        else
+          echo "✗ FAIL: Source and destination files differ (src: $src_md5, dst: $dst_md5)"
+          test_passed=false
+        fi
       fi
     fi
   else
@@ -264,6 +276,63 @@ run_test "Source file multiple non-aligned blocks (25MB+777 bytes)" "$TEST_DIR/m
 # Test 36: Source file big random, 200MB
 create_random_file "$TEST_DIR/big_src.img" 209715200 # 200MB
 run_test "Source file big random, 200MB" "$TEST_DIR/big_src.img" "$TEST_DIR/dst_big.img" 0
+
+# Test 37: Destination file larger than source, extra data is random
+create_random_file "$TEST_DIR/large_random_dst.img" 20971520 # 20MB
+run_test "Dest larger than source, extra data random" "$TEST_DIR/random_src.img" "$TEST_DIR/large_random_dst.img" 0
+
+# Test 38: Destination file is sparse, source is full
+create_random_file "$TEST_DIR/full_src.img" 10485760 # 10MB
+cp "$TEST_DIR/full_src.img" "$TEST_DIR/sparse_dst.img"
+truncate -s 20M "$TEST_DIR/sparse_dst.img"
+run_test "Dest is sparse, source is full" "$TEST_DIR/full_src.img" "$TEST_DIR/sparse_dst.img" 0
+
+# Test 39: Source file with all 0xFF bytes
+ff_file="$TEST_DIR/ff_src.img"
+dd if=/dev/zero bs=1M count=10 of="$ff_file" 2>/dev/null
+perl -pi -e 's/\x00/\xFF/g' "$ff_file"
+run_test "Source file all 0xFF bytes" "$ff_file" "$TEST_DIR/dst_ff.img" 0
+
+# Test 40: Destination file is read-only
+create_random_file "$TEST_DIR/readonly_dst.img" 10485760 # 10MB
+chmod 444 "$TEST_DIR/readonly_dst.img"
+run_test "Destination file is read-only (should fail)" "$TEST_DIR/random_src.img" "$TEST_DIR/readonly_dst.img" 1
+chmod 644 "$TEST_DIR/readonly_dst.img"
+
+# Test 41: Source file changes during sync (simulate by background write)
+create_random_file "$TEST_DIR/changing_src.img" 10485760 # 10MB
+(for i in 1 2 3 4 5; do sleep 1; dd if=/dev/urandom of="$TEST_DIR/changing_src.img" bs=1M count=1 seek=5 conv=notrunc 2>/dev/null; done ) &
+run_test "Source file changes during sync" "$TEST_DIR/changing_src.img" "$TEST_DIR/dst_changing.img" 0 1
+wait
+
+# Test 42: Destination file is a device (simulate with /dev/null)
+run_test "Destination is /dev/null (should fail or skip)" "$TEST_DIR/random_src.img" "/dev/null" 0
+
+# Test 43: Source file with all byte values
+allbytes="$TEST_DIR/allbytes_src.img"
+perl -e 'print map { chr } 0..255' > "$allbytes"
+run_test "Source file with all byte values" "$allbytes" "$TEST_DIR/dst_allbytes.img" 0
+
+# Test 44: Destination file is a symlink
+create_random_file "$TEST_DIR/random_src.img" 1048576
+create_random_file "$TEST_DIR/real_dst.img" 10485760 # 10MB
+ln -sf "$TEST_DIR/real_dst.img" "$TEST_DIR/symlink_dst.img"
+run_test "Destination file is a symlink" "$TEST_DIR/random_src.img" "$TEST_DIR/symlink_dst.img" 0
+
+# Test 45: Source file is a symlink
+ln -sf "$TEST_DIR/random_src.img" "$TEST_DIR/symlink_src.img"
+run_test "Source file is a symlink" "$TEST_DIR/symlink_src.img" "$TEST_DIR/dst_symlink.img" 0
+
+# Edge: Destination file is locked by another process
+# create_random_file "$TEST_DIR/locked_dst.img" 10485760 # 10MB
+# (exec 9>"$TEST_DIR/locked_dst.img"; flock -x 9; run_test "Destination file locked by another process (should fail)" "$TEST_DIR/random_src.img" "$TEST_DIR/locked_dst.img" 1) &
+# sleep 1
+# wait
+
+# Edge: Very large file (>4GB)
+# Only run if you have enough disk space
+# create_random_file "$TEST_DIR/huge_src.img" 4294967296 # 4GB
+# run_test "Very large source file (>4GB)" "$TEST_DIR/huge_src.img" "$TEST_DIR/dst_huge.img" 0
 
 echo "All edge case tests completed successfully!"
 echo "Cleaning up test files..."

@@ -40,6 +40,7 @@ func waitForReady(stdout io.ReadCloser, isLocal bool) error {
 	scanner := bufio.NewScanner(stdout)
 	for scanner.Scan() {
 		line := scanner.Text()
+		Log("server-> %s\n", line)
 		if strings.Contains(line, "READY") {
 			serverType := "remote"
 			if isLocal {

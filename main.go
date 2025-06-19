@@ -7,9 +7,11 @@ import (
 	"os/exec"
 )
 
-var debug bool = false
+var debug bool = true
 var blockSize uint32 = 10485760
 var mb1 float64 = 1048576.0
+var compressionLevel int = 1        // default: fastest
+var compressionWindow int = 1 << 18 // default: 256KB
 
 func main() {
 	var device string
@@ -20,6 +22,8 @@ func main() {
 	var noCompress bool
 	var sshTarget string
 	var quiet bool
+	var zLevel int
+	var zWindow int
 
 	flag.StringVar(&device, "f", "/dev/zero", "specify file or device, i.e. '/dev/vda'")
 	flag.StringVar(&remoteAddr, "r", "", "specify remote address of server")
@@ -29,9 +33,13 @@ func main() {
 	flag.BoolVar(&noCompress, "n", false, "do not compress blocks (by default compress)")
 	flag.StringVar(&sshTarget, "t", "", "launch remote server via ssh: user@host:/remote_path")
 	flag.BoolVar(&quiet, "q", false, "be quiet, without output")
+	flag.IntVar(&zLevel, "z", 1, "compression level: 1=fastest, 2=default, 3=better, 4=best")
+	flag.IntVar(&zWindow, "w", 262144, "compression window size in bytes (default 262144, i.e. 256KB)")
 	flag.Parse() // after declaring flags we need to call it
 
 	blockSize = uint32(bSize)
+	compressionLevel = zLevel
+	compressionWindow = zWindow
 
 	if sshTarget != "" {
 		_, host, _ := parseSSHTarget(sshTarget)
@@ -51,23 +59,28 @@ func main() {
 			sshCmd, err = startRemoteSSH(sshTarget, port, blockSize, quiet)
 			if err != nil {
 				Log("Error: SSH launch failed: %s\n", err)
-				return
+				os.Exit(1)
 			}
 			defer sshCmd.Wait()
 		}
 
 		file, err := os.OpenFile(device, os.O_RDONLY, 0666)
 		if err != nil {
-			Log("Error: opening source file: %s\n", device)
-			os.Exit(1)
+			if sshCmd != nil {
+				sshCmd.Process.Kill()
+				sshCmd.Wait()
+			}
+			Err("Error: opening source file: %s\n", device)
 		}
 		defer file.Close()
 
 		fileSize := getDeviceSize(file)
-
 		if fileSize == 0 {
-			Log("Error: zero source file: %s\n", device)
-			os.Exit(1)
+			if sshCmd != nil {
+				sshCmd.Process.Kill()
+				sshCmd.Wait()
+			}
+			Err("Error: zero source file: %s\n", device)
 		}
 		if blockSize > uint32(fileSize) {
 			blockSize = uint32(fileSize)

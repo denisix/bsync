@@ -4,6 +4,7 @@ import (
 	"hash/fnv"
 	"io"
 	"os"
+	"sync"
 )
 
 var zeroBlockHash = make([]byte, 16)
@@ -20,14 +21,16 @@ type BlockData struct {
 }
 
 type ChecksumCache struct {
-	checksums map[uint64]chan []byte
-	blocks    map[uint64]chan *BlockData // only if storeData
-	maxId     uint64
-	window    uint64
-	storeData bool
-	compress  bool
-	file      *os.File
-	blockSize uint32
+	checksums   map[uint64]chan []byte
+	blocks      map[uint64]chan *BlockData
+	maxId       uint64
+	window      uint64
+	storeData   bool
+	compress    bool
+	file        *os.File
+	blockSize   uint32
+	mu          sync.RWMutex // protect map access
+	cleanupLock sync.Mutex   // protect cleanup operations
 }
 
 func NewChecksumCache(maxId uint64, storeData, compress bool, file *os.File, blockSize uint32) *ChecksumCache {
@@ -46,7 +49,32 @@ func NewChecksumCache(maxId uint64, storeData, compress bool, file *os.File, blo
 	return cc
 }
 
+func (cc *ChecksumCache) cleanup(idx uint64) {
+	cc.cleanupLock.Lock()
+	defer cc.cleanupLock.Unlock()
+
+	// Remove channels for blocks outside the window
+	if idx > cc.window {
+		cc.mu.Lock()
+		for i := uint64(0); i < idx-cc.window; i++ {
+			delete(cc.checksums, i)
+			if cc.storeData {
+				delete(cc.blocks, i)
+			}
+		}
+		cc.mu.Unlock()
+	}
+}
+
 func (cc *ChecksumCache) EnsureWindow(idx uint64) {
+	if idx > cc.maxId {
+		return
+	}
+
+	cc.mu.Lock()
+	defer cc.mu.Unlock()
+
+	// Create channels for blocks within the window
 	for i := idx; i < idx+cc.window && i <= cc.maxId; i++ {
 		if _, ok := cc.checksums[i]; !ok {
 			cc.checksums[i] = make(chan []byte, 1)
@@ -62,30 +90,52 @@ func (cc *ChecksumCache) WaitFor(idx uint64) []byte {
 	if idx > cc.maxId {
 		return zeroBlockHash
 	}
+
 	cc.EnsureWindow(idx)
+
+	cc.mu.RLock()
 	ch, ok := cc.checksums[idx]
+	cc.mu.RUnlock()
+
 	if !ok {
 		return zeroBlockHash
 	}
-	return <-ch
+
+	hash := <-ch
+	cc.cleanup(idx + 1)
+	return hash
 }
 
 func (cc *ChecksumCache) WaitForBlockData(idx uint64) *BlockData {
-	if !cc.storeData {
+	if !cc.storeData || idx > cc.maxId {
 		return nil
 	}
+
 	cc.EnsureWindow(idx)
+
+	cc.mu.RLock()
 	ch, ok := cc.blocks[idx]
+	cc.mu.RUnlock()
+
 	if !ok {
 		return nil
 	}
-	return <-ch
+
+	data := <-ch
+	cc.cleanup(idx + 1)
+	return data
 }
 
 func processBlock(f *os.File, bs uint32, idx uint64, cc *ChecksumCache) {
 	if f == nil || bs == 0 {
+		cc.mu.Lock()
+		if ch, ok := cc.checksums[idx]; ok {
+			ch <- []byte("ERR")
+		}
+		cc.mu.Unlock()
 		return
 	}
+
 	buf := make([]byte, bs)
 	off := int64(idx) * int64(bs)
 	n, err := f.ReadAt(buf, off)
@@ -118,8 +168,14 @@ func processBlock(f *os.File, bs uint32, idx uint64, cc *ChecksumCache) {
 		}
 	}
 
-	cc.checksums[idx] <- sum
-	if cc.storeData {
-		cc.blocks[idx] <- bd
+	cc.mu.Lock()
+	if ch, ok := cc.checksums[idx]; ok {
+		ch <- sum
 	}
+	if cc.storeData {
+		if ch, ok := cc.blocks[idx]; ok {
+			ch <- bd
+		}
+	}
+	cc.mu.Unlock()
 }

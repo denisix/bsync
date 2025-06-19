@@ -1,22 +1,22 @@
 package main
 
 import (
-  "net"
+	"net"
 )
 
 func connWrite(conn net.Conn, data []byte) error {
-    var start,c int
-    var err error
-    for {
-      if c, err = conn.Write(data[start:]); err != nil {
-          return err
-      }
-      start += c
-      if c == 0 || start == len(data) {
-          break
-      }
-    }
-    return nil
+	var start, c int
+	var err error
+	for {
+		if c, err = conn.Write(data[start:]); err != nil {
+			return err
+		}
+		start += c
+		if c == 0 || start == len(data) {
+			break
+		}
+	}
+	return nil
 }
 
 type AutoReconnectTCP struct {
@@ -29,10 +29,10 @@ func NewAutoReconnectTCP(addr *net.TCPAddr) *AutoReconnectTCP {
 }
 
 func (a *AutoReconnectTCP) connect() error {
-  if a.conn != nil {
+	if a.conn != nil {
 		return nil
 	}
-  Log("connecting to %s ..\n", a.addr)
+	Log("connecting to %s ..\n", a.addr)
 
 	var err error
 	a.conn, err = net.DialTCP("tcp", nil, a.addr)
@@ -82,4 +82,3 @@ func (a *AutoReconnectTCP) Close() error {
 	}
 	return nil
 }
-

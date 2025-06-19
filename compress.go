@@ -1,22 +1,37 @@
 package main
 
 import (
-  "sync"
-  "github.com/klauspost/compress/zstd"
+	"sync"
+
+	"github.com/klauspost/compress/zstd"
 )
 
 var (
-	encoder *zstd.Encoder
-	decoder *zstd.Decoder
+	encoder  *zstd.Encoder
+	decoder  *zstd.Decoder
 	initOnce sync.Once
 )
+
+func getZstdLevel() zstd.EncoderLevel {
+	switch compressionLevel {
+	case 1:
+		return zstd.SpeedFastest
+	case 2:
+		return zstd.SpeedDefault
+	case 3:
+		return zstd.SpeedBetterCompression
+	case 4:
+		return zstd.SpeedBestCompression
+	default:
+		return zstd.SpeedFastest
+	}
+}
 
 func initEncoderDecoder() {
 	var err error
 	encoder, err = zstd.NewWriter(nil,
-		zstd.WithEncoderLevel(zstd.SpeedFastest),
-		//zstd.WithEncoderLevel(zstd.SpeedBestCompression),
-		zstd.WithWindowSize(1<<18), // Setting a window size of 1MB. Adjust as needed.
+		zstd.WithEncoderLevel(getZstdLevel()),
+		zstd.WithWindowSize(compressionWindow),
 	)
 	if err != nil {
 		panic(err)
@@ -32,7 +47,6 @@ func compressData(data []byte) ([]byte, error) {
 	initOnce.Do(initEncoderDecoder)
 
 	// Pre-allocate a buffer with the same size as the input data.
-	// This is a basic heuristic; you might want to adjust based on your data characteristics.
 	buffer := make([]byte, 0, len(data))
 
 	return encoder.EncodeAll(data, buffer), nil
