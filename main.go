@@ -41,6 +41,10 @@ func main() {
 	compressionLevel = zLevel
 	compressionWindow = zWindow
 
+	if blockSize == 0 {
+		Err("Block size cannot be zero\n")
+	}
+
 	if sshTarget != "" {
 		_, host, _ := parseSSHTarget(sshTarget)
 		remoteAddr = host + ":" + port

@@ -123,7 +123,10 @@ func startClient(serverAddress string, skipIdx uint64, fileSize uint64, blockSiz
 		localHash := checksumCache.WaitFor(blockIdx)
 		totOrigSize += uint64(blockSize)
 		secs := time.Since(t0).Seconds()
-		mbs := float64(totOrigSize) / mb1 / secs
+		mbs := float64(0)
+		if secs > 0 {
+			mbs = float64(totOrigSize) / mb1 / secs
+		}
 
 		if bytes.Equal(localHash, serverHash) || bytes.Equal(localHash, zeroBlockHash) {
 			totCompSize += uint64(blockSize)
