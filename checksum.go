@@ -33,11 +33,11 @@ type ChecksumCache struct {
 	cleanupLock sync.Mutex   // protect cleanup operations
 }
 
-func NewChecksumCache(maxId uint64, storeData, compress bool, file *os.File, blockSize uint64) *ChecksumCache {
+func NewChecksumCache(maxId uint64, storeData, compress bool, file *os.File, blockSize uint64, blocksAhead uint64) *ChecksumCache {
 	cc := &ChecksumCache{
 		checksums: make(map[uint64]chan []byte),
 		maxId:     maxId,
-		window:    5,
+		window:    blocksAhead,
 		storeData: storeData,
 		compress:  compress,
 		file:      file,

@@ -6,46 +6,31 @@ import (
 	"time"
 )
 
-func connWrite(conn net.Conn, data []byte) error {
-	var start, c int
-	var err error
-	for {
-		if c, err = conn.Write(data[start:]); err != nil {
-			return err
-		}
-		start += c
-		if c == 0 || start == len(data) {
-			break
-		}
-	}
-	return nil
-}
-
-// Robust read with retries
-func connReadFullWithRetry(conn net.Conn, buf []byte, maxRetries int) (int, error) {
+// Robust read with infinite retries
+func connReadFullWithRetry(conn net.Conn, buf []byte) (int, error) {
 	var n int
 	var err error
-	for i := 0; i < maxRetries; i++ {
+	for {
 		n, err = io.ReadFull(conn, buf)
 		if err == nil {
 			return n, nil
 		}
-		time.Sleep(time.Millisecond * 100)
+		Log("Network read error: %v, retrying in 1s...\n", err)
+		time.Sleep(time.Second)
 	}
-	return n, err
 }
 
-// Robust write with retries
-func connWriteWithRetry(conn net.Conn, data []byte, maxRetries int) error {
+// Robust write with infinite retries
+func connWriteWithRetry(conn net.Conn, data []byte) error {
 	var err error
-	for i := 0; i < maxRetries; i++ {
-		err = connWrite(conn, data)
+	for {
+		_, err = conn.Write(data)
 		if err == nil {
 			return nil
 		}
-		time.Sleep(time.Millisecond * 100)
+		Log("Network write error: %v, retrying in 1s...\n", err)
+		time.Sleep(time.Second)
 	}
-	return err
 }
 
 type AutoReconnectTCP struct {
@@ -90,17 +75,21 @@ func (a *AutoReconnectTCP) Read(b []byte) (int, error) {
 	return n, nil
 }
 
+// Write all bytes, with reconnect and error handling
 func (a *AutoReconnectTCP) Write(b []byte) (int, error) {
 	if err := a.connect(); err != nil {
 		return 0, err
 	}
-
-	n, err := a.conn.Write(b)
-	if err != nil {
-		a.handleErr(err)
-		return 0, err
+	total := 0
+	for total < len(b) {
+		n, err := a.conn.Write(b[total:])
+		if err != nil {
+			a.handleErr(err)
+			return total, err
+		}
+		total += n
 	}
-	return n, nil
+	return total, nil
 }
 
 func (a *AutoReconnectTCP) Close() error {

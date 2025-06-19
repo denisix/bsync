@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"net"
 	"os"
+	"os/signal"
 	"time"
 )
 
@@ -18,14 +19,18 @@ type hashReceiver struct {
 	hashes       []serverChecksum
 	ready        chan struct{} // signals when a hash is ready
 	lastBlockNum uint64
+	fileSize     uint64
+	blockSize    uint64
 }
 
-func newHashReceiver(conn *AutoReconnectTCP, lastBlockNum uint64) *hashReceiver {
+func newHashReceiver(conn *AutoReconnectTCP, lastBlockNum, fileSize, blockSize uint64) *hashReceiver {
 	hr := &hashReceiver{
 		conn:         conn,
 		hashes:       make([]serverChecksum, lastBlockNum+1),
 		ready:        make(chan struct{}, 100),
 		lastBlockNum: lastBlockNum,
+		fileSize:     fileSize,
+		blockSize:    blockSize,
 	}
 
 	go hr.receiveHashes()
@@ -35,7 +40,7 @@ func newHashReceiver(conn *AutoReconnectTCP, lastBlockNum uint64) *hashReceiver 
 func (hr *hashReceiver) receiveHashes() {
 	hashBuf := make([]byte, 16)
 	for i := uint64(0); i <= hr.lastBlockNum; i++ {
-		if _, err := connReadFullWithRetry(hr.conn, hashBuf, 3); err != nil {
+		if _, err := connReadFullWithRetry(hr.conn, hashBuf); err != nil {
 			Log("Error reading hash: %v\n", err)
 			break
 		}
@@ -52,15 +57,84 @@ func (hr *hashReceiver) receiveHashes() {
 }
 
 func (hr *hashReceiver) waitForHash(blockIdx uint64) []byte {
-	if !hr.hashes[blockIdx].received {
+	for {
+		if hr.hashes[blockIdx].received {
+			return hr.hashes[blockIdx].hash
+		}
 		select {
 		case _, ok := <-hr.ready:
 			if !ok {
-				return nil // channel closed, error occurred
+				Log("Connection lost or channel closed, attempting to reconnect...\n")
+				for {
+					if hr.reconnectAndResync(blockIdx) == nil {
+						break
+					}
+					Log("Reconnect failed, retrying in 1s...\n")
+					time.Sleep(time.Second)
+				}
+			}
+		case <-time.After(30 * time.Second):
+			Log("Timeout waiting for hash %d, trying to reconnect...\n", blockIdx)
+			for {
+				if hr.reconnectAndResync(blockIdx) == nil {
+					break
+				}
+				Log("Reconnect failed, retrying in 1s...\n")
+				time.Sleep(time.Second)
 			}
 		}
 	}
-	return hr.hashes[blockIdx].hash
+}
+
+// Reconnect and resync: reconnects, resends initial message, skips already received hashes, resumes receiving
+func (hr *hashReceiver) reconnectAndResync(startIdx uint64) error {
+	// Close and reopen connection
+	if hr.conn != nil {
+		hr.conn.Close()
+	}
+	// Reconnect
+	saddr := hr.conn.addr
+	newConn := NewAutoReconnectTCP(saddr)
+	if err := newConn.connect(); err != nil {
+		return err
+	}
+	hr.conn = newConn
+
+	// Resend initial message
+	magicBytes := stringToFixedSizeArray(magicHead)
+	msg, err := pack(&Msg{
+		MagicHead:  magicBytes,
+		BlockIdx:   0,
+		BlockSize:  hr.blockSize,
+		FileSize:   hr.fileSize,
+		DataSize:   0,
+		Compressed: false,
+	})
+	if err != nil {
+		return err
+	}
+	if err := connWriteWithRetry(hr.conn, msg); err != nil {
+		return err
+	}
+
+	// Start a new hash receiver goroutine, skipping already received hashes
+	go func() {
+		hashBuf := make([]byte, 16)
+		for i := startIdx; i <= hr.lastBlockNum; i++ {
+			if _, err := connReadFullWithRetry(hr.conn, hashBuf); err != nil {
+				Log("Error reading hash after reconnect: %v\n", err)
+				break
+			}
+			copy(hr.hashes[i].hash, hashBuf)
+			hr.hashes[i].received = true
+			hr.ready <- struct{}{}
+			if i == hr.lastBlockNum {
+				break
+			}
+		}
+		close(hr.ready)
+	}()
+	return nil
 }
 
 func startClient(serverAddress string, skipIdx uint64, fileSize uint64, blockSize uint64, lastBlockNum uint64, noCompress bool, checksumCache *ChecksumCache) {
@@ -74,6 +148,28 @@ func startClient(serverAddress string, skipIdx uint64, fileSize uint64, blockSiz
 
 	conn := NewAutoReconnectTCP(saddr)
 	defer conn.Close()
+
+	// --- Signal handler for Ctrl+C (SIGINT) to send LastBlock message ---
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt)
+	go func() {
+		<-sigChan
+		Log("Caught interrupt, sending LastBlock message to server...\n")
+		msg, err := pack(&Msg{
+			MagicHead: magicBytes,
+			BlockIdx:  0,
+			BlockSize: blockSize,
+			FileSize:  fileSize,
+			DataSize:  0,
+			LastBlock: true,
+		})
+		if err == nil {
+			conn.Write(msg) // ignore error, best effort
+		}
+		time.Sleep(500 * time.Millisecond) // give server time to process
+		conn.Close()                       // explicitly close connection
+		os.Exit(1)
+	}()
 
 	// Send initial message with file info
 	msg, err := pack(&Msg{
@@ -97,7 +193,7 @@ func startClient(serverAddress string, skipIdx uint64, fileSize uint64, blockSiz
 
 	// Initialize hash receiver
 	Log("initialize hash receiver\n")
-	hashReceiver := newHashReceiver(conn, lastBlockNum)
+	hashReceiver := newHashReceiver(conn, lastBlockNum, fileSize, blockSize)
 
 	var totCompSize uint64 = 0
 	var totOrigSize uint64 = 0
@@ -151,11 +247,11 @@ func startClient(serverAddress string, skipIdx uint64, fileSize uint64, blockSiz
 			os.Exit(1)
 		}
 
-		if err := connWriteWithRetry(conn, msg, 3); err != nil {
+		if err := connWriteWithRetry(conn, msg); err != nil {
 			Log("Error sending block message: %v\n", err)
 			os.Exit(1)
 		}
-		if err := connWriteWithRetry(conn, blockData.Data, 3); err != nil {
+		if err := connWriteWithRetry(conn, blockData.Data); err != nil {
 			Log("Error sending block data: %v\n", err)
 			os.Exit(1)
 		}
@@ -178,7 +274,7 @@ func startClient(serverAddress string, skipIdx uint64, fileSize uint64, blockSiz
 		Log("Error packing completion message: %v\n", err)
 		return
 	}
-	if err := connWriteWithRetry(conn, msg, 3); err != nil {
+	if err := connWriteWithRetry(conn, msg); err != nil {
 		Log("Error sending completion message: %v\n", err)
 		return
 	}

@@ -5,6 +5,7 @@ import (
 	"math"
 	"os"
 	"os/exec"
+	"runtime"
 )
 
 var debug bool = true
@@ -24,6 +25,7 @@ func main() {
 	var quiet bool
 	var zLevel int
 	var zWindow int
+	var blocksAhead uint64
 
 	flag.StringVar(&device, "f", "/dev/zero", "specify file or device, i.e. '/dev/vda'")
 	flag.StringVar(&remoteAddr, "r", "", "specify remote address of server")
@@ -35,11 +37,16 @@ func main() {
 	flag.BoolVar(&quiet, "q", false, "be quiet, without output")
 	flag.IntVar(&zLevel, "z", 1, "compression level: 1=fastest, 2=default, 3=better, 4=best")
 	flag.IntVar(&zWindow, "w", 262144, "compression window size in bytes (default 262144, i.e. 256KB)")
+	flag.Uint64Var(&blocksAhead, "a", 0, "read-ahead blocks, default 0 (cores number)")
 	flag.Parse() // after declaring flags we need to call it
 
 	blockSize = bSize
 	compressionLevel = zLevel
 	compressionWindow = zWindow
+
+	if blocksAhead == 0 {
+		blocksAhead = uint64(runtime.NumCPU())
+	}
 
 	if blockSize == 0 {
 		Err("Block size cannot be zero\n")
@@ -91,7 +98,7 @@ func main() {
 		}
 		lastBlockNum := uint64(math.Ceil(float64(fileSize)/float64(blockSize))) - 1
 
-		checksumCache := NewChecksumCache(lastBlockNum, true, !noCompress, file, blockSize)
+		checksumCache := NewChecksumCache(lastBlockNum, true, !noCompress, file, blockSize, blocksAhead)
 
 		startClient(remoteAddr, skipIdx, fileSize, blockSize, lastBlockNum, noCompress, checksumCache)
 
@@ -115,7 +122,7 @@ func main() {
 		fileSize := getDeviceSize(file)
 		lastBlockNum := uint64(math.Ceil(float64(fileSize)/float64(blockSize))) - 1
 
-		checksumCache := NewChecksumCache(lastBlockNum, false, false, file, blockSize)
+		checksumCache := NewChecksumCache(lastBlockNum, false, false, file, blockSize, blocksAhead)
 
 		startServer(file, port, checksumCache)
 	}

@@ -1,9 +1,11 @@
 package main
 
 import (
+	"encoding/binary"
 	"io"
 	"net"
 	"os"
+	"time"
 )
 
 func handleClient(conn net.Conn, file *os.File, checksumCache *ChecksumCache) {
@@ -35,8 +37,7 @@ func handleClient(conn net.Conn, file *os.File, checksumCache *ChecksumCache) {
 	}
 	Log("handling client, src blocks: 0..%d, dst blocks: 0..%d\n", lastBlockNum, destBlockNum)
 
-	// Send all hashes sequentially in background
-	hashSendErr := make(chan error, 1)
+	// Send all hashes sequentially in background, retry forever on error
 	go func() {
 		for i := uint64(0); i <= lastBlockNum; i++ {
 			var hash []byte
@@ -45,57 +46,50 @@ func handleClient(conn net.Conn, file *os.File, checksumCache *ChecksumCache) {
 			} else {
 				hash = zeroBlockHash
 			}
-			// Log("sending hash [%d]: %x\n", i, hash)
-			if _, err := conn.Write(hash); err != nil {
-				Log("Error sending hash %d: %v\n", i, err)
-				hashSendErr <- err
-				return
+			for {
+				_, err := conn.Write(hash)
+				if err == nil {
+					break
+				}
+				// Exit if connection is closed or permanent error
+				if err == io.EOF || (err != nil && !isTemporaryNetErr(err)) {
+					Log("Hash send error (permanent): %v, exiting hash sender goroutine.\n", err)
+					return
+				}
+				Log("Hash send error: %v, retrying in 1s...\n", err)
+				time.Sleep(time.Second)
 			}
 		}
-		close(hashSendErr)
 	}()
 
 	// Handle incoming block data
 	filebuf := make([]byte, blockSize)
 	for {
-		select {
-		case err, ok := <-hashSendErr:
-			if !ok {
-				// Channel closed normally, continue processing
-				hashSendErr = nil
-				continue
+		msg, err := readMsg(conn)
+		if err != nil {
+			if err != io.EOF {
+				Log("Error reading message: %v\n", err)
 			}
-			if err != nil {
-				Log("Background hash sending failed: %v\n", err)
-				return
-			}
-		default:
-			msg, err := readMsg(conn)
-			if err != nil {
-				if err != io.EOF {
-					Log("Error reading message: %v\n", err)
-				}
-				return
-			}
+			return
+		}
 
-			if msg.LastBlock {
-				Log("Received last block, exiting\n")
-				os.Exit(0)
-				return
-			}
+		if msg.LastBlock {
+			Log("Received last block, exiting\n")
+			os.Exit(0)
+			return
+		}
 
-			if msg.DataSize > 0 {
-				if err := writeBlock(conn, file, msg, filebuf); err != nil {
-					Log("Error handling block: %v\n", err)
-					return
-				}
+		if msg.DataSize > 0 {
+			if err := writeBlock(conn, file, msg, filebuf); err != nil {
+				Log("Error handling block: %v\n", err)
+				return
 			}
 		}
 	}
 }
 
 func readMsg(conn net.Conn) (*Msg, error) {
-	msgBuf := make([]byte, 51)
+	msgBuf := make([]byte, binary.Size(Msg{}))
 	if _, err := io.ReadFull(conn, msgBuf); err != nil {
 		return nil, err
 	}
@@ -144,4 +138,10 @@ func startServer(file *os.File, port string, checksumCache *ChecksumCache) {
 		}
 		go handleClient(conn, file, checksumCache)
 	}
+}
+
+// Helper to check for temporary network errors
+func isTemporaryNetErr(err error) bool {
+	netErr, ok := err.(net.Error)
+	return ok && netErr.Temporary()
 }
