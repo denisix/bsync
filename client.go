@@ -59,9 +59,6 @@ func (hr *hashReceiver) waitForHash(blockIdx uint64) []byte {
 			if !ok {
 				return nil // channel closed, error occurred
 			}
-		case <-time.After(30 * time.Second):
-			Log("Timeout waiting for hash %d\n", blockIdx)
-			return nil
 		}
 	}
 	return hr.hashes[blockIdx].hash
@@ -114,7 +111,7 @@ func startClient(serverAddress string, skipIdx uint64, fileSize uint64, blockSiz
 
 		if serverHash == nil {
 			Log("Error: serverHash nil\n")
-			os.Exit(1)
+			continue
 		}
 
 		localHash := checksumCache.WaitFor(blockIdx)
