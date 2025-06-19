@@ -9,13 +9,13 @@ const magicLen = 17
 const magicHead = "blockSync-ver0.01"
 
 type Msg struct {
-  MagicHead  [magicLen]byte
-  BlockIdx   uint64
-  BlockSize  uint32
-  FileSize   uint64
-  DataSize   uint32
-  Compressed bool
-  LastBlock  bool
+	MagicHead  [magicLen]byte
+	BlockIdx   uint64
+	BlockSize  uint64
+	FileSize   uint64
+	DataSize   uint64
+	Compressed bool
+	LastBlock  bool
 }
 
 func stringToFixedSizeArray(s string) [magicLen]byte {
@@ -25,18 +25,18 @@ func stringToFixedSizeArray(s string) [magicLen]byte {
 }
 
 func pack(data *Msg) ([]byte, error) {
-  buf := new(bytes.Buffer)
-  if err := binary.Write(buf, binary.LittleEndian, data); err != nil {
-    return nil, err
-  }
-  return buf.Bytes(), nil
+	buf := new(bytes.Buffer)
+	if err := binary.Write(buf, binary.LittleEndian, data); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
 }
 
 func unpack(dataBytes []byte) (*Msg, error) {
-  data := &Msg{}
-  buf := bytes.NewReader(dataBytes)
-  if err := binary.Read(buf, binary.LittleEndian, data); err != nil {
-    return nil, err
-  }
-  return data, nil
+	data := &Msg{}
+	buf := bytes.NewReader(dataBytes)
+	if err := binary.Read(buf, binary.LittleEndian, data); err != nil {
+		return nil, err
+	}
+	return data, nil
 }

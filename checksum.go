@@ -28,12 +28,12 @@ type ChecksumCache struct {
 	storeData   bool
 	compress    bool
 	file        *os.File
-	blockSize   uint32
+	blockSize   uint64
 	mu          sync.RWMutex // protect map access
 	cleanupLock sync.Mutex   // protect cleanup operations
 }
 
-func NewChecksumCache(maxId uint64, storeData, compress bool, file *os.File, blockSize uint32) *ChecksumCache {
+func NewChecksumCache(maxId uint64, storeData, compress bool, file *os.File, blockSize uint64) *ChecksumCache {
 	cc := &ChecksumCache{
 		checksums: make(map[uint64]chan []byte),
 		maxId:     maxId,
@@ -126,7 +126,7 @@ func (cc *ChecksumCache) WaitForBlockData(idx uint64) *BlockData {
 	return data
 }
 
-func processBlock(f *os.File, bs uint32, idx uint64, cc *ChecksumCache) {
+func processBlock(f *os.File, bs uint64, idx uint64, cc *ChecksumCache) {
 	if f == nil || bs == 0 {
 		cc.mu.Lock()
 		if ch, ok := cc.checksums[idx]; ok {

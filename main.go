@@ -8,7 +8,7 @@ import (
 )
 
 var debug bool = true
-var blockSize uint32 = 10485760
+var blockSize uint64 = 10485760
 var mb1 float64 = 1048576.0
 var compressionLevel int = 1        // default: fastest
 var compressionWindow int = 1 << 18 // default: 256KB
@@ -16,7 +16,7 @@ var compressionWindow int = 1 << 18 // default: 256KB
 func main() {
 	var device string
 	var remoteAddr string
-	var bSize uint
+	var bSize uint64
 	var skipIdx uint64
 	var port string
 	var noCompress bool
@@ -27,7 +27,7 @@ func main() {
 
 	flag.StringVar(&device, "f", "/dev/zero", "specify file or device, i.e. '/dev/vda'")
 	flag.StringVar(&remoteAddr, "r", "", "specify remote address of server")
-	flag.UintVar(&bSize, "b", uint(blockSize), "block size, default 100M")
+	flag.Uint64Var(&bSize, "b", blockSize, "block size, default 100M")
 	flag.Uint64Var(&skipIdx, "s", 0, "skip blocks, default 0")
 	flag.StringVar(&port, "p", "8080", "bind to port, default 8080")
 	flag.BoolVar(&noCompress, "n", false, "do not compress blocks (by default compress)")
@@ -37,7 +37,7 @@ func main() {
 	flag.IntVar(&zWindow, "w", 262144, "compression window size in bytes (default 262144, i.e. 256KB)")
 	flag.Parse() // after declaring flags we need to call it
 
-	blockSize = uint32(bSize)
+	blockSize = bSize
 	compressionLevel = zLevel
 	compressionWindow = zWindow
 
@@ -86,8 +86,8 @@ func main() {
 			}
 			Err("Error: zero source file: %s\n", device)
 		}
-		if blockSize > uint32(fileSize) {
-			blockSize = uint32(fileSize)
+		if blockSize > fileSize {
+			blockSize = fileSize
 		}
 		lastBlockNum := uint64(math.Ceil(float64(fileSize)/float64(blockSize))) - 1
 

@@ -53,7 +53,7 @@ func waitForReady(stdout io.ReadCloser, isLocal bool) error {
 	return scanner.Err()
 }
 
-func startRemoteSSH(targetPath, port string, blockSize uint32, quiet bool) (*exec.Cmd, error) {
+func startRemoteSSH(targetPath, port string, blockSize uint64, quiet bool) (*exec.Cmd, error) {
 	// split sshTarget "user@host:/remote/path" -> "user@host" and "/remote/path"
 	user, host, file := parseSSHTarget(targetPath)
 

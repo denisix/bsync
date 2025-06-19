@@ -95,7 +95,7 @@ func handleClient(conn net.Conn, file *os.File, checksumCache *ChecksumCache) {
 }
 
 func readMsg(conn net.Conn) (*Msg, error) {
-	msgBuf := make([]byte, 43)
+	msgBuf := make([]byte, 51)
 	if _, err := io.ReadFull(conn, msgBuf); err != nil {
 		return nil, err
 	}

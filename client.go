@@ -29,10 +29,6 @@ func newHashReceiver(conn *AutoReconnectTCP, lastBlockNum uint64) *hashReceiver 
 		lastBlockNum: lastBlockNum,
 	}
 
-	for i := range hr.hashes {
-		hr.hashes[i].hash = make([]byte, 16)
-	}
-
 	go hr.receiveHashes()
 	return hr
 }
@@ -44,6 +40,7 @@ func (hr *hashReceiver) receiveHashes() {
 			Log("Error reading hash: %v\n", err)
 			break
 		}
+		hr.hashes[i].hash = make([]byte, 16)
 		copy(hr.hashes[i].hash, hashBuf)
 		// Log("received hash [%d]: %x\n", i, hashBuf)
 		hr.hashes[i].received = true
@@ -70,7 +67,7 @@ func (hr *hashReceiver) waitForHash(blockIdx uint64) []byte {
 	return hr.hashes[blockIdx].hash
 }
 
-func startClient(serverAddress string, skipIdx uint64, fileSize uint64, blockSize uint32, lastBlockNum uint64, noCompress bool, checksumCache *ChecksumCache) {
+func startClient(serverAddress string, skipIdx uint64, fileSize uint64, blockSize uint64, lastBlockNum uint64, noCompress bool, checksumCache *ChecksumCache) {
 	magicBytes := stringToFixedSizeArray(magicHead)
 
 	saddr, err := net.ResolveTCPAddr("tcp", serverAddress)
@@ -150,7 +147,7 @@ func startClient(serverAddress string, skipIdx uint64, fileSize uint64, blockSiz
 			BlockIdx:   blockIdx,
 			BlockSize:  blockSize,
 			FileSize:   fileSize,
-			DataSize:   uint32(len(blockData.Data)),
+			DataSize:   uint64(len(blockData.Data)),
 			Compressed: blockData.IsCompressed,
 		})
 		if err != nil {
