@@ -55,14 +55,14 @@ func main() {
 			}
 			defer sshCmd.Wait()
 		}
-	
+
 		file, err := os.OpenFile(device, os.O_RDONLY, 0666)
 		if err != nil {
 			Log("Error: opening source file: %s\n", device)
 			os.Exit(1)
 		}
 		defer file.Close()
-		
+
 		fileSize := getDeviceSize(file)
 
 		if fileSize == 0 {
@@ -74,8 +74,7 @@ func main() {
 		}
 		lastBlockNum := uint64(math.Ceil(float64(fileSize)/float64(blockSize))) - 1
 
-		checksumCache := NewChecksumCache(lastBlockNum)
-		go precomputeChecksums(file, blockSize, lastBlockNum, checksumCache, true, !noCompress)
+		checksumCache := NewChecksumCache(lastBlockNum, true, !noCompress, file, blockSize)
 
 		startClient(remoteAddr, skipIdx, fileSize, blockSize, lastBlockNum, noCompress, checksumCache)
 
@@ -99,8 +98,7 @@ func main() {
 		fileSize := getDeviceSize(file)
 		lastBlockNum := uint64(math.Ceil(float64(fileSize)/float64(blockSize))) - 1
 
-		checksumCache := NewChecksumCache(lastBlockNum)
-		go precomputeChecksums(file, blockSize, lastBlockNum, checksumCache, false, false)
+		checksumCache := NewChecksumCache(lastBlockNum, false, false, file, blockSize)
 
 		startServer(file, port, checksumCache)
 	}

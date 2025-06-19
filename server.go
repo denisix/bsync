@@ -101,6 +101,9 @@ func serverHandleReq(conn net.Conn, file *os.File, checksumCache *ChecksumCache)
 				break
 			}
 
+			if debug {
+				Log("\t- wait for checksum for block %d\n", msg.BlockIdx)
+			}
 			hash := checksumCache.WaitFor(msg.BlockIdx)
 
 			if debug {

@@ -4,16 +4,14 @@ import (
 	"hash/fnv"
 	"io"
 	"os"
-	"sync"
 )
 
-var zeroBlockHash = make([]byte, 16) // FNV-128a length
+var zeroBlockHash = make([]byte, 16)
 
-// compute FNV1a checksum
 func checksum(data []byte) []byte {
-	hasher := fnv.New128a() // Using 128-bit FNV-1a. You can also use New32a(), New64a() for smaller sizes.
-	hasher.Write(data)
-	return hasher.Sum(nil)
+	h := fnv.New128a()
+	h.Write(data)
+	return h.Sum(nil)
 }
 
 type BlockData struct {
@@ -22,169 +20,106 @@ type BlockData struct {
 }
 
 type ChecksumCache struct {
-	data           map[uint64][]byte
-	ready          map[uint64]bool
-	blockData      map[uint64]*BlockData
-	blockDataReady map[uint64]bool
-	mu             sync.Mutex
-	cond           *sync.Cond
-	maxId          uint64
-	windowSize     uint64
-	nextBlock      chan uint64
-	done           chan struct{}
+	checksums map[uint64]chan []byte
+	blocks    map[uint64]chan *BlockData // only if storeData
+	maxId     uint64
+	window    uint64
+	storeData bool
+	compress  bool
+	file      *os.File
+	blockSize uint32
 }
 
-func NewChecksumCache(maxId uint64) *ChecksumCache {
+func NewChecksumCache(maxId uint64, storeData, compress bool, file *os.File, blockSize uint32) *ChecksumCache {
 	cc := &ChecksumCache{
-		data:           make(map[uint64][]byte),
-		ready:          make(map[uint64]bool),
-		blockData:      make(map[uint64]*BlockData),
-		blockDataReady: make(map[uint64]bool),
-		maxId:          maxId,
-		windowSize:     10,
-		nextBlock:      make(chan uint64, 1),
-		done:           make(chan struct{}),
+		checksums: make(map[uint64]chan []byte),
+		maxId:     maxId,
+		window:    5,
+		storeData: storeData,
+		compress:  compress,
+		file:      file,
+		blockSize: blockSize,
 	}
-	cc.cond = sync.NewCond(&cc.mu)
+	if storeData {
+		cc.blocks = make(map[uint64]chan *BlockData)
+	}
 	return cc
 }
 
-func (cc *ChecksumCache) Set(idx uint64, checksum []byte) {
-	cc.mu.Lock()
-	defer cc.mu.Unlock()
-	cc.data[idx] = checksum
-	cc.ready[idx] = true
-	cc.cond.Broadcast()
-}
-
-func (cc *ChecksumCache) SetBlockData(idx uint64, data []byte, isCompressed bool) {
-	cc.mu.Lock()
-	defer cc.mu.Unlock()
-	cc.blockData[idx] = &BlockData{
-		Data:         data,
-		IsCompressed: isCompressed,
+func (cc *ChecksumCache) EnsureWindow(idx uint64) {
+	for i := idx; i < idx+cc.window && i <= cc.maxId; i++ {
+		if _, ok := cc.checksums[i]; !ok {
+			cc.checksums[i] = make(chan []byte, 1)
+			if cc.storeData && cc.blocks[i] == nil {
+				cc.blocks[i] = make(chan *BlockData, 1)
+			}
+			go processBlock(cc.file, cc.blockSize, i, cc)
+		}
 	}
-	cc.blockDataReady[idx] = true
-	cc.cond.Broadcast()
 }
 
 func (cc *ChecksumCache) WaitFor(idx uint64) []byte {
-	cc.mu.Lock()
-	defer cc.mu.Unlock()
-
 	if idx > cc.maxId {
-		return make([]byte, 16) // all-zero hash
+		return zeroBlockHash
 	}
-
-	for !cc.ready[idx] {
-		cc.cond.Wait()
+	cc.EnsureWindow(idx)
+	ch, ok := cc.checksums[idx]
+	if !ok {
+		return zeroBlockHash
 	}
-
-	return cc.data[idx]
+	return <-ch
 }
 
 func (cc *ChecksumCache) WaitForBlockData(idx uint64) *BlockData {
-	cc.mu.Lock()
-	defer cc.mu.Unlock()
-
-	if idx > cc.maxId {
+	if !cc.storeData {
 		return nil
 	}
+	cc.EnsureWindow(idx)
+	ch, ok := cc.blocks[idx]
+	if !ok {
+		return nil
+	}
+	return <-ch
+}
 
-	// Signal that we need to process this block
-	select {
-	case cc.nextBlock <- idx:
+func processBlock(f *os.File, bs uint32, idx uint64, cc *ChecksumCache) {
+	if f == nil || bs == 0 {
+		return
+	}
+	buf := make([]byte, bs)
+	off := int64(idx) * int64(bs)
+	n, err := f.ReadAt(buf, off)
+
+	var sum []byte
+	var bd *BlockData
+
+	switch {
+	case err != nil && err != io.EOF:
+		sum = []byte("ERR")
+	case n == 0 && err == io.EOF:
+		sum = []byte("EOF")
+	case isZeroBlock(buf[:n]):
+		sum = zeroBlockHash
+		if cc.storeData {
+			bd = &BlockData{Data: buf[:n]}
+		}
 	default:
-	}
-
-	for !cc.blockDataReady[idx] {
-		cc.cond.Wait()
-	}
-
-	return cc.blockData[idx]
-}
-
-func (cc *ChecksumCache) GetWindowSize() uint64 {
-	return cc.windowSize
-}
-
-func (cc *ChecksumCache) Close() {
-	close(cc.done)
-	cc.cond.Broadcast()
-}
-
-func precomputeChecksums(file *os.File, blockSize uint32, lastBlockNum uint64, cache *ChecksumCache, storeData bool, tryCompress bool) {
-	Log("checksums: start computing..\n")
-	windowSize := cache.GetWindowSize()
-
-	// Process initial window
-	for i := uint64(0); i < windowSize && i <= lastBlockNum; i++ {
-		processBlock(file, blockSize, i, cache, storeData, tryCompress)
-	}
-
-	// Process remaining blocks as requested
-	for {
-		select {
-		case <-cache.done:
-			return
-		case idx := <-cache.nextBlock:
-			// Process any block up to and including the last block
-			if idx <= lastBlockNum {
-				processBlock(file, blockSize, idx, cache, storeData, tryCompress)
-			}
-		}
-	}
-}
-
-func processBlock(file *os.File, blockSize uint32, idx uint64, cache *ChecksumCache, storeData bool, tryCompress bool) {
-	// Read block data
-	buf := make([]byte, blockSize)
-	offset := int64(idx) * int64(blockSize)
-
-	n, err := file.ReadAt(buf, offset)
-	if err != nil && err != io.EOF {
-		Log("Read error at block %d: %v\n", idx, err)
-		cache.Set(idx, []byte("ERR"))
-		cache.SetBlockData(idx, nil, false)
-		return
-	}
-	if n == 0 && err == io.EOF {
-		cache.Set(idx, []byte("EOF"))
-		cache.SetBlockData(idx, nil, false)
-		return
-	}
-
-	// Check if it's a zero block
-	if isZeroBlock(buf[:n]) {
-		cache.Set(idx, zeroBlockHash)
-		if storeData {
-			cache.SetBlockData(idx, buf[:n], false)
-		} else {
-			cache.SetBlockData(idx, nil, false)
-		}
-		return
-	}
-
-	// Compute and store checksum
-	hash := checksum(buf[:n])
-	cache.Set(idx, hash)
-
-	// Store data if requested
-	if storeData {
-		if tryCompress {
-			compressed, err := compressData(buf[:n])
-			if err != nil {
-				Log("Compression error at block %d: %v\n", idx, err)
-				cache.SetBlockData(idx, buf[:n], false)
-			} else if len(compressed) < n {
-				cache.SetBlockData(idx, compressed, true)
+		sum = checksum(buf[:n])
+		if cc.storeData {
+			if cc.compress {
+				if c, e := compressData(buf[:n]); e == nil && len(c) < n {
+					bd = &BlockData{Data: c, IsCompressed: true}
+				} else {
+					bd = &BlockData{Data: buf[:n]}
+				}
 			} else {
-				cache.SetBlockData(idx, buf[:n], false)
+				bd = &BlockData{Data: buf[:n]}
 			}
-		} else {
-			cache.SetBlockData(idx, buf[:n], false)
 		}
-	} else {
-		cache.SetBlockData(idx, nil, false)
+	}
+
+	cc.checksums[idx] <- sum
+	if cc.storeData {
+		cc.blocks[idx] <- bd
 	}
 }

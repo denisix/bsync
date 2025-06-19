@@ -191,6 +191,6 @@ func startClient(serverAddress string, skipIdx uint64, fileSize uint64, blockSiz
 	}
 
 	Log("\nDONE, exiting..\n\n")
-	checksumCache.Close()
+	// checksumCache.Close() // No longer needed
 	time.Sleep(2 * time.Second)
 }

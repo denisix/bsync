@@ -261,6 +261,10 @@ create_random_file "$TEST_DIR/multi_non_aligned_src.img" 26214400 # 25MB
 dd if=/dev/urandom of="$TEST_DIR/multi_non_aligned_src.img" bs=1 count=777 conv=notrunc 2>/dev/null
 run_test "Source file multiple non-aligned blocks (25MB+777 bytes)" "$TEST_DIR/multi_non_aligned_src.img" "$TEST_DIR/dst35.img" 0
 
+# Test 36: Source file big random, 200MB
+create_random_file "$TEST_DIR/big_src.img" 209715200 # 200MB
+run_test "Source file big random, 200MB" "$TEST_DIR/big_src.img" "$TEST_DIR/dst_big.img" 0
+
 echo "All edge case tests completed successfully!"
 echo "Cleaning up test files..."
 rm -rf "$TEST_DIR"
