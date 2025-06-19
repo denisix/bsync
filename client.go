@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"io"
 	"net"
 	"os"
 	"time"
@@ -36,7 +35,7 @@ func newHashReceiver(conn *AutoReconnectTCP, lastBlockNum uint64) *hashReceiver 
 func (hr *hashReceiver) receiveHashes() {
 	hashBuf := make([]byte, 16)
 	for i := uint64(0); i <= hr.lastBlockNum; i++ {
-		if _, err := io.ReadFull(hr.conn, hashBuf); err != nil {
+		if _, err := connReadFullWithRetry(hr.conn, hashBuf, 3); err != nil {
 			Log("Error reading hash: %v\n", err)
 			break
 		}
@@ -110,8 +109,8 @@ func startClient(serverAddress string, skipIdx uint64, fileSize uint64, blockSiz
 		serverHash := hashReceiver.waitForHash(blockIdx)
 
 		if serverHash == nil {
-			Log("Error: serverHash nil\n")
-			continue
+			Log("Error: serverHash nil after retries\n")
+			os.Exit(1)
 		}
 
 		localHash := checksumCache.WaitFor(blockIdx)
@@ -152,11 +151,11 @@ func startClient(serverAddress string, skipIdx uint64, fileSize uint64, blockSiz
 			os.Exit(1)
 		}
 
-		if _, err := conn.Write(msg); err != nil {
+		if err := connWriteWithRetry(conn, msg, 3); err != nil {
 			Log("Error sending block message: %v\n", err)
 			os.Exit(1)
 		}
-		if _, err := conn.Write(blockData.Data); err != nil {
+		if err := connWriteWithRetry(conn, blockData.Data, 3); err != nil {
 			Log("Error sending block data: %v\n", err)
 			os.Exit(1)
 		}
@@ -179,7 +178,7 @@ func startClient(serverAddress string, skipIdx uint64, fileSize uint64, blockSiz
 		Log("Error packing completion message: %v\n", err)
 		return
 	}
-	if _, err := conn.Write(msg); err != nil {
+	if err := connWriteWithRetry(conn, msg, 3); err != nil {
 		Log("Error sending completion message: %v\n", err)
 		return
 	}
