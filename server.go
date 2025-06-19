@@ -30,18 +30,20 @@ func handleClient(conn net.Conn, file *os.File, checksumCache *ChecksumCache) {
 	if msg.FileSize%uint64(blockSize) != 0 {
 		lastBlockNum++
 	}
-	destSize := getDeviceSize(file)
-	destBlockNum := uint64(destSize / uint64(blockSize))
-	if destSize%uint64(blockSize) != 0 {
-		destBlockNum++
-	}
-	Log("handling client, src blocks: 0..%d, dst blocks: 0..%d\n", lastBlockNum, destBlockNum)
+
+	Log("handling client, src blocks: 0..%d\n", lastBlockNum)
+
+	// --- Block stats ---
+	t0 := time.Now()
+	totalBlocks := 0
+	totalBytes := uint64(0)
+	totalCompressed := uint64(0)
 
 	// Send all hashes sequentially in background, retry forever on error
 	go func() {
 		for i := uint64(0); i <= lastBlockNum; i++ {
 			var hash []byte
-			if i < destBlockNum {
+			if i < lastBlockNum {
 				hash = checksumCache.WaitFor(i)
 			} else {
 				hash = zeroBlockHash
@@ -74,6 +76,11 @@ func handleClient(conn net.Conn, file *os.File, checksumCache *ChecksumCache) {
 		}
 
 		if msg.LastBlock {
+			elapsed := time.Since(t0).Seconds()
+			mbs := float64(totalBytes) / mb1 / elapsed
+			compRatio := float64(totalCompressed) / float64(totalBytes)
+			Log("\nTransfer complete: %d blocks, %d bytes, compressed: %d bytes, ratio: %.2f%%, avg %.2f MB/s\n",
+				totalBlocks, totalBytes, totalCompressed, 100*compRatio, mbs)
 			Log("Received last block, exiting\n")
 			os.Exit(0)
 			return
@@ -84,6 +91,12 @@ func handleClient(conn net.Conn, file *os.File, checksumCache *ChecksumCache) {
 				Log("Error handling block: %v\n", err)
 				return
 			}
+			totalBlocks++
+			totalBytes += msg.DataSize
+			if msg.Compressed {
+				totalCompressed += msg.DataSize
+			}
+			Log("block %d/%d\r", msg.BlockIdx, lastBlockNum)
 		}
 	}
 }

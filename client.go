@@ -40,9 +40,19 @@ func newHashReceiver(conn *AutoReconnectTCP, lastBlockNum, fileSize, blockSize u
 func (hr *hashReceiver) receiveHashes() {
 	hashBuf := make([]byte, 16)
 	for i := uint64(0); i <= hr.lastBlockNum; i++ {
-		if _, err := connReadFullWithRetry(hr.conn, hashBuf); err != nil {
-			Log("Error reading hash: %v\n", err)
-			break
+		for {
+			if _, err := connReadFullWithRetry(hr.conn, hashBuf); err != nil {
+				Log("Error reading hash: %v, attempting reconnect...\n", err)
+				for {
+					if hr.reconnectAndResync(i) == nil {
+						break
+					}
+					Log("Reconnect failed, retrying in 1s...\n")
+					time.Sleep(time.Second)
+				}
+				continue // retry reading this hash after reconnect
+			}
+			break // success
 		}
 		hr.hashes[i].hash = make([]byte, 16)
 		copy(hr.hashes[i].hash, hashBuf)
@@ -113,27 +123,11 @@ func (hr *hashReceiver) reconnectAndResync(startIdx uint64) error {
 	if err != nil {
 		return err
 	}
+	Log("Resending initial message to server after reconnect...\n")
 	if err := connWriteWithRetry(hr.conn, msg); err != nil {
 		return err
 	}
-
-	// Start a new hash receiver goroutine, skipping already received hashes
-	go func() {
-		hashBuf := make([]byte, 16)
-		for i := startIdx; i <= hr.lastBlockNum; i++ {
-			if _, err := connReadFullWithRetry(hr.conn, hashBuf); err != nil {
-				Log("Error reading hash after reconnect: %v\n", err)
-				break
-			}
-			copy(hr.hashes[i].hash, hashBuf)
-			hr.hashes[i].received = true
-			hr.ready <- struct{}{}
-			if i == hr.lastBlockNum {
-				break
-			}
-		}
-		close(hr.ready)
-	}()
+	// Do NOT start a new goroutine here. Let receiveHashes continue after reconnect.
 	return nil
 }
 
@@ -203,6 +197,7 @@ func startClient(serverAddress string, skipIdx uint64, fileSize uint64, blockSiz
 	Log("processing blocks: %d .. %d\n", skipIdx, lastBlockNum)
 	for blockIdx := uint64(skipIdx); blockIdx <= lastBlockNum; blockIdx++ {
 		serverHash := hashReceiver.waitForHash(blockIdx)
+		// Log("hash [%d]: %x\n", blockIdx, serverHash)
 
 		if serverHash == nil {
 			Log("Error: serverHash nil after retries\n")
@@ -213,14 +208,19 @@ func startClient(serverAddress string, skipIdx uint64, fileSize uint64, blockSiz
 		totOrigSize += uint64(blockSize)
 		secs := time.Since(t0).Seconds()
 		mbs := float64(0)
+		mbsLeft := float64(lastBlockNum - blockIdx)
+		eta := 0
 		if secs > 0 {
 			mbs = float64(totOrigSize) / mb1 / secs
+		}
+		if mbs > 0 {
+			eta = int(mbsLeft / mbs / 60)
 		}
 
 		if bytes.Equal(localHash, serverHash) || bytes.Equal(localHash, zeroBlockHash) {
 			totCompSize += uint64(blockSize)
 			ratio := float32(100 * (float64(totCompSize) / float64(totOrigSize)))
-			Log("block %d/%d (%0.2f%%) [-] size=%d ratio=%0.2f %0.2f MB/s\r", blockIdx, lastBlockNum, ratio, fileSize, ratio, mbs)
+			Log("block %d/%d (%0.2f%%) [-] size=%d ratio=%0.2f %0.2f MB/s (%d min eta)\r", blockIdx, lastBlockNum, ratio, fileSize, ratio, mbs, eta)
 			continue
 		}
 
@@ -256,9 +256,9 @@ func startClient(serverAddress string, skipIdx uint64, fileSize uint64, blockSiz
 			os.Exit(1)
 		}
 
-		Log("block %d/%d (%0.2f%%) [%s] size=%d ratio=%0.2f %0.2f MB/s\r",
+		Log("block %d/%d (%0.2f%%) [%s] size=%d ratio=%0.2f %0.2f MB/s eta %d min\r",
 			blockIdx, lastBlockNum, ratio, map[bool]string{true: "c", false: "w"}[blockData.IsCompressed],
-			fileSize, ratio, mbs)
+			fileSize, ratio, mbs, eta)
 	}
 
 	// Send completion message

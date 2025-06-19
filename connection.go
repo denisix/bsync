@@ -16,6 +16,14 @@ func connReadFullWithRetry(conn net.Conn, buf []byte) (int, error) {
 			return n, nil
 		}
 		Log("Network read error: %v, retrying in 1s...\n", err)
+		// If connection is AutoReconnectTCP, try to reconnect on EOF or permanent error
+		if err == io.EOF || (err != nil && !isTemporaryNetErrConn(err)) {
+			if artcp, ok := conn.(*AutoReconnectTCP); ok {
+				Log("Triggering reconnect after read error...\n")
+				artcp.Close()
+				_ = artcp.connect()
+			}
+		}
 		time.Sleep(time.Second)
 	}
 }
@@ -29,8 +37,22 @@ func connWriteWithRetry(conn net.Conn, data []byte) error {
 			return nil
 		}
 		Log("Network write error: %v, retrying in 1s...\n", err)
+		// If connection is AutoReconnectTCP, try to reconnect on EOF or permanent error
+		if err == io.EOF || (err != nil && !isTemporaryNetErrConn(err)) {
+			if artcp, ok := conn.(*AutoReconnectTCP); ok {
+				Log("Triggering reconnect after write error...\n")
+				artcp.Close()
+				_ = artcp.connect()
+			}
+		}
 		time.Sleep(time.Second)
 	}
+}
+
+// Helper to check for temporary network errors (local to connection.go)
+func isTemporaryNetErrConn(err error) bool {
+	netErr, ok := err.(net.Error)
+	return ok && netErr.Temporary()
 }
 
 type AutoReconnectTCP struct {
