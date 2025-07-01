@@ -42,7 +42,7 @@ func startRemoteSSH(targetPath, port string, blockSize uint32) (*exec.Cmd, error
 	args := []string{"ssh", host, "bsync", "-f", file, "-p", port, "-b", strconv.FormatUint(uint64(blockSize), 10)}
 	Log("spawning ssh with args: %s\n", args)
 	cmd := exec.Command(args[0], args[1:]...)
-	
+
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return nil, err

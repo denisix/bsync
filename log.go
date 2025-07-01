@@ -7,8 +7,12 @@ import (
 
 var logPrefix = "[main]"
 
-func SetLogPrefix(p string) {
-	logPrefix = p
+func SetLogPrefix(pre1, pre2 string) {
+	if pre1 != "" {
+		logPrefix = pre1 + " " + pre2
+	} else {
+		logPrefix = pre2
+	}
 }
 
 func Log(format string, args ...interface{}) {

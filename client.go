@@ -23,7 +23,8 @@ func startClient(file *os.File, serverAddress string, skipIdx uint32, fileSize u
 
   var totCompSize uint64 = 0
   var totOrigSize uint64 = 0
-  var percent float32 = 0
+  var percent float64 = 0
+	var diffs uint64 = 0
   t0 := time.Now()
   mbs := 0.0
   eta := 0
@@ -88,20 +89,23 @@ func startClient(file *os.File, serverAddress string, skipIdx uint32, fileSize u
 		if mbs > 0 { eta = int(mbsLeft / mbs / 60) }
 		if eta < 0 { eta = 0 }
 		if blockIdx >= lastBlockNum { eta = 0 }
+		percent = float64(blockIdx) / float64(lastBlockNum)
 
 		if bytes.Equal(hash, serverHash) || bytes.Equal(hash, zeroBlockHash) {
  		   // Block is already in sync, or it's a known zero block — skip sending
 			totCompSize = totCompSize + uint64(blockSize)
-			ratio := float32(100 * (float64(totCompSize) / float64(totOrigSize)))
+			ratio := 100 * float64(totCompSize) / float64(totOrigSize)
     
-			Log("block %d/%d (%0.2f%%) [-] size=%d ratio=%0.2f %0.2f MB/s ETA=%d min\r", blockIdx, lastBlockNum, percent, fileSize, ratio, mbs, eta)
+			Log("block %d/%d (%0.2f%%) [-] size=%d ratio=%0.2f %0.2f MB/s ETA=%d min diffs=%d\r", blockIdx, lastBlockNum, percent, fileSize, ratio, mbs, eta, diffs)
 			continue
     }
 
+		diffs = diffs + 1
+
 		if noCompress {
 			totCompSize = totCompSize + uint64(blockSize)
-			ratio := float32(100 * (float64(totCompSize) / float64(totOrigSize)))
-			Log("block %d/%d (%0.2f%%) [w] size=%d ratio=%0.2f %0.2f MB/s ETA=%d min\r", blockIdx, lastBlockNum, percent, fileSize, ratio, mbs, eta)
+			ratio := 100 * float64(totCompSize) / float64(totOrigSize)
+			Log("block %d/%d (%0.2f%%) [w] size=%d ratio=%0.2f %0.2f MB/s ETA=%d min diffs=%d\r", blockIdx, lastBlockNum, percent, fileSize, ratio, mbs, eta, diffs)
 
 			msg, err1 := pack(&Msg{
 				MagicHead: magicBytes,
@@ -136,10 +140,10 @@ func startClient(file *os.File, serverAddress string, skipIdx uint32, fileSize u
 
 		compressedBytes := uint32(len(compBuf))
 		totCompSize = totCompSize + uint64(compressedBytes)
-		ratio := float32(100 * (float64(totCompSize) / float64(totOrigSize)))
+		ratio := 100 * float64(totCompSize) / float64(totOrigSize)
 
 		if compressedBytes < blockSize {
-			Log("block %d/%d (%0.2f%%) [c] size=%d ratio=%0.2f %0.2f MB/s ETA=%d min\r", blockIdx, lastBlockNum, percent, fileSize, ratio, mbs, eta)
+			Log("block %d/%d (%0.2f%%) [c] size=%d ratio=%0.2f %0.2f MB/s ETA=%d min diffs=%d\r", blockIdx, lastBlockNum, percent, fileSize, ratio, mbs, eta, diffs)
 
 			msg, err1 := pack(&Msg{
 				MagicHead: magicBytes,
@@ -163,7 +167,7 @@ func startClient(file *os.File, serverAddress string, skipIdx uint32, fileSize u
 				break
 			}
 		} else {
-			Log("block %d/%d (%0.2f%%) [w] size=%d ratio=%0.2f %0.2f MB/s ETA=%d min\r", blockIdx, lastBlockNum, percent, fileSize, ratio, mbs, eta)
+			Log("block %d/%d (%0.2f%%) [w] size=%d ratio=%0.2f %0.2f MB/s ETA=%d min diffs=%d\r", blockIdx, lastBlockNum, percent, fileSize, ratio, mbs, eta, diffs)
 
 			msg, err1 := pack(&Msg{
 				MagicHead: magicBytes,
