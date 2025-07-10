@@ -6,6 +6,7 @@ import (
   "net"
   "bufio"
   "time"
+	"encoding/binary"
 )
 
 func serverHandleReq(conn net.Conn, file *os.File, checksumCache *ChecksumCache) {
@@ -14,7 +15,7 @@ func serverHandleReq(conn net.Conn, file *os.File, checksumCache *ChecksumCache)
   magicBytes := stringToFixedSizeArray(magicHead)
 
   filebuf := make([]byte, blockSize)
-  msgBuf := make([]byte, 21 + magicLen)
+	msgBuf := make([]byte, binary.Size(Msg{}))
 
   var lastBlockNum uint32 = 0
   var lastPartSize uint64 = 0
@@ -107,6 +108,15 @@ func serverHandleReq(conn net.Conn, file *os.File, checksumCache *ChecksumCache)
 				return
       }
 
+			if msg.Zero {
+				zero := make([]byte, msg.DataSize)
+        n, err := file.WriteAt(zero, offset)
+        if err != nil && err != io.EOF {
+          Log("\t- error writing to file: [%d] %s\n", n, err.Error())
+          break
+        }
+			}
+
       if msg.Compressed {
         decompressed, err := decompressData(filebuf[:msg.DataSize])
         if err != nil {
@@ -117,7 +127,7 @@ func serverHandleReq(conn net.Conn, file *os.File, checksumCache *ChecksumCache)
         if debug { Log("\t- write uncompressed bytes: %d [%d bytes]\n", msg.DataSize, len(decompressed)) }
         n, err2 := file.WriteAt(decompressed, offset)
         if err2 != nil && err2 != io.EOF {
-          Log("\t- error reading from file: [%d] %s\n", n, err2.Error())
+          Log("\t- error writing to file: [%d] %s\n", n, err2.Error())
           break
         }
       } else {

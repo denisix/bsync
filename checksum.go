@@ -58,9 +58,9 @@ func (cc *ChecksumCache) WaitFor(idx uint32) []byte {
 	return cc.data[idx]
 }
 
-func precomputeChecksums(file *os.File, blockSize uint32, lastBlockNum uint32, cache *ChecksumCache) {
+func precomputeChecksums(file *os.File, blockSize uint32, lastBlockNum uint32, cache *ChecksumCache, skipIdx uint32) {
 	Log("checksums: start computing..\n")
-	for idx := uint32(0); idx <= lastBlockNum; idx++ {
+	for idx := skipIdx; idx <= lastBlockNum; idx++ {
 		buf := make([]byte, blockSize)
 		offset := int64(idx) * int64(blockSize)
 

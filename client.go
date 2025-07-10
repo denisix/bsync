@@ -28,6 +28,7 @@ func startClient(file *os.File, serverAddress string, skipIdx uint32, fileSize u
   t0 := time.Now()
   mbs := 0.0
   eta := 0
+	etaUnit := "min"
 
   buf := make([]byte, blockSize)
 
@@ -45,6 +46,7 @@ func startClient(file *os.File, serverAddress string, skipIdx uint32, fileSize u
       FileSize: fileSize,
       DataSize: 0,
       Compressed: false,
+			Zero: false,
     })
     if err1 != nil { Log("\t- cant pack msg-> %s\n", err1) }
     if debug { Log("\t- sending packed msg-> %s [%d bytes]\n", msg, len(msg)) }
@@ -86,26 +88,32 @@ func startClient(file *os.File, serverAddress string, skipIdx uint32, fileSize u
 		mbsLeft := blocksLeft * blockMb
 		mbs = mbsDelta / secs
 
-		if mbs > 0 { eta = int(mbsLeft / mbs / 60) }
+		if mbs > 0 { 
+			eta = int(mbsLeft / mbs / 60)
+			etaUnit = "min"
+			if eta > 180 {
+				eta = eta / 60
+				etaUnit = "hr"
+			}
+		}
 		if eta < 0 { eta = 0 }
 		if blockIdx >= lastBlockNum { eta = 0 }
-		percent = float64(blockIdx) / float64(lastBlockNum)
+		percent = 100 * float64(blockIdx) / float64(lastBlockNum)
 
-		if bytes.Equal(hash, serverHash) || bytes.Equal(hash, zeroBlockHash) {
- 		   // Block is already in sync, or it's a known zero block — skip sending
+ 		  // Block is already in sync, or it's a known zero block — skip sending
+		if bytes.Equal(hash, serverHash) {
 			totCompSize = totCompSize + uint64(blockSize)
 			ratio := 100 * float64(totCompSize) / float64(totOrigSize)
     
-			Log("block %d/%d (%0.2f%%) [-] size=%d ratio=%0.2f %0.2f MB/s ETA=%d min diffs=%d\r", blockIdx, lastBlockNum, percent, fileSize, ratio, mbs, eta, diffs)
+			Log("block %d/%d (%0.2f%%) [-] size=%d ratio=%0.2f %0.2f MB/s ETA=%d %s diffs=%d\r", blockIdx, lastBlockNum, percent, fileSize, ratio, mbs, eta, etaUnit, diffs)
 			continue
     }
 
-		diffs = diffs + 1
-
-		if noCompress {
+		// Block zero, just send that it's zero
+		if bytes.Equal(hash, zeroBlockHash) {
 			totCompSize = totCompSize + uint64(blockSize)
 			ratio := 100 * float64(totCompSize) / float64(totOrigSize)
-			Log("block %d/%d (%0.2f%%) [w] size=%d ratio=%0.2f %0.2f MB/s ETA=%d min diffs=%d\r", blockIdx, lastBlockNum, percent, fileSize, ratio, mbs, eta, diffs)
+			Log("block %d/%d (%0.2f%%) [.] size=%d ratio=%0.2f %0.2f MB/s ETA=%d %s diffs=%d\r", blockIdx, lastBlockNum, percent, fileSize, ratio, mbs, eta, etaUnit, diffs)
 
 			msg, err1 := pack(&Msg{
 				MagicHead: magicBytes,
@@ -114,6 +122,39 @@ func startClient(file *os.File, serverAddress string, skipIdx uint32, fileSize u
 				FileSize: fileSize,
 				DataSize: uint32(readedBytes),
 				Compressed: false,
+				Zero: true,
+			})
+			if err1 != nil { Log("\t- cant pack msg-> %s\n", err) }
+
+			n, err2 := conn.Write(msg) // writeConn(conn, b)
+			if err2 != nil && err2 != io.EOF {
+				Log("\t- error writing net: [%d] %s\n", n, err2.Error())
+				break
+			}
+
+			n, err3 := conn.Write(buf[:readedBytes]) // writeConn(conn, b)
+			if err3 != nil && err3 != io.EOF {
+				Log("\t- error writing net: [%d] %s\n", n, err3.Error())
+				break
+			}
+			continue
+		}
+
+		diffs = diffs + 1
+
+		if noCompress {
+			totCompSize = totCompSize + uint64(blockSize)
+			ratio := 100 * float64(totCompSize) / float64(totOrigSize)
+			Log("block %d/%d (%0.2f%%) [w] size=%d ratio=%0.2f %0.2f MB/s ETA=%d %s diffs=%d\r", blockIdx, lastBlockNum, percent, fileSize, ratio, mbs, eta, etaUnit, diffs)
+
+			msg, err1 := pack(&Msg{
+				MagicHead: magicBytes,
+				BlockIdx: blockIdx,
+				BlockSize: blockSize,
+				FileSize: fileSize,
+				DataSize: uint32(readedBytes),
+				Compressed: false,
+				Zero: false,
 			})
 			if err1 != nil { Log("\t- cant pack msg-> %s\n", err) }
 
@@ -143,7 +184,7 @@ func startClient(file *os.File, serverAddress string, skipIdx uint32, fileSize u
 		ratio := 100 * float64(totCompSize) / float64(totOrigSize)
 
 		if compressedBytes < blockSize {
-			Log("block %d/%d (%0.2f%%) [c] size=%d ratio=%0.2f %0.2f MB/s ETA=%d min diffs=%d\r", blockIdx, lastBlockNum, percent, fileSize, ratio, mbs, eta, diffs)
+			Log("block %d/%d (%0.2f%%) [c] size=%d ratio=%0.2f %0.2f MB/s ETA=%d %s diffs=%d\r", blockIdx, lastBlockNum, percent, fileSize, ratio, mbs, eta, etaUnit, diffs)
 
 			msg, err1 := pack(&Msg{
 				MagicHead: magicBytes,
@@ -152,6 +193,7 @@ func startClient(file *os.File, serverAddress string, skipIdx uint32, fileSize u
 				FileSize: fileSize,
 				DataSize: compressedBytes,
 				Compressed: true,
+				Zero: false,
 			})
 			if err1 != nil { Log("\t- cant pack msg-> %s\n", err) }
 
@@ -167,7 +209,7 @@ func startClient(file *os.File, serverAddress string, skipIdx uint32, fileSize u
 				break
 			}
 		} else {
-			Log("block %d/%d (%0.2f%%) [w] size=%d ratio=%0.2f %0.2f MB/s ETA=%d min diffs=%d\r", blockIdx, lastBlockNum, percent, fileSize, ratio, mbs, eta, diffs)
+			Log("block %d/%d (%0.2f%%) [w] size=%d ratio=%0.2f %0.2f MB/s ETA=%d %s diffs=%d\r", blockIdx, lastBlockNum, percent, fileSize, ratio, mbs, eta, etaUnit, diffs)
 
 			msg, err1 := pack(&Msg{
 				MagicHead: magicBytes,
@@ -176,6 +218,7 @@ func startClient(file *os.File, serverAddress string, skipIdx uint32, fileSize u
 				FileSize: fileSize,
 				DataSize: uint32(readedBytes),
 				Compressed: false,
+				Zero: false,
 			})
 			if err1 != nil { Log("\t- cant pack msg-> %s\n", err) }
 

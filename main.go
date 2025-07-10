@@ -48,7 +48,7 @@ func main() {
 		if sshTarget != "" {
 			Log("launching remote server via SSH: %s\n", sshTarget)
 			var err error
-			sshCmd, err = startRemoteSSH(sshTarget, port, blockSize)
+			sshCmd, err = startRemoteSSH(sshTarget, port, blockSize, uint32(skipIdx))
 			if err != nil {
 				Log("Error: SSH launch failed: %s\n", err)
 				return
@@ -67,7 +67,7 @@ func main() {
 		lastBlockNum := uint32(fileSize / uint64(blockSize))
 
 		checksumCache := NewChecksumCache(lastBlockNum)
-		go precomputeChecksums(file, blockSize, lastBlockNum, checksumCache)
+		go precomputeChecksums(file, blockSize, lastBlockNum, checksumCache, uint32(skipIdx))
 
 		startClient(file, remoteAddr, uint32(skipIdx), fileSize, blockSize, noCompress, checksumCache)
 
@@ -93,7 +93,7 @@ func main() {
 		lastBlockNum := uint32(fileSize / uint64(blockSize))
 
 		checksumCache := NewChecksumCache(lastBlockNum)
-		go precomputeChecksums(file, blockSize, lastBlockNum, checksumCache)
+		go precomputeChecksums(file, blockSize, lastBlockNum, checksumCache, uint32(skipIdx))
 
 		startServer(file, port, checksumCache)
 	}

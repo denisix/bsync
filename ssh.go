@@ -30,7 +30,7 @@ func parseSSHTarget(input string) (user, host, file string) {
 	return user, host, file
 }
 
-func startRemoteSSH(targetPath, port string, blockSize uint32) (*exec.Cmd, error) {
+func startRemoteSSH(targetPath, port string, blockSize, skipIdx uint32) (*exec.Cmd, error) {
 	// split sshTarget "user@host:/remote/path" -> "user@host" and "/remote/path"
 	user, host, file := parseSSHTarget(targetPath)
 
@@ -39,7 +39,13 @@ func startRemoteSSH(targetPath, port string, blockSize uint32) (*exec.Cmd, error
 	}
 
 	// run SSH command
-	args := []string{"ssh", host, "bsync", "-f", file, "-p", port, "-b", strconv.FormatUint(uint64(blockSize), 10)}
+	args := []string{
+		"ssh", host,
+		"bsync", "-f", file,
+		"-p", port,
+		"-b", strconv.FormatUint(uint64(blockSize), 10),
+		"-s", strconv.FormatUint(uint64(skipIdx), 10),
+	}
 	Log("spawning ssh with args: %s\n", args)
 	cmd := exec.Command(args[0], args[1:]...)
 
