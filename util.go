@@ -1,19 +1,19 @@
 package main
 
 import (
-  "io"
-  "os"
+	"io"
+	"os"
 )
 
 func getDeviceSize(file *os.File) uint64 {
-  pos, err := file.Seek(0, io.SeekEnd)
-  if err != nil {
-    Log("error seeking to end of %s: %s\n", err)
-    os.Exit(1)
-  }
-  file.Seek(0, io.SeekStart)
-  Log("file size -> %d bytes.\n", pos)
-  return uint64(pos)
+	pos, err := file.Seek(0, io.SeekEnd)
+	if err != nil {
+		Log("error seeking to end of %s: %s\n", err)
+		os.Exit(1)
+	}
+	file.Seek(0, io.SeekStart)
+	Log("file size -> %d bytes.\n", pos)
+	return uint64(pos)
 }
 
 // isZeroBlock -> true if every byte is 0
@@ -36,10 +36,15 @@ func truncateIfRegularFile(file *os.File, size uint64) {
 	isBlock := mode&os.ModeDevice != 0 && mode&os.ModeCharDevice == 0
 
 	if !isBlock && mode.IsRegular() {
-		if err := file.Truncate(int64(size)); err != nil {
-			Log("Error: truncate failed: %w\n", err)
+		currentSize := uint64(info.Size())
+		if currentSize != size {
+			if err := file.Truncate(int64(size)); err != nil {
+				Log("Error: truncate failed: %w\n", err)
+			}
+			Log("file truncated to %d bytes\n", size)
+		} else {
+			Log("skip truncate: file size already %d bytes\n", size)
 		}
-		Log("file truncated to %d bytes\n", size)
 	} else {
 		Log("skip truncate: destination is a block device or special file\n")
 	}
