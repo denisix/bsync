@@ -6,7 +6,7 @@ import (
 	"os/exec"
 )
 
-var debug bool = false
+var debug bool = true
 var blockSize uint32 = 10485760
 var mb1 float64 = 1048576.0
 
@@ -20,6 +20,7 @@ func main() {
 	var sshTarget string
 	var logPrefix string
 	var workers uint
+	var quiet bool
 
 	flag.StringVar(&device, "f", "/dev/zero", "specify file or device, i.e. '/dev/vda'")
 	flag.StringVar(&remoteAddr, "r", "", "specify remote address of server")
@@ -30,10 +31,15 @@ func main() {
 	flag.StringVar(&sshTarget, "t", "", "launch remote server via ssh: user@host:/remote_path")
 	flag.StringVar(&logPrefix, "l", "", "custom log prefix")
 	flag.UintVar(&workers, "w", 1, "workers count, default 1")
+	flag.BoolVar(&quiet, "q", false, "be quiet, without output")
 
 	flag.Parse() // after declaring flags we need to call it
 
 	blockSize = uint32(bSize)
+
+	if blockSize == 0 {
+		Err("Block size cannot be zero\n")
+	}
 
 	if sshTarget != "" {
 		_, host, _ := parseSSHTarget(sshTarget)
@@ -42,7 +48,7 @@ func main() {
 
 	if remoteAddr != "" {
 		// CLIENT: source file
-		SetLogPrefix(logPrefix, "[client]")
+		SetLog(logPrefix, "[client]", quiet)
 		Log("starting client, transfer: %s -> %s\n", device, remoteAddr)
 
 		// launch SSH if sshTarget provided
@@ -50,9 +56,9 @@ func main() {
 		if sshTarget != "" {
 			Log("launching remote server via SSH: %s\n", sshTarget)
 			var err error
-			sshCmd, err = startRemoteSSH(sshTarget, port, blockSize, uint32(skipIdx))
+			sshCmd, err = startRemoteSSH(sshTarget, port, blockSize, uint32(skipIdx), quiet)
 			if err != nil {
-				Log("Error: SSH launch failed: %s\n", err)
+				Err("Error: SSH launch failed: %s\n", err)
 				return
 			}
 			defer sshCmd.Wait()
@@ -60,12 +66,24 @@ func main() {
 
 		file, err := os.OpenFile(device, os.O_RDONLY, 0666)
 		if err != nil {
-			Log("Error: opening file: %s\n", err.Error())
+			if sshCmd != nil {
+				sshCmd.Process.Kill()
+				sshCmd.Wait()
+			}
+			Err("opening file: %s\n", err.Error())
 			return
 		}
 		defer file.Close()
 
 		fileSize := getDeviceSize(file)
+		if fileSize == 0 {
+			if sshCmd != nil {
+				sshCmd.Process.Kill()
+				sshCmd.Wait()
+			}
+			Err("Error: zero source file: %s\n", device)
+		}
+
 		lastBlockNum := uint32(fileSize / uint64(blockSize))
 
 		checksumCache := NewChecksumCache(lastBlockNum)
@@ -82,11 +100,11 @@ func main() {
 
 	} else {
 		// SERVER: destination file
-		SetLogPrefix(logPrefix, "[server]")
+		SetLog(logPrefix, "[server]", quiet)
 		Log("starting server, remote -> %s\n", device)
 		file, err := os.OpenFile(device, os.O_RDWR|os.O_CREATE, 0666)
 		if err != nil {
-			Log("[server] Error opening file: %s\n", err.Error())
+			Err("Error opening file: %s\n", err.Error())
 			return
 		}
 		defer file.Close()

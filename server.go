@@ -21,10 +21,6 @@ func serverHandleReq(conn net.Conn, file *os.File, checksumCache *ChecksumCache)
   var lastPartSize uint64 = 0
   var firstBlock uint32 = 0
 
-  t0 := time.Now()
-  mbs := 0.0
-  eta := 0
-
   c := bufio.NewReader(conn)
 
   for {
@@ -62,26 +58,7 @@ func serverHandleReq(conn net.Conn, file *os.File, checksumCache *ChecksumCache)
 				
 				truncateIfRegularFile(file, msg.FileSize)
       }
-
-      secs := time.Since(t0).Seconds()
-      blockMb := float64(msg.BlockSize) / mb1
-      blocksDelta := float64(msg.BlockIdx - firstBlock)
-      mbsDelta := blocksDelta * blockMb
-      blocksLeft := float64(lastBlockNum - msg.BlockIdx)
-      mbsLeft := blocksLeft * blockMb
-      
-      mbs = mbsDelta / secs
-
-			if mbs > 0 { eta = int(mbsLeft / mbs / 60) }
-      if eta < 0 { eta = 0 }
-      if msg.BlockIdx >= lastBlockNum { eta = 0 }
     }
-
-    // if msg.DataSize > 0 {
-    //   Log("block %d/%d (%0.2f%%) [w] size=%d ratio=%0.2f %0.2f MB/s ETA=%d min\r", msg.BlockIdx, lastBlockNum, percent, msg.FileSize, compressRatio, mbs, eta)
-    // } else {
-    //   Log("block %d/%d (%0.2f%%) [K] size=%d ratio=%0.2f %0.2f MB/s ETA=%d min\r", msg.BlockIdx, lastBlockNum, percent, msg.FileSize, compressRatio, mbs, eta)
-    // }
 
     if msg.DataSize == 0 {
       if debug { Log("\t- read block from file\n") }
@@ -155,7 +132,7 @@ func serverHandleReq(conn net.Conn, file *os.File, checksumCache *ChecksumCache)
 func startServer(file *os.File, port string, checksumCache *ChecksumCache) {
 	listener, err := net.Listen("tcp", ":" + port)
   if err != nil {
-    Log("Error listening: %s\n", err.Error())
+    Err("listening: %s\n", err.Error())
     return
   }
   defer listener.Close()

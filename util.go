@@ -8,8 +8,7 @@ import (
 func getDeviceSize(file *os.File) uint64 {
 	pos, err := file.Seek(0, io.SeekEnd)
 	if err != nil {
-		Log("error seeking to end of %s: %s\n", err)
-		os.Exit(1)
+		Err("seeking to end of %s: %s\n", err)
 	}
 	file.Seek(0, io.SeekStart)
 	Log("file size -> %d bytes.\n", pos)
@@ -39,7 +38,7 @@ func truncateIfRegularFile(file *os.File, size uint64) {
 		currentSize := uint64(info.Size())
 		if currentSize != size {
 			if err := file.Truncate(int64(size)); err != nil {
-				Log("Error: truncate failed: %w\n", err)
+				Err("Error: truncate failed: %w\n", err)
 			}
 			Log("file truncated to %d bytes\n", size)
 		} else {

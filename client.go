@@ -80,7 +80,7 @@ func processBlockJob(conn *AutoReconnectTCP, job BlockJob, blockSize uint32, fil
 		Zero:       false,
 	})
 	if err1 != nil {
-		Log("\t- cant pack msg-> %s\n", err1)
+		Log("cant pack msg-> %s\n", err1)
 		return
 	}
 
@@ -123,7 +123,7 @@ func processBlockJob(conn *AutoReconnectTCP, job BlockJob, blockSize uint32, fil
 		}
 		n, err2 := conn.Write(msg)
 		if err2 != nil && err2 != io.EOF {
-			Log("\t- error writing net: [%d] %s\n", n, err2.Error())
+			Err("\t- error writing net: [%d] %s\n", n, err2.Error())
 			return
 		}
 		n, err3 := conn.Write(job.data)
@@ -240,7 +240,7 @@ func startClient(file *os.File, serverAddress string, skipIdx uint32, fileSize u
 	// Resolve server address once
 	saddr, err := net.ResolveTCPAddr("tcp", serverAddress)
 	if err != nil {
-		Log("Error: resolving: %s\n", err.Error())
+		Err("resolving: %s\n", err.Error())
 		return
 	}
 
@@ -265,7 +265,7 @@ func startClient(file *os.File, serverAddress string, skipIdx uint32, fileSize u
 		offset := int64(blockIdx) * int64(blockSize)
 		readedBytes, err := file.ReadAt(buf, offset)
 		if err != nil && err != io.EOF {
-			Log("\t- error reading file: %s\n", err.Error())
+			Err("\t- error reading file: %s\n", err.Error())
 			break
 		}
 		dataCopy := make([]byte, readedBytes)
