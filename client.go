@@ -17,7 +17,7 @@ type BlockJob struct {
 }
 
 // processBlockJob handles hashing, compressing, and sending a block using a persistent connection
-func processBlockJob(conn *AutoReconnectTCP, job BlockJob, serverAddress string, blockSize uint32, fileSize uint64, noCompress bool, checksumCache *ChecksumCache) {
+func processBlockJob(conn *AutoReconnectTCP, job BlockJob, blockSize uint32, fileSize uint64, noCompress bool, checksumCache *ChecksumCache) {
 	magicBytes := stringToFixedSizeArray(magicHead)
 
 	msg, err1 := pack(&Msg{
@@ -179,23 +179,25 @@ func startClient(file *os.File, serverAddress string, skipIdx uint32, fileSize u
 	jobs := make(chan BlockJob, workers*2)
 	var wg sync.WaitGroup
 
+	// Resolve server address once
+	saddr, err := net.ResolveTCPAddr("tcp", serverAddress)
+	if err != nil {
+		Log("Error: resolving: %s\n", err.Error())
+		return
+	}
+
 	Log("starting %d workers\n", workers)
 	// Start worker goroutines
 	for i := 0; i < workers; i++ {
 		wg.Add(1)
-		go func() {
+		go func(saddr *net.TCPAddr) {
 			defer wg.Done()
-			saddr, err := net.ResolveTCPAddr("tcp", serverAddress)
-			if err != nil {
-				Log("Error: resolving: %s\n", err.Error())
-				return
-			}
 			conn := NewAutoReconnectTCP(saddr)
 			defer conn.Close()
 			for job := range jobs {
-				processBlockJob(conn, job, serverAddress, blockSize, fileSize, noCompress, checksumCache)
+				processBlockJob(conn, job, blockSize, fileSize, noCompress, checksumCache)
 			}
-		}()
+		}(saddr)
 	}
 
 	// Producer: read file sequentially and push jobs
