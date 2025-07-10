@@ -19,6 +19,7 @@ func main() {
 	var noCompress bool
 	var sshTarget string
 	var logPrefix string
+	var workers uint
 
 	flag.StringVar(&device, "f", "/dev/zero", "specify file or device, i.e. '/dev/vda'")
 	flag.StringVar(&remoteAddr, "r", "", "specify remote address of server")
@@ -28,8 +29,9 @@ func main() {
 	flag.BoolVar(&noCompress, "n", false, "do not compress blocks (by default compress)")
 	flag.StringVar(&sshTarget, "t", "", "launch remote server via ssh: user@host:/remote_path")
 	flag.StringVar(&logPrefix, "l", "", "custom log prefix")
+	flag.UintVar(&workers, "w", 1, "workers count, default 1")
 
-	flag.Parse()  // after declaring flags we need to call it
+	flag.Parse() // after declaring flags we need to call it
 
 	blockSize = uint32(bSize)
 
@@ -69,7 +71,7 @@ func main() {
 		checksumCache := NewChecksumCache(lastBlockNum)
 		go precomputeChecksums(file, blockSize, lastBlockNum, checksumCache, uint32(skipIdx))
 
-		startClient(file, remoteAddr, uint32(skipIdx), fileSize, blockSize, noCompress, checksumCache)
+		startClient(file, remoteAddr, uint32(skipIdx), fileSize, blockSize, noCompress, checksumCache, int(workers))
 
 		// cleanup SSH
 		if sshCmd != nil {

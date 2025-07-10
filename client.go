@@ -1,245 +1,218 @@
 package main
 
 import (
-  "io"
-  "os"
-  "net"
-  "bytes"
+	"bytes"
+	"io"
+	"net"
+	"os"
+	"sync"
 	"time"
 )
 
-func startClient(file *os.File, serverAddress string, skipIdx uint32, fileSize uint64, blockSize uint32, noCompress bool, checksumCache *ChecksumCache) {
-  Log("startClient()\n")
+// BlockJob represents a file block to be processed by a worker
+type BlockJob struct {
+	blockIdx    uint32
+	data        []byte
+	readedBytes int
+}
+
+// processBlockJob handles hashing, compressing, and sending a block using a persistent connection
+func processBlockJob(conn *AutoReconnectTCP, job BlockJob, serverAddress string, blockSize uint32, fileSize uint64, noCompress bool, checksumCache *ChecksumCache) {
 	magicBytes := stringToFixedSizeArray(magicHead)
 
-  saddr, err := net.ResolveTCPAddr("tcp", serverAddress)
-  if err != nil {
-		Log("Error: resolving: %s\n", err.Error())
-    return
-  }
+	msg, err1 := pack(&Msg{
+		MagicHead:  magicBytes,
+		BlockIdx:   job.blockIdx,
+		BlockSize:  blockSize,
+		FileSize:   fileSize,
+		DataSize:   0,
+		Compressed: false,
+		Zero:       false,
+	})
+	if err1 != nil {
+		Log("\t- cant pack msg-> %s\n", err1)
+		return
+	}
 
-  conn := NewAutoReconnectTCP(saddr)
-  defer conn.Close()
+	n, err2 := conn.Write(msg)
+	if err2 != nil && err2 != io.EOF {
+		Log("\t- error writing net: [%d] %s\n", n, err2.Error())
+		return
+	}
 
-  var totCompSize uint64 = 0
-  var totOrigSize uint64 = 0
-  var percent float64 = 0
-	var diffs uint64 = 0
-  t0 := time.Now()
-  mbs := 0.0
-  eta := 0
-	etaUnit := "min"
+	hash := checksumCache.WaitFor(job.blockIdx)
 
-  buf := make([]byte, blockSize)
+	// buffer to get data
+	serverHash := make([]byte, len(hash))
+	_, err := conn.Read(serverHash)
+	if err != nil {
+		Log("[client]\t- read data from net failed: %s\n", err.Error())
+		return
+	}
 
-  lastBlockNum := uint32(fileSize / uint64(blockSize))
+	// Block is already in sync, or it's a known zero block — skip sending
+	if bytes.Equal(hash, serverHash) {
+		return
+	}
 
-  Log("source size: %d bytes, block %d bytes, blockNum: %d\n", fileSize, blockSize, lastBlockNum)
-
-  for blockIdx := uint32(skipIdx); blockIdx <= lastBlockNum; blockIdx++ {
-
-    if debug { Log("\t- send to server blockIdx\n") }
-    msg, err1 := pack(&Msg{ 
-      MagicHead: magicBytes,
-      BlockIdx: blockIdx,
-      BlockSize: blockSize,
-      FileSize: fileSize,
-      DataSize: 0,
-      Compressed: false,
-			Zero: false,
-    })
-    if err1 != nil { Log("\t- cant pack msg-> %s\n", err1) }
-    if debug { Log("\t- sending packed msg-> %s [%d bytes]\n", msg, len(msg)) }
-
-    // read file block 1M
-    if debug { Log("\t- read block from file\n") }
-    offset := int64(blockIdx) * int64(blockSize)
-    readedBytes, err := file.ReadAt(buf, offset)
-    if err != nil && err != io.EOF {
-      Log("\t- error reading file: %s\n", err.Error())
-      break
-    }
-
-    n, err2 := conn.Write(msg) // writeConn(conn, b)
-    if err2 != nil && err2 != io.EOF {
-      Log("\t- error writing net: [%d] %s\n", n, err2.Error())
-      break
-    }
-
-		hash := checksumCache.WaitFor(blockIdx)
-    if debug { Log("\t- calc local hash -> [%d] %x\n", blockIdx, hash) }
-
-    // buffer to get data
-    serverHash := make([]byte, len(hash))
-    _, err = conn.Read(serverHash)
-    if err != nil {
-      println("[client]\t- read data from net failed:", err.Error())
-			return
-    }
-    if debug { Log("\t- rcvd server hash: [%d] %x\n", blockIdx, serverHash) }
-
-		// ETA, stats
-		totOrigSize = totOrigSize + uint64(blockSize)
-		secs := time.Since(t0).Seconds()
-		blockMb := float64(blockSize) / mb1
-		blocksDelta := float64(blockIdx - skipIdx)
-		mbsDelta := blocksDelta * blockMb
-		blocksLeft := float64(lastBlockNum - blockIdx)
-		mbsLeft := blocksLeft * blockMb
-		mbs = mbsDelta / secs
-
-		if mbs > 0 { 
-			eta = int(mbsLeft / mbs / 60)
-			etaUnit = "min"
-			if eta > 180 {
-				eta = eta / 60
-				etaUnit = "hr"
-			}
-		}
-		if eta < 0 { eta = 0 }
-		if blockIdx >= lastBlockNum { eta = 0 }
-		percent = 100 * float64(blockIdx) / float64(lastBlockNum)
-
- 		  // Block is already in sync, or it's a known zero block — skip sending
-		if bytes.Equal(hash, serverHash) {
-			totCompSize = totCompSize + uint64(blockSize)
-			ratio := 100 * float64(totCompSize) / float64(totOrigSize)
-    
-			Log("block %d/%d (%0.2f%%) [-] size=%d ratio=%0.2f %0.2f MB/s ETA=%d %s diffs=%d\r", blockIdx, lastBlockNum, percent, fileSize, ratio, mbs, eta, etaUnit, diffs)
-			continue
-    }
-
-		// Block zero, just send that it's zero
-		if bytes.Equal(hash, zeroBlockHash) {
-			totCompSize = totCompSize + uint64(blockSize)
-			ratio := 100 * float64(totCompSize) / float64(totOrigSize)
-			Log("block %d/%d (%0.2f%%) [.] size=%d ratio=%0.2f %0.2f MB/s ETA=%d %s diffs=%d\r", blockIdx, lastBlockNum, percent, fileSize, ratio, mbs, eta, etaUnit, diffs)
-
-			msg, err1 := pack(&Msg{
-				MagicHead: magicBytes,
-				BlockIdx: blockIdx,
-				BlockSize: blockSize,
-				FileSize: fileSize,
-				DataSize: uint32(readedBytes),
-				Compressed: false,
-				Zero: true,
-			})
-			if err1 != nil { Log("\t- cant pack msg-> %s\n", err) }
-
-			n, err2 := conn.Write(msg) // writeConn(conn, b)
-			if err2 != nil && err2 != io.EOF {
-				Log("\t- error writing net: [%d] %s\n", n, err2.Error())
-				break
-			}
-
-			n, err3 := conn.Write(buf[:readedBytes]) // writeConn(conn, b)
-			if err3 != nil && err3 != io.EOF {
-				Log("\t- error writing net: [%d] %s\n", n, err3.Error())
-				break
-			}
-			continue
-		}
-
-		diffs = diffs + 1
-
-		if noCompress {
-			totCompSize = totCompSize + uint64(blockSize)
-			ratio := 100 * float64(totCompSize) / float64(totOrigSize)
-			Log("block %d/%d (%0.2f%%) [w] size=%d ratio=%0.2f %0.2f MB/s ETA=%d %s diffs=%d\r", blockIdx, lastBlockNum, percent, fileSize, ratio, mbs, eta, etaUnit, diffs)
-
-			msg, err1 := pack(&Msg{
-				MagicHead: magicBytes,
-				BlockIdx: blockIdx,
-				BlockSize: blockSize,
-				FileSize: fileSize,
-				DataSize: uint32(readedBytes),
-				Compressed: false,
-				Zero: false,
-			})
-			if err1 != nil { Log("\t- cant pack msg-> %s\n", err) }
-
-			n, err2 := conn.Write(msg) // writeConn(conn, b)
-			if err2 != nil && err2 != io.EOF {
-				Log("\t- error writing net: [%d] %s\n", n, err2.Error())
-				break
-			}
-
-			n, err3 := conn.Write(buf[:readedBytes]) // writeConn(conn, b)
-			if err3 != nil && err3 != io.EOF {
-				Log("\t- error writing net: [%d] %s\n", n, err3.Error())
-				break
-			}
-			continue
-		}
-
-		// else compress block:
-		compBuf, err := compressData(buf[:readedBytes])
-		if err != nil {
-			Log("Error: compressing data: %s\n", err)
+	// Block zero, just send that it's zero
+	if bytes.Equal(hash, zeroBlockHash) {
+		msg, err1 := pack(&Msg{
+			MagicHead:  magicBytes,
+			BlockIdx:   job.blockIdx,
+			BlockSize:  blockSize,
+			FileSize:   fileSize,
+			DataSize:   uint32(job.readedBytes),
+			Compressed: false,
+			Zero:       true,
+		})
+		if err1 != nil {
+			Log("\t- cant pack msg-> %s\n", err1)
 			return
 		}
-
-		compressedBytes := uint32(len(compBuf))
-		totCompSize = totCompSize + uint64(compressedBytes)
-		ratio := 100 * float64(totCompSize) / float64(totOrigSize)
-
-		if compressedBytes < blockSize {
-			Log("block %d/%d (%0.2f%%) [c] size=%d ratio=%0.2f %0.2f MB/s ETA=%d %s diffs=%d\r", blockIdx, lastBlockNum, percent, fileSize, ratio, mbs, eta, etaUnit, diffs)
-
-			msg, err1 := pack(&Msg{
-				MagicHead: magicBytes,
-				BlockIdx: blockIdx,
-				BlockSize: blockSize,
-				FileSize: fileSize,
-				DataSize: compressedBytes,
-				Compressed: true,
-				Zero: false,
-			})
-			if err1 != nil { Log("\t- cant pack msg-> %s\n", err) }
-
-			n, err2 := conn.Write(msg) // writeConn(conn, b)
-			if err2 != nil && err2 != io.EOF {
-				Log("\t- error writing net: [%d] %s\n", n, err2.Error())
-				break
-			}
-
-			n, err3 := conn.Write(compBuf) // writeConn(conn, b)
-			if err3 != nil && err3 != io.EOF {
-				Log("\t- error writing net: [%d] %s\n", n, err3.Error())
-				break
-			}
-		} else {
-			Log("block %d/%d (%0.2f%%) [w] size=%d ratio=%0.2f %0.2f MB/s ETA=%d %s diffs=%d\r", blockIdx, lastBlockNum, percent, fileSize, ratio, mbs, eta, etaUnit, diffs)
-
-			msg, err1 := pack(&Msg{
-				MagicHead: magicBytes,
-				BlockIdx: blockIdx,
-				BlockSize: blockSize,
-				FileSize: fileSize,
-				DataSize: uint32(readedBytes),
-				Compressed: false,
-				Zero: false,
-			})
-			if err1 != nil { Log("\t- cant pack msg-> %s\n", err) }
-
-			n, err2 := conn.Write(msg) // writeConn(conn, b)
-			if err2 != nil && err2 != io.EOF {
-				Log("\t- error writing net: [%d] %s\n", n, err2.Error())
-				break
-			}
-
-			n, err3 := conn.Write(buf[:readedBytes]) // writeConn(conn, b)
-			if err3 != nil && err3 != io.EOF {
-				Log("\t- error writing net: [%d] %s\n", n, err3.Error())
-				break
-			}
+		n, err2 := conn.Write(msg)
+		if err2 != nil && err2 != io.EOF {
+			Log("\t- error writing net: [%d] %s\n", n, err2.Error())
+			return
 		}
-  }
+		n, err3 := conn.Write(job.data)
+		if err3 != nil && err3 != io.EOF {
+			Log("\t- error writing net: [%d] %s\n", n, err3.Error())
+			return
+		}
+		return
+	}
 
-	// if file was sparse / empty -> finalize it by writing just end
+	if noCompress {
+		msg, err1 := pack(&Msg{
+			MagicHead:  magicBytes,
+			BlockIdx:   job.blockIdx,
+			BlockSize:  blockSize,
+			FileSize:   fileSize,
+			DataSize:   uint32(job.readedBytes),
+			Compressed: false,
+			Zero:       false,
+		})
+		if err1 != nil {
+			Log("\t- cant pack msg-> %s\n", err1)
+			return
+		}
+		n, err2 := conn.Write(msg)
+		if err2 != nil && err2 != io.EOF {
+			Log("\t- error writing net: [%d] %s\n", n, err2.Error())
+			return
+		}
+		n, err3 := conn.Write(job.data)
+		if err3 != nil && err3 != io.EOF {
+			Log("\t- error writing net: [%d] %s\n", n, err3.Error())
+			return
+		}
+		return
+	}
+
+	// else compress block:
+	compBuf, err := compressData(job.data)
+	if err != nil {
+		Log("Error: compressing data: %s\n", err)
+		return
+	}
+
+	compressedBytes := uint32(len(compBuf))
+
+	if compressedBytes < blockSize {
+		msg, err1 := pack(&Msg{
+			MagicHead:  magicBytes,
+			BlockIdx:   job.blockIdx,
+			BlockSize:  blockSize,
+			FileSize:   fileSize,
+			DataSize:   compressedBytes,
+			Compressed: true,
+			Zero:       false,
+		})
+		if err1 != nil {
+			Log("\t- cant pack msg-> %s\n", err1)
+			return
+		}
+		n, err2 := conn.Write(msg)
+		if err2 != nil && err2 != io.EOF {
+			Log("\t- error writing net: [%d] %s\n", n, err2.Error())
+			return
+		}
+		n, err3 := conn.Write(compBuf)
+		if err3 != nil && err3 != io.EOF {
+			Log("\t- error writing net: [%d] %s\n", n, err3.Error())
+			return
+		}
+	} else {
+		msg, err1 := pack(&Msg{
+			MagicHead:  magicBytes,
+			BlockIdx:   job.blockIdx,
+			BlockSize:  blockSize,
+			FileSize:   fileSize,
+			DataSize:   uint32(job.readedBytes),
+			Compressed: false,
+			Zero:       false,
+		})
+		if err1 != nil {
+			Log("\t- cant pack msg-> %s\n", err1)
+			return
+		}
+		n, err2 := conn.Write(msg)
+		if err2 != nil && err2 != io.EOF {
+			Log("\t- error writing net: [%d] %s\n", n, err2.Error())
+			return
+		}
+		n, err3 := conn.Write(job.data)
+		if err3 != nil && err3 != io.EOF {
+			Log("\t- error writing net: [%d] %s\n", n, err3.Error())
+			return
+		}
+	}
+}
+
+// startClient launches threadsCount workers, each with a persistent connection, and pushes file blocks to a jobs channel
+func startClient(file *os.File, serverAddress string, skipIdx uint32, fileSize uint64, blockSize uint32, noCompress bool, checksumCache *ChecksumCache, threadsCount int) {
+	Log("startClient()\n")
+	lastBlockNum := uint32(fileSize / uint64(blockSize))
+	Log("source size: %d bytes, block %d bytes, blockNum: %d\n", fileSize, blockSize, lastBlockNum)
+
+	jobs := make(chan BlockJob, threadsCount*2)
+	var wg sync.WaitGroup
+
+	// Start worker goroutines
+	for i := 0; i < threadsCount; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			saddr, err := net.ResolveTCPAddr("tcp", serverAddress)
+			if err != nil {
+				Log("Error: resolving: %s\n", err.Error())
+				return
+			}
+			conn := NewAutoReconnectTCP(saddr)
+			defer conn.Close()
+			for job := range jobs {
+				processBlockJob(conn, job, serverAddress, blockSize, fileSize, noCompress, checksumCache)
+			}
+		}()
+	}
+
+	// Producer: read file sequentially and push jobs
+	buf := make([]byte, blockSize)
+	for blockIdx := uint32(skipIdx); blockIdx <= lastBlockNum; blockIdx++ {
+		offset := int64(blockIdx) * int64(blockSize)
+		readedBytes, err := file.ReadAt(buf, offset)
+		if err != nil && err != io.EOF {
+			Log("\t- error reading file: %s\n", err.Error())
+			break
+		}
+		dataCopy := make([]byte, readedBytes)
+		copy(dataCopy, buf[:readedBytes])
+		jobs <- BlockJob{blockIdx, dataCopy, readedBytes}
+	}
+	close(jobs)
+	wg.Wait()
 	Log("\nDONE, exiting..\n\n")
-
-	// wait connection closed
 	time.Sleep(2 * time.Second)
 	return
 }
