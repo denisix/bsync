@@ -1,50 +1,122 @@
 # bsync
-Efficiently transfer large data between two block devices (or files) between servers, block by block: each block is compared by a checksum and transmitted with compression if they differ.
 
-### Usage
-To compile the program just issue:
+🚀 **Efficient block-level synchronization tool for large data transfer between servers**
+
+`bsync` transfers data between block devices or files block-by-block, comparing checksums and only transmitting differences with compression. Perfect for syncing large datasets, disk images, or virtual machine storage.
+
+## ✨ Features
+
+- **Smart Transfer**: Only transfers blocks that differ (checksum-based)
+- **Compression**: Built-in compression for efficient network usage
+- **SSH Integration**: Automatic remote server deployment via SSH
+- **Multi-worker Support**: Parallel processing for faster transfers
+- **Resume Capability**: Skip blocks to resume interrupted transfers
+- **Progress Monitoring**: Real-time transfer progress with speed and ETA
+
+## 🛠️ Installation
+
 ```bash
 make
 ```
 
-Then copy `bsync` file to your servers.
-Example usage to sync two block devices (or files) between servers:
+Copy the `bsync` binary to your source and destination servers.
 
-1. on destination server where you need to sync to:
+## 📖 Usage
+
+### Basic Operation
+
+`bsync` operates in two modes:
+- **Server mode**: Receives data (destination)
+- **Client mode**: Sends data (source)
+
+### Command Line Options
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `-f` | File or device path (e.g., `/dev/vda`, `/path/to/file`) | `/dev/zero` |
+| `-r` | Remote server address (`host:port`) | - |
+| `-b` | Block size in bytes | 10485760 (10MB) |
+| `-s` | Skip blocks (for resume) | 0 |
+| `-p` | Server port | 8080 |
+| `-n` | Disable compression | false |
+| `-t` | SSH target (`user@host:/remote_path`) | - |
+| `-l` | Custom log prefix | - |
+| `-w` | Number of workers | 1 |
+| `-q` | Quiet mode (no output) | false |
+
+## 🔄 Examples
+
+### 1. Local Network Transfer
+
+**Destination server:**
 ```bash
-$ ./bsync -f /dev/shm/test-dst
-- starting server, remote -> /dev/shm/test-dst (init blockSize = 104857600 )
-- listening on 0.0.0.0:8080
-- serverHandleReq()
-- last part size -> 112524800 lastBlock 2 firstBlock 0 blockSize 204857600
-- block 0/2 (0.00%) [-] size=522240000 ratio=0.00 0.00 MB/s ETA=0 min
-- block 0/2 (0.00%) [w] size=522240000 ratio=30.71 0.00 MB/s ETA=0 min
-- block 1/2 (39.00%) [-] size=522240000 ratio=0.00 67.99 MB/s ETA=0 min
-- block 1/2 (39.00%) [w] size=522240000 ratio=21.55 40.86 MB/s ETA=0 min
-- block 2/2 (78.00%) [-] size=522240000 ratio=0.00 65.11 MB/s ETA=0 min
-- block 2/2 (78.00%) [w] size=522240000 ratio=14.05 57.40 MB/s ETA=0 min
-- block 3/2 (117.00%) [-] size=522240000 ratio=0.00 80.50 MB/s ETA=0 min
-- transfer done, exiting..
+./bsync -f /dev/shm/test-dst -p 8080
 ```
 
-2. on source server, from where you want to sync data:
+**Source server:**
 ```bash
-$ ./bsync -r 127.0.0.1:8080 -f /dev/shm/test-src -b 204857600
-- starting client, transfer:  /dev/shm/test-src -> 127.0.0.1:8080
-- startClient()
-- getDeviceSize(): 522240000 bytes.
-- source size: 522240000 bytes, block 204857600 bytes, blockNum: 2
-- block 0 / 2
-- connecting.. 127.0.0.1:8080
-- block 1 / 2
-- block 2 / 2
-- block 3 / 2
-- transfer done, exiting..
+./bsync -b 200M -f /dev/shm/test-src -r 192.168.1.100:8080
 ```
 
-3. just to verify transferred correctly:
+### 2. SSH-Automated Transfer
+
+**Single command (automatically starts remote server):**
 ```bash
-$ md5sum /dev/shm/test-src /dev/shm/test-dst
-22aacaff71dc4477d917d449fdc2aa19  /dev/shm/test-src
-22aacaff71dc4477d917d449fdc2aa19  /dev/shm/test-dst
+./bsync -b 200M -f /dev/shm/test-src -t user@remote-server:/dev/shm/test-dst 
 ```
+
+### 3. High-Performance Transfer
+
+**Multi-worker (4 workers selected) transfer with custom block size and label `backup`:**
+```bash
+./bsync -b 500M -w 4 -l backup -f /dev/sda -r remote-server:8080
+```
+
+### 4. Resume Interrupted Transfer
+
+**Skip first 10 blocks to resume:**
+```bash
+./bsync -f /dev/sda -r remote-server:8080 -s 10
+```
+
+### 5. Quiet Mode for Scripts
+
+```bash
+./bsync -f /dev/sda -r remote-server:8080  -q
+```
+
+### 6. Bonus: it's also possible to sync local files
+```bash
+./bsync -n -f /tmp/src.img -t /tmp/dst.img
+```
+
+
+## 🔍 Verification
+
+Verify successful transfer:
+```bash
+md5sum /dev/shm/test-src /dev/shm/test-dst
+```
+
+Run tests:
+```bash
+make test
+```
+
+## 📊 Performance Tips
+
+- **Block Size**: Larger blocks (200M-500M) for fast networks, smaller for slow connections
+- **Workers**: Increase worker count (`-w`) for parallel processing
+- **Compression**: Disable (`-n`) only if network is very fast and CPU is limited, or data is uncompressable (like video)
+- **SSH**: Use `-t` for automatic remote server management
+
+## 🚨 Requirements
+
+- Go 1.16+ (for compilation)
+- Network connectivity between servers
+- SSH access (if using `-t` option)
+- Read/write permissions on source/destination files
+
+## 📝 License
+
+See [LICENSE](LICENSE) file for details.
