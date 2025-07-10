@@ -171,16 +171,17 @@ func processBlockJob(conn *AutoReconnectTCP, job BlockJob, serverAddress string,
 }
 
 // startClient launches threadsCount workers, each with a persistent connection, and pushes file blocks to a jobs channel
-func startClient(file *os.File, serverAddress string, skipIdx uint32, fileSize uint64, blockSize uint32, noCompress bool, checksumCache *ChecksumCache, threadsCount int) {
+func startClient(file *os.File, serverAddress string, skipIdx uint32, fileSize uint64, blockSize uint32, noCompress bool, checksumCache *ChecksumCache, workers int) {
 	Log("startClient()\n")
 	lastBlockNum := uint32(fileSize / uint64(blockSize))
 	Log("source size: %d bytes, block %d bytes, blockNum: %d\n", fileSize, blockSize, lastBlockNum)
 
-	jobs := make(chan BlockJob, threadsCount*2)
+	jobs := make(chan BlockJob, workers*2)
 	var wg sync.WaitGroup
 
+	Log("starting %d workers\n", workers)
 	// Start worker goroutines
-	for i := 0; i < threadsCount; i++ {
+	for i := 0; i < workers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -198,6 +199,7 @@ func startClient(file *os.File, serverAddress string, skipIdx uint32, fileSize u
 	}
 
 	// Producer: read file sequentially and push jobs
+	Log("start reading source\n")
 	buf := make([]byte, blockSize)
 	for blockIdx := uint32(skipIdx); blockIdx <= lastBlockNum; blockIdx++ {
 		offset := int64(blockIdx) * int64(blockSize)
@@ -211,7 +213,10 @@ func startClient(file *os.File, serverAddress string, skipIdx uint32, fileSize u
 		jobs <- BlockJob{blockIdx, dataCopy, readedBytes}
 	}
 	close(jobs)
+
+	Log("DONE, waiting for the workers\n")
 	wg.Wait()
+
 	Log("\nDONE, exiting..\n\n")
 	time.Sleep(2 * time.Second)
 	return
