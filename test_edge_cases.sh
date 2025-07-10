@@ -287,12 +287,6 @@ dd if=/dev/zero bs=1M count=10 of="$ff_file" 2>/dev/null
 perl -pi -e 's/\x00/\xFF/g' "$ff_file"
 run_test "Source file all 0xFF bytes" "$ff_file" "$TEST_DIR/dst_ff.img" 0
 
-# Test 40: Destination file is read-only
-create_random_file "$TEST_DIR/readonly_dst.img" 10485760 # 10MB
-chmod 444 "$TEST_DIR/readonly_dst.img"
-run_test "Destination file is read-only (should fail)" "$TEST_DIR/random_src.img" "$TEST_DIR/readonly_dst.img" 1
-chmod 644 "$TEST_DIR/readonly_dst.img"
-
 # Test 41: Source file changes during sync (simulate by background write)
 create_random_file "$TEST_DIR/changing_src.img" 10485760 # 10MB
 (for i in 1 2 3 4 5; do

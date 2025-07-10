@@ -18,13 +18,13 @@ type BlockJob struct {
 
 var (
 	lastBlockNum uint32 = 0
-	totCompSize uint64 = 0
-	totOrigSize uint64 = 0
-	diffs uint32 = 0
-	v_skipIdx uint32 = 0
-	v_fileSize uint64 = 0
-	t0 time.Time
-	mu      sync.Mutex
+	totCompSize  uint64 = 0
+	totOrigSize  uint64 = 0
+	diffs        uint32 = 0
+	v_skipIdx    uint32 = 0
+	v_fileSize   uint64 = 0
+	t0           time.Time
+	mu           sync.Mutex
 )
 
 // ETA, stats
@@ -42,7 +42,7 @@ func printStats(job BlockJob, indicator string, diff, bytes uint32) {
 
 	blocksLeft := float64(lastBlockNum - job.blockIdx)
 	mbsLeft := blocksLeft * blockMb
-	mbsDone := float64(job.blockIdx - v_skipIdx) * blockMb
+	mbsDone := float64(job.blockIdx-v_skipIdx) * blockMb
 
 	mbs := mbsDone / time.Since(t0).Seconds()
 
@@ -57,8 +57,12 @@ func printStats(job BlockJob, indicator string, diff, bytes uint32) {
 			etaUnit = "hr"
 		}
 	}
-	if eta < 0 { eta = 0 }
-	if job.blockIdx >= lastBlockNum { eta = 0 }
+	if eta < 0 {
+		eta = 0
+	}
+	if job.blockIdx >= lastBlockNum {
+		eta = 0
+	}
 
 	percent := 100 * float64(job.blockIdx) / float64(lastBlockNum)
 	ratio := 100 * float64(totCompSize) / float64(totOrigSize)
@@ -78,6 +82,7 @@ func processBlockJob(conn *AutoReconnectTCP, job BlockJob, blockSize uint32, fil
 		DataSize:   0,
 		Compressed: false,
 		Zero:       false,
+		Done:       false,
 	})
 	if err1 != nil {
 		Log("cant pack msg-> %s\n", err1)
@@ -116,6 +121,7 @@ func processBlockJob(conn *AutoReconnectTCP, job BlockJob, blockSize uint32, fil
 			DataSize:   uint32(job.readedBytes),
 			Compressed: false,
 			Zero:       true,
+			Done:       false,
 		})
 		if err1 != nil {
 			Log("\t- cant pack msg-> %s\n", err1)
@@ -144,6 +150,7 @@ func processBlockJob(conn *AutoReconnectTCP, job BlockJob, blockSize uint32, fil
 			DataSize:   uint32(job.readedBytes),
 			Compressed: false,
 			Zero:       false,
+			Done:       false,
 		})
 		if err1 != nil {
 			Log("\t- cant pack msg-> %s\n", err1)
@@ -154,6 +161,10 @@ func processBlockJob(conn *AutoReconnectTCP, job BlockJob, blockSize uint32, fil
 			Log("\t- error writing net: [%d] %s\n", n, err2.Error())
 			return
 		}
+		if debug {
+			Log("\t- send nocompress data [%d] %d: %x\n", job.blockIdx, job.readedBytes, hash)
+		}
+
 		n, err3 := conn.Write(job.data)
 		if err3 != nil && err3 != io.EOF {
 			Log("\t- error writing net: [%d] %s\n", n, err3.Error())
@@ -181,6 +192,7 @@ func processBlockJob(conn *AutoReconnectTCP, job BlockJob, blockSize uint32, fil
 			DataSize:   compressedBytes,
 			Compressed: true,
 			Zero:       false,
+			Done:       false,
 		})
 		if err1 != nil {
 			Log("\t- cant pack msg-> %s\n", err1)
@@ -206,6 +218,7 @@ func processBlockJob(conn *AutoReconnectTCP, job BlockJob, blockSize uint32, fil
 			DataSize:   uint32(job.readedBytes),
 			Compressed: false,
 			Zero:       false,
+			Done:       false,
 		})
 		if err1 != nil {
 			Log("\t- cant pack msg-> %s\n", err1)
@@ -273,6 +286,31 @@ func startClient(file *os.File, serverAddress string, skipIdx uint32, fileSize u
 		jobs <- BlockJob{blockIdx, dataCopy, readedBytes}
 	}
 	close(jobs)
+
+	// send DONE
+	magicBytes := stringToFixedSizeArray(magicHead)
+	conn := NewAutoReconnectTCP(saddr)
+	defer conn.Close()
+	msg, err1 := pack(&Msg{
+		MagicHead:  magicBytes,
+		BlockIdx:   0,
+		BlockSize:  blockSize,
+		FileSize:   fileSize,
+		DataSize:   0,
+		Compressed: false,
+		Zero:       false,
+		Done:       true,
+	})
+	if err1 != nil {
+		Log("cant pack msg-> %s\n", err1)
+		return
+	}
+
+	n, err2 := conn.Write(msg)
+	if err2 != nil && err2 != io.EOF {
+		Log("\t- error writing net: [%d] %s\n", n, err2.Error())
+		return
+	}
 
 	Log("DONE, waiting for the workers\n")
 	wg.Wait()

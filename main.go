@@ -6,7 +6,7 @@ import (
 	"os/exec"
 )
 
-var debug bool = true
+var debug bool = false
 var blockSize uint32 = 10485760
 var mb1 float64 = 1048576.0
 
