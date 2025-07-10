@@ -14,8 +14,8 @@ var (
 func initEncoderDecoder() {
 	var err error
 	encoder, err = zstd.NewWriter(nil,
-		zstd.WithEncoderLevel(zstd.SpeedFastest),
-		//zstd.WithEncoderLevel(zstd.SpeedBestCompression),
+		// zstd.WithEncoderLevel(zstd.SpeedFastest),
+		zstd.WithEncoderLevel(zstd.SpeedBestCompression),
 		zstd.WithWindowSize(1<<18), // Setting a window size of 1MB. Adjust as needed.
 	)
 	if err != nil {

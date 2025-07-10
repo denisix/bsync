@@ -16,6 +16,56 @@ type BlockJob struct {
 	readedBytes int
 }
 
+var (
+	lastBlockNum uint32 = 0
+	totCompSize uint64 = 0
+	totOrigSize uint64 = 0
+	diffs uint32 = 0
+	v_skipIdx uint32 = 0
+	v_fileSize uint64 = 0
+	t0 time.Time
+	mu      sync.Mutex
+)
+
+// ETA, stats
+func printStats(job BlockJob, indicator string, diff, bytes uint32) {
+
+	mu.Lock()
+	diffs = diffs + diff
+	if bytes > 0 {
+		totOrigSize = totOrigSize + uint64(blockSize)
+		totCompSize = totCompSize + uint64(bytes)
+	}
+	mu.Unlock()
+
+	blockMb := float64(blockSize) / float64(mb1)
+
+	blocksLeft := float64(lastBlockNum - job.blockIdx)
+	mbsLeft := blocksLeft * blockMb
+	mbsDone := float64(job.blockIdx - v_skipIdx) * blockMb
+
+	mbs := mbsDone / time.Since(t0).Seconds()
+
+	eta := 0
+	etaUnit := "min"
+
+	if mbs > 0 {
+		eta = int(mbsLeft / mbs / 60)
+		etaUnit = "min"
+		if eta > 180 {
+			eta = eta / 60
+			etaUnit = "hr"
+		}
+	}
+	if eta < 0 { eta = 0 }
+	if job.blockIdx >= lastBlockNum { eta = 0 }
+
+	percent := 100 * float64(job.blockIdx) / float64(lastBlockNum)
+	ratio := 100 * float64(totCompSize) / float64(totOrigSize)
+
+	Log("block %d/%d (%0.2f%%) [%s] size=%d ratio=%0.2f %0.2f MB/s ETA=%d %s diffs=%d\r", job.blockIdx, lastBlockNum, percent, indicator, v_fileSize, ratio, mbs, eta, etaUnit, diffs)
+}
+
 // processBlockJob handles hashing, compressing, and sending a block using a persistent connection
 func processBlockJob(conn *AutoReconnectTCP, job BlockJob, blockSize uint32, fileSize uint64, noCompress bool, checksumCache *ChecksumCache) {
 	magicBytes := stringToFixedSizeArray(magicHead)
@@ -52,6 +102,7 @@ func processBlockJob(conn *AutoReconnectTCP, job BlockJob, blockSize uint32, fil
 
 	// Block is already in sync, or it's a known zero block — skip sending
 	if bytes.Equal(hash, serverHash) {
+		printStats(job, "-", 0, 0)
 		return
 	}
 
@@ -80,6 +131,7 @@ func processBlockJob(conn *AutoReconnectTCP, job BlockJob, blockSize uint32, fil
 			Log("\t- error writing net: [%d] %s\n", n, err3.Error())
 			return
 		}
+		printStats(job, ".", 1, 0)
 		return
 	}
 
@@ -107,6 +159,7 @@ func processBlockJob(conn *AutoReconnectTCP, job BlockJob, blockSize uint32, fil
 			Log("\t- error writing net: [%d] %s\n", n, err3.Error())
 			return
 		}
+		printStats(job, "w", 1, uint32(job.readedBytes))
 		return
 	}
 
@@ -143,6 +196,7 @@ func processBlockJob(conn *AutoReconnectTCP, job BlockJob, blockSize uint32, fil
 			Log("\t- error writing net: [%d] %s\n", n, err3.Error())
 			return
 		}
+		printStats(job, "c", 1, compressedBytes)
 	} else {
 		msg, err1 := pack(&Msg{
 			MagicHead:  magicBytes,
@@ -167,17 +221,21 @@ func processBlockJob(conn *AutoReconnectTCP, job BlockJob, blockSize uint32, fil
 			Log("\t- error writing net: [%d] %s\n", n, err3.Error())
 			return
 		}
+		printStats(job, "w", 1, uint32(job.readedBytes))
 	}
 }
 
 // startClient launches threadsCount workers, each with a persistent connection, and pushes file blocks to a jobs channel
 func startClient(file *os.File, serverAddress string, skipIdx uint32, fileSize uint64, blockSize uint32, noCompress bool, checksumCache *ChecksumCache, workers int) {
 	Log("startClient()\n")
-	lastBlockNum := uint32(fileSize / uint64(blockSize))
+	lastBlockNum = uint32(fileSize / uint64(blockSize))
 	Log("source size: %d bytes, block %d bytes, blockNum: %d\n", fileSize, blockSize, lastBlockNum)
 
 	jobs := make(chan BlockJob, workers*2)
 	var wg sync.WaitGroup
+	t0 = time.Now()
+	v_skipIdx = skipIdx
+	v_fileSize = fileSize
 
 	// Resolve server address once
 	saddr, err := net.ResolveTCPAddr("tcp", serverAddress)
@@ -186,8 +244,8 @@ func startClient(file *os.File, serverAddress string, skipIdx uint32, fileSize u
 		return
 	}
 
-	Log("starting %d workers\n", workers)
 	// Start worker goroutines
+	Log("starting %d workers\n", workers)
 	for i := 0; i < workers; i++ {
 		wg.Add(1)
 		go func(saddr *net.TCPAddr) {
