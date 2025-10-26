@@ -16,6 +16,7 @@ func main() {
 	var bSize uint
 	var skipIdx uint
 	var port string
+	var bindIp string
 	var noCompress bool
 	var sshTarget string
 	var logPrefix string
@@ -27,6 +28,7 @@ func main() {
 	flag.UintVar(&bSize, "b", uint(blockSize), "block size, default 100M")
 	flag.UintVar(&skipIdx, "s", 0, "skip blocks, default 0")
 	flag.StringVar(&port, "p", "8080", "bind to port, default 8080")
+	flag.StringVar(&bindIp, "i", "0.0.0.0", "bind to IP, default 0.0.0.0")
 	flag.BoolVar(&noCompress, "n", false, "do not compress blocks (by default compress)")
 	flag.StringVar(&sshTarget, "t", "", "launch remote server via ssh: user@host:/remote_path")
 	flag.StringVar(&logPrefix, "l", "", "custom log prefix")
@@ -115,6 +117,6 @@ func main() {
 		checksumCache := NewChecksumCache(lastBlockNum)
 		go precomputeChecksums(file, blockSize, lastBlockNum, checksumCache, uint32(skipIdx))
 
-		startServer(file, port, checksumCache)
+		startServer(file, bindIp, port, checksumCache)
 	}
 }

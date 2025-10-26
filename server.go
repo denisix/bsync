@@ -141,8 +141,13 @@ func serverHandleReq(conn net.Conn, file *os.File, checksumCache *ChecksumCache)
 	}
 }
 
-func startServer(file *os.File, port string, checksumCache *ChecksumCache) {
-	listener, err := net.Listen("tcp", ":"+port)
+func startServer(file *os.File, bindIp, port string, checksumCache *ChecksumCache) {
+	bindTo := ":" + port
+	if bindIp != "0.0.0.0" {
+		bindTo = bindIp + ":" + port
+	}
+
+	listener, err := net.Listen("tcp", bindTo)
 	if err != nil {
 		Err("listening: %s\n", err.Error())
 		return
@@ -150,7 +155,7 @@ func startServer(file *os.File, port string, checksumCache *ChecksumCache) {
 	defer listener.Close()
 
 	// time.Sleep(2 * time.Second)
-	Log("READY, listening on 0.0.0.0:%s\n", port)
+	Log("READY, listening on %s\n", bindTo)
 
 	for {
 		conn, err := listener.Accept()
