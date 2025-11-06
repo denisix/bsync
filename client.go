@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/binary"
 	"io"
 	"net"
 	"os"
@@ -318,4 +319,153 @@ func startClient(file *os.File, serverAddress string, skipIdx uint32, fileSize u
 	Log("\nDONE, exiting..\n\n")
 	time.Sleep(2 * time.Second)
 	return
+}
+
+// startClientDownload connects to server and downloads file blocks
+func startClientDownload(file *os.File, serverAddress string, skipIdx uint32, blockSize uint32, noCompress bool, workers int) {
+	Log("startClientDownload()\n")
+
+	// Resolve server address once
+	saddr, err := net.ResolveTCPAddr("tcp", serverAddress)
+	if err != nil {
+		Err("resolving: %s\n", err.Error())
+		return
+	}
+
+	// Connect to server
+	conn := NewAutoReconnectTCP(saddr)
+	defer conn.Close()
+
+	// Send download request to server
+	magicBytes := stringToFixedSizeArray(magicHead)
+	msg, err1 := pack(&Msg{
+		MagicHead:  magicBytes,
+		BlockIdx:   0,
+		BlockSize:  blockSize,
+		FileSize:   0,
+		DataSize:   0,
+		Compressed: false,
+		Zero:       false,
+		Done:       false,
+	})
+	if err1 != nil {
+		Log("cant pack download request msg-> %s\n", err1)
+		return
+	}
+
+	n, err2 := conn.Write(msg)
+	if err2 != nil && err2 != io.EOF {
+		Log("\t- error writing download request: [%d] %s\n", n, err2.Error())
+		return
+	}
+
+	// Read file metadata from server
+	msgBuf := make([]byte, binary.Size(Msg{}))
+	_, err = io.ReadFull(conn, msgBuf)
+	if err != nil {
+		Log("Error reading metadata from server: %s\n", err.Error())
+		return
+	}
+
+	metaMsg, err3 := unpack(msgBuf)
+	if err3 != nil {
+		Log("\t- unpack metadata failed: %s\n", err3)
+		return
+	}
+
+	fileSize := metaMsg.FileSize
+	lastBlockNum := uint32(fileSize / uint64(blockSize))
+
+	Log("remote file size: %d bytes, block %d bytes, blockNum: %d\n", fileSize, blockSize, lastBlockNum)
+
+	// Truncate local file to match remote size
+	truncateIfRegularFile(file, fileSize)
+
+	// Start receiving blocks
+	Log("start downloading from server\n")
+	filebuf := make([]byte, blockSize)
+
+	for blockIdx := uint32(skipIdx); blockIdx <= lastBlockNum; blockIdx++ {
+		// Request block from server
+		msg, err1 := pack(&Msg{
+			MagicHead:  magicBytes,
+			BlockIdx:   blockIdx,
+			BlockSize:  blockSize,
+			FileSize:   fileSize,
+			DataSize:   0,
+			Compressed: false,
+			Zero:       false,
+			Done:       false,
+		})
+		if err1 != nil {
+			Log("cant pack block request msg-> %s\n", err1)
+			return
+		}
+
+		n, err2 := conn.Write(msg)
+		if err2 != nil && err2 != io.EOF {
+			Log("\t- error writing block request: [%d] %s\n", n, err2.Error())
+			return
+		}
+
+		// Read response
+		_, err = io.ReadFull(conn, msgBuf)
+		if err != nil {
+			Log("Error reading block response: %s\n", err.Error())
+			return
+		}
+
+		blockMsg, err4 := unpack(msgBuf)
+		if err4 != nil {
+			Log("\t- unpack block response failed: %s\n", err4)
+			return
+		}
+
+		if blockMsg.Done {
+			Log("\ndownload DONE\n\n")
+			break
+		}
+
+		offset := int64(blockIdx) * int64(blockSize)
+
+		if blockMsg.DataSize > 0 {
+			// Read block data
+			_, err1 := io.ReadFull(conn, filebuf[:blockMsg.DataSize])
+			if err1 != nil {
+				Log("\t- error reading block data: %s\n", err1)
+				return
+			}
+
+			if blockMsg.Zero {
+				zero := make([]byte, blockMsg.DataSize)
+				n, err := file.WriteAt(zero, offset)
+				if err != nil && err != io.EOF {
+					Log("\t- error writing zero block: [%d] %s\n", n, err.Error())
+					break
+				}
+			} else if blockMsg.Compressed {
+				decompressed, err := decompressData(filebuf[:blockMsg.DataSize])
+				if err != nil {
+					Log("\t- error decompressing: %s\n", err.Error())
+					break
+				}
+				n, err2 := file.WriteAt(decompressed, offset)
+				if err2 != nil && err2 != io.EOF {
+					Log("\t- error writing decompressed block: [%d] %s\n", n, err2.Error())
+					break
+				}
+			} else {
+				n, err2 := file.WriteAt(filebuf[:blockMsg.DataSize], offset)
+				if err2 != nil && err2 != io.EOF {
+					Log("\t- error writing block: [%d] %s\n", n, err2.Error())
+					break
+				}
+			}
+		}
+
+		percent := 100 * float64(blockIdx) / float64(lastBlockNum)
+		Log("downloaded block %d/%d (%0.2f%%)\r", blockIdx, lastBlockNum, percent)
+	}
+
+	Log("\ndownload complete\n")
 }

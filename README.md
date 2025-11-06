@@ -43,6 +43,7 @@ Copy the `bsync` binary to your source and destination servers.
 | `-l` | Custom log prefix | - |
 | `-w` | Number of workers | 1 |
 | `-q` | Quiet mode (no output) | false |
+| `-d` | Download mode: transfer from server to client | false |
 
 ## 🔄 Examples
 
@@ -90,6 +91,22 @@ Copy the `bsync` binary to your source and destination servers.
 ./bsync -n -f /tmp/src.img -t /tmp/dst.img
 ```
 
+### 7. Download Mode Examples
+
+**Server (upload mode):**
+```bash
+./bsync -f /dev/shm/test-src -p 8080 -d
+```
+
+**Client (download mode):**
+```bash
+./bsync -f /dev/shm/test-dst -r 192.168.1.100:8080 -d
+```
+
+**SSH-Automated Download:**
+```bash
+./bsync -f /dev/shm/test-dst -t user@remote-server:/dev/shm/test-src -d
+```
 
 ## 🔍 Verification
 

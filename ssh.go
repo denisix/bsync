@@ -137,3 +137,87 @@ func startRemoteSSH(targetPath, port string, blockSize, skipIdx uint32, quiet bo
 
 	return cmd, nil
 }
+
+func startRemoteSSHDownload(targetPath, port string, blockSize, skipIdx uint32, quiet bool) (*exec.Cmd, error) {
+	// split sshTarget "user@host:/remote/path" -> "user@host" and "/remote/path"
+	user, host, file := parseSSHTarget(targetPath)
+
+	// If no host specified, run locally
+	if host == "" {
+		Log("run locally for download: %s\n", file)
+
+		// Get the path to the current executable
+		execPath, err := os.Executable()
+		if err != nil {
+			return nil, err
+		}
+
+		// Create command with absolute path to bsync with -d flag for download mode
+		args := []string{execPath, "-f", file, "-p", port, "-b", strconv.FormatUint(uint64(blockSize), 10), "-d"}
+		if quiet {
+			args = append(args, "-q")
+		}
+		cmd := exec.Command(args[0], args[1:]...)
+
+		// Set up stdout pipe to capture READY signal
+		stdout, err := cmd.StdoutPipe()
+		if err != nil {
+			return nil, err
+		}
+		cmd.Stderr = os.Stderr
+
+		if err := cmd.Start(); err != nil {
+			return nil, err
+		}
+
+		if err := waitForReady(stdout, true); err != nil {
+			return nil, err
+		}
+		cmd.Stdout = os.Stdout
+
+		go io.Copy(os.Stdout, stdout) // keeps reading and printing
+
+		return cmd, nil
+	}
+
+	if (user != "") {
+		host = user + "@" + host
+	}
+
+	// run SSH command with -d flag for download mode
+	args := []string{
+		"ssh", host,
+		"bsync", "-f", file,
+		"-p", port,
+		"-b", strconv.FormatUint(uint64(blockSize), 10),
+		"-s", strconv.FormatUint(uint64(skipIdx), 10),
+		"-d",
+	}
+
+	if quiet {
+		args = append(args, "-q")
+	}
+
+	Log("spawning ssh for download with args: %s\n", args)
+	cmd := exec.Command(args[0], args[1:]...)
+
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, err
+	}
+	cmd.Stderr = os.Stderr // pass stderr through
+
+	if err := cmd.Start(); err != nil {
+		return nil, err
+	}
+
+	if err := waitForReady(stdout, false); err != nil {
+		return nil, err
+	}
+
+	cmd.Stdout = os.Stdout
+
+	go io.Copy(os.Stdout, stdout) // keeps reading and printing
+
+	return cmd, nil
+}
