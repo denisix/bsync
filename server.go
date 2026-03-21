@@ -7,11 +7,17 @@ import (
 	"io"
 	"net"
 	"os"
+	"sync/atomic"
 	"time"
 )
 
+var (
+	activeConns   int64
+	doneReceived  int32
+	shutdownTimer *time.Timer
+)
+
 func serverHandleReq(conn net.Conn, file *os.File, checksumCache *ChecksumCache) {
-	Log("serverHandleReq()\n")
 	defer conn.Close()
 	magicBytes := stringToFixedSizeArray(magicHead)
 
@@ -19,8 +25,6 @@ func serverHandleReq(conn net.Conn, file *os.File, checksumCache *ChecksumCache)
 	msgBuf := make([]byte, binary.Size(Msg{}))
 
 	var lastBlockNum uint32 = 0
-	var lastPartSize uint64 = 0
-	var firstBlock uint32 = 0
 
 	c := bufio.NewReader(conn)
 
@@ -42,7 +46,7 @@ func serverHandleReq(conn net.Conn, file *os.File, checksumCache *ChecksumCache)
 		}
 
 		if debug {
-			Log("\t- unpacked Msg-> %s\n", msg)
+			Log("\t- unpacked Msg-> %v\n", msg)
 		}
 
 		if msg.BlockSize != blockSize {
@@ -54,11 +58,7 @@ func serverHandleReq(conn net.Conn, file *os.File, checksumCache *ChecksumCache)
 
 		if msg.FileSize > 0 {
 			if lastBlockNum == 0 {
-				lastBlockNum = uint32(msg.FileSize/uint64(blockSize)) + 1
-				lastPartSize = msg.FileSize - uint64(lastBlockNum)*uint64(blockSize)
-				firstBlock = msg.BlockIdx
-				Log("\n\tlast part size = %d\n\tlast block = %d\n\tfirst block = %d\n\tblock size = %d\n\n", lastPartSize, lastBlockNum, firstBlock, msg.BlockSize)
-
+				lastBlockNum = uint32(msg.FileSize / uint64(blockSize))
 				truncateIfRegularFile(file, msg.FileSize)
 			}
 		}
@@ -132,11 +132,15 @@ func serverHandleReq(conn net.Conn, file *os.File, checksumCache *ChecksumCache)
 			}
 		}
 
-		// if Done?
+		// Check for DONE message
 		if msg.Done {
-			Log("\ntransfer DONE\n\n")
-			time.Sleep(2 * time.Second)
-			os.Exit(0)
+			Log("\ntransfer DONE message received, starting graceful shutdown\n")
+			atomic.StoreInt32(&doneReceived, 1)
+			// Start shutdown timer in main loop
+			if shutdownTimer != nil {
+				shutdownTimer.Reset(10 * time.Second)
+			}
+			return
 		}
 
 	}
@@ -155,16 +159,80 @@ func startServer(file *os.File, bindIp, port string, checksumCache *ChecksumCach
 	}
 	defer listener.Close()
 
-	// time.Sleep(2 * time.Second)
 	Log("READY, listening on %s\n", bindTo)
 
+	// Idle timeout: exit after 2 seconds of no connections
+	idleTimer := time.NewTimer(2 * time.Second)
+	idleTimer.Stop() // Don't start until we've had at least one connection
+
+	// Shutdown timer: started when DONE received
+	shutdownTimer = time.NewTimer(10 * time.Second)
+	shutdownTimer.Stop() // Don't start until DONE received
+
+	connChan := make(chan net.Conn)
+	errChan := make(chan error)
+
+	// Accept connections in goroutine
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				errChan <- err
+				return
+			}
+			connChan <- conn
+		}
+	}()
+
+	hadConnection := false
+
 	for {
-		conn, err := listener.Accept()
-		if err != nil {
+		select {
+		case conn := <-connChan:
+			hadConnection = true
+			idleTimer.Stop()
+			shutdownTimer.Stop() // Stop shutdown timer when new activity
+			atomic.AddInt64(&activeConns, 1)
+			go func(c net.Conn) {
+				defer atomic.AddInt64(&activeConns, -1)
+				serverHandleReq(c, file, checksumCache)
+
+				// Check if we should exit after DONE
+				if atomic.LoadInt32(&doneReceived) == 1 {
+					active := atomic.LoadInt64(&activeConns)
+					if active == 0 {
+						Log("All connections finished after DONE, exiting\n")
+						return
+					}
+					Log("Graceful shutdown: %d connections still active, waiting...\n", active)
+				}
+
+				// Normal idle timer (only when NOT done)
+				if atomic.LoadInt64(&activeConns) == 0 && hadConnection && atomic.LoadInt32(&doneReceived) == 0 {
+					Log("Last connection closed, starting idle timer\n")
+					idleTimer.Reset(2 * time.Second)
+				}
+			}(conn)
+
+		case err := <-errChan:
 			Log("Error accepting: %s\n", err.Error())
 			return
+
+		case <-idleTimer.C:
+			if atomic.LoadInt64(&activeConns) == 0 && atomic.LoadInt32(&doneReceived) == 0 {
+				Log("Server idle timeout, exiting\n")
+				return
+			}
+
+		case <-shutdownTimer.C:
+			active := atomic.LoadInt64(&activeConns)
+			if active == 0 {
+				Log("Graceful shutdown: no active connections, exiting\n")
+				return
+			}
+			Log("Graceful shutdown: %d connections still active, waiting another 10s\n", active)
+			shutdownTimer.Reset(10 * time.Second)
 		}
-		go serverHandleReq(conn, file, checksumCache)
 	}
 }
 
@@ -226,7 +294,7 @@ func serverHandleUpload(conn net.Conn, file *os.File, fileSize uint64, checksumC
 		}
 
 		if debug {
-			Log("\t- unpacked upload Msg-> %s\n", msg)
+			Log("\t- unpacked upload Msg-> %v\n", msg)
 		}
 
 		// If this is the first request, send file metadata

@@ -9,6 +9,16 @@ import (
 
 var zeroBlockHash = make([]byte, 16) // FNV-128a length
 
+// PrecomputedBlock contains hash and compressed data
+type PrecomputedBlock struct {
+	BlockIdx      uint32
+	Hash          []byte
+	Data          []byte // Original data
+	Compressed    []byte // Compressed data (if beneficial)
+	UseCompressed bool   // Whether to use compressed version
+	IsZero        bool
+}
+
 // compute FNV1a checksum
 func checksum(data []byte) []byte {
 	hasher := fnv.New128a() // Using 128-bit FNV-1a. You can also use New32a(), New64a() for smaller sizes.
@@ -58,30 +68,107 @@ func (cc *ChecksumCache) WaitFor(idx uint32) []byte {
 	return cc.data[idx]
 }
 
-func precomputeChecksums(file *os.File, blockSize uint32, lastBlockNum uint32, cache *ChecksumCache, skipIdx uint32) {
-	Log("checksums: start computing..\n")
-	for idx := skipIdx; idx <= lastBlockNum; idx++ {
-		buf := make([]byte, blockSize)
-		offset := int64(idx) * int64(blockSize)
+// precomputeChecksumsParallel uses channel-based reader for parallel checksum + compression
+func precomputeChecksumsParallel(reader *SequentialReader, cache *ChecksumCache, precompressedChan chan<- PrecomputedBlock, workers int) {
+	Log("checksums: start computing with %d parallel workers..\n", workers)
 
-		n, err := file.ReadAt(buf, offset)
-		if err != nil && err != io.EOF {
-			Log("Checksum error at block %d: %v\n", idx, err)
-			cache.Set(idx, []byte("ERR"))
-			continue
-		}
-		if n == 0 && err == io.EOF {
-			cache.Set(idx, []byte("EOF"))
-			continue
-		}
+	var wg sync.WaitGroup
 
-		if isZeroBlock(buf[:n]) {
-    	cache.Set(idx, zeroBlockHash)
-    	continue
-		}
+	// Start worker goroutines
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for block := range reader.Blocks() {
+				var hash []byte
+				var isZero bool
+				var compressed []byte
+				var useCompressed bool
 
-		hash := checksum(buf[:n])
-		cache.Set(idx, hash)
+				if isZeroBlock(block.Data) {
+					hash = zeroBlockHash
+					isZero = true
+				} else {
+					hash = checksum(block.Data)
+					isZero = false
+
+					// Compress the block
+					comp, err := compressData(block.Data)
+					if err == nil && len(comp) < len(block.Data) {
+						compressed = comp
+						useCompressed = true
+					} else {
+						compressed = nil
+						useCompressed = false
+					}
+				}
+
+				// Store hash in cache for processBlockJob to use
+				cache.Set(block.BlockIdx, hash)
+
+				// Send precomputed block to transfer workers
+				precompressedChan <- PrecomputedBlock{
+					BlockIdx:      block.BlockIdx,
+					Hash:          hash,
+					Data:          block.Data,
+					Compressed:    compressed,
+					UseCompressed: useCompressed,
+					IsZero:        isZero,
+				}
+			}
+		}()
 	}
+
+	// Close channel when all workers done
+	go func() {
+		wg.Wait()
+		close(precompressedChan)
+	}()
+}
+
+// Note: precomputeChecksumsSequential removed - use precomputeChecksumsParallel instead
+
+
+func precomputeChecksums(file *os.File, blockSize uint32, lastBlockNum uint32, cache *ChecksumCache, skipIdx uint32, workers int) {
+	Log("checksums: start computing with %d workers..\n", workers)
+
+	jobs := make(chan uint32, workers*2)
+	var wg sync.WaitGroup
+
+	// Start worker goroutines
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			buf := make([]byte, blockSize)
+			for idx := range jobs {
+				offset := int64(idx) * int64(blockSize)
+				n, err := file.ReadAt(buf, offset)
+				if err != nil && err != io.EOF {
+					cache.Set(idx, []byte("ERR"))
+					continue
+				}
+				if n == 0 && err == io.EOF {
+					cache.Set(idx, []byte("EOF"))
+					continue
+				}
+
+				if isZeroBlock(buf[:n]) {
+					cache.Set(idx, zeroBlockHash)
+					continue
+				}
+
+				hash := checksum(buf[:n])
+				cache.Set(idx, hash)
+			}
+		}()
+	}
+
+	// Distribute jobs
+	for idx := skipIdx; idx <= lastBlockNum; idx++ {
+		jobs <- idx
+	}
+	close(jobs)
+	wg.Wait()
 }
 

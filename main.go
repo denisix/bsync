@@ -46,7 +46,7 @@ func main() {
 	}
 
 	if sshTarget != "" {
-		_, host, _ := parseSSHTarget(sshTarget)
+		_, host, _, _ := parseSSHTarget(sshTarget)
 		remoteAddr = host + ":" + port
 	}
 
@@ -129,7 +129,7 @@ func main() {
 			lastBlockNum := uint32(fileSize / uint64(blockSize))
 
 			checksumCache := NewChecksumCache(lastBlockNum)
-			go precomputeChecksums(file, blockSize, lastBlockNum, checksumCache, uint32(skipIdx))
+			// Note: startClient now handles checksum precomputation with sequential reader
 
 			startClient(file, remoteAddr, uint32(skipIdx), fileSize, blockSize, noCompress, checksumCache, int(workers))
 
@@ -159,7 +159,7 @@ func main() {
 			lastBlockNum := uint32(fileSize / uint64(blockSize))
 
 			checksumCache := NewChecksumCache(lastBlockNum)
-			go precomputeChecksums(file, blockSize, lastBlockNum, checksumCache, uint32(skipIdx))
+			go precomputeChecksums(file, blockSize, lastBlockNum, checksumCache, uint32(skipIdx), int(workers))
 
 			startServerUpload(file, bindIp, port, fileSize, checksumCache, int(workers))
 		} else {
@@ -177,7 +177,7 @@ func main() {
 			lastBlockNum := uint32(fileSize / uint64(blockSize))
 
 			checksumCache := NewChecksumCache(lastBlockNum)
-			go precomputeChecksums(file, blockSize, lastBlockNum, checksumCache, uint32(skipIdx))
+			go precomputeChecksums(file, blockSize, lastBlockNum, checksumCache, uint32(skipIdx), int(workers))
 
 			startServer(file, bindIp, port, checksumCache)
 		}

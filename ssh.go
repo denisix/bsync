@@ -9,10 +9,28 @@ import (
 	"strconv"
 )
 
-func parseSSHTarget(input string) (user, host, file string) {
+func isPortNumber(s string) bool {
+	if s == "" {
+		return false
+	}
+	// Check all characters are digits
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	// Parse and validate range (1-65535)
+	port, err := strconv.ParseUint(s, 10, 16)
+	if err != nil || port < 1 || port > 65535 {
+		return false
+	}
+	return true
+}
+
+func parseSSHTarget(input string) (user, host, port, file string) {
 	// If input doesn't contain ':', it's a local file
 	if !strings.Contains(input, ":") {
-		return "", "", input
+		return "", "", "", input
 	}
 
 	// Split the input by '@' to handle the optional user component
@@ -22,16 +40,25 @@ func parseSSHTarget(input string) (user, host, file string) {
 		input = parts[1]
 	}
 
-	// Split the remaining part by ':' to separate host and file
-	parts = strings.SplitN(input, ":", 2)
-	if len(parts) != 2 {
+	// Split by ':' - could be host:port:/path or host:/path or host:port:path (for Windows)
+	parts = strings.SplitN(input, ":", 3)
+	if len(parts) < 2 {
 		Err("invalid format: %s\n", input)
+		return
 	}
 
 	host = parts[0]
-	file = parts[1]
 
-	return user, host, file
+	// Check if middle part is a numeric port (format: host:port:/path)
+	if len(parts) == 3 && isPortNumber(parts[1]) {
+		port = parts[1]
+		file = parts[2]
+	} else {
+		// No port: host:/path
+		file = parts[1]
+	}
+
+	return user, host, port, file
 }
 
 func waitForReady(stdout io.ReadCloser, isLocal bool) error {
@@ -55,7 +82,7 @@ func waitForReady(stdout io.ReadCloser, isLocal bool) error {
 
 func startRemoteSSH(targetPath, port string, blockSize, skipIdx uint32, quiet bool) (*exec.Cmd, error) {
 	// split sshTarget "user@host:/remote/path" -> "user@host" and "/remote/path"
-	user, host, file := parseSSHTarget(targetPath)
+	user, host, sshPort, file := parseSSHTarget(targetPath)
 
 	// If no host specified, run locally
 	if host == "" {
@@ -101,13 +128,19 @@ func startRemoteSSH(targetPath, port string, blockSize, skipIdx uint32, quiet bo
 	}
 
 	// run SSH command
-	args := []string{
-		"ssh", host,
+	args := []string{"ssh"}
+
+	// Add custom SSH port if specified
+	if sshPort != "" {
+		args = append(args, "-p", sshPort)
+	}
+
+	args = append(args, host,
 		"bsync", "-f", file,
 		"-p", port,
 		"-b", strconv.FormatUint(uint64(blockSize), 10),
 		"-s", strconv.FormatUint(uint64(skipIdx), 10),
-	}
+	)
 
 	if quiet {
 		args = append(args, "-q")
@@ -140,7 +173,7 @@ func startRemoteSSH(targetPath, port string, blockSize, skipIdx uint32, quiet bo
 
 func startRemoteSSHDownload(targetPath, port string, blockSize, skipIdx uint32, quiet bool) (*exec.Cmd, error) {
 	// split sshTarget "user@host:/remote/path" -> "user@host" and "/remote/path"
-	user, host, file := parseSSHTarget(targetPath)
+	user, host, sshPort, file := parseSSHTarget(targetPath)
 
 	// If no host specified, run locally
 	if host == "" {
@@ -185,14 +218,20 @@ func startRemoteSSHDownload(targetPath, port string, blockSize, skipIdx uint32, 
 	}
 
 	// run SSH command with -d flag for download mode
-	args := []string{
-		"ssh", host,
+	args := []string{"ssh"}
+
+	// Add custom SSH port if specified
+	if sshPort != "" {
+		args = append(args, "-p", sshPort)
+	}
+
+	args = append(args, host,
 		"bsync", "-f", file,
 		"-p", port,
 		"-b", strconv.FormatUint(uint64(blockSize), 10),
 		"-s", strconv.FormatUint(uint64(skipIdx), 10),
 		"-d",
-	}
+	)
 
 	if quiet {
 		args = append(args, "-q")

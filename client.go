@@ -245,7 +245,6 @@ func startClient(file *os.File, serverAddress string, skipIdx uint32, fileSize u
 	lastBlockNum = uint32(fileSize / uint64(blockSize))
 	Log("source size: %d bytes, block %d bytes, blockNum: %d\n", fileSize, blockSize, lastBlockNum)
 
-	jobs := make(chan BlockJob, workers*2)
 	var wg sync.WaitGroup
 	t0 = time.Now()
 	v_skipIdx = skipIdx
@@ -258,37 +257,34 @@ func startClient(file *os.File, serverAddress string, skipIdx uint32, fileSize u
 		return
 	}
 
-	// Start worker goroutines
-	Log("starting %d workers\n", workers)
+	// Create sequential reader with channel-based output
+	reader := NewSequentialReader(file, blockSize, fileSize, skipIdx, workers*2)
+	reader.Start()
+
+	// Channel for precomputed blocks (hash + compressed data)
+	precompressedChan := make(chan PrecomputedBlock, workers*2)
+
+	// Start parallel checksum + compression workers
+	go precomputeChecksumsParallel(reader, checksumCache, precompressedChan, workers)
+
+	// Start worker goroutines for network transfer
+	Log("starting %d transfer workers\n", workers)
 	for i := 0; i < workers; i++ {
 		wg.Add(1)
 		go func(saddr *net.TCPAddr) {
 			defer wg.Done()
 			conn := NewAutoReconnectTCP(saddr)
 			defer conn.Close()
-			for job := range jobs {
-				processBlockJob(conn, job, blockSize, fileSize, noCompress, checksumCache)
+			for block := range precompressedChan {
+				processPrecomputedBlock(conn, block, blockSize, fileSize, noCompress, checksumCache)
 			}
 		}(saddr)
 	}
 
-	// Producer: read file sequentially and push jobs
-	Log("start reading source\n")
-	buf := make([]byte, blockSize)
-	for blockIdx := uint32(skipIdx); blockIdx <= lastBlockNum; blockIdx++ {
-		offset := int64(blockIdx) * int64(blockSize)
-		readedBytes, err := file.ReadAt(buf, offset)
-		if err != nil && err != io.EOF {
-			Err("\t- error reading file: %s\n", err.Error())
-			break
-		}
-		dataCopy := make([]byte, readedBytes)
-		copy(dataCopy, buf[:readedBytes])
-		jobs <- BlockJob{blockIdx, dataCopy, readedBytes}
-	}
-	close(jobs)
+	Log("DONE, waiting for the workers\n")
+	wg.Wait()
 
-	// send DONE
+	// Send DONE message to server
 	magicBytes := stringToFixedSizeArray(magicHead)
 	conn := NewAutoReconnectTCP(saddr)
 	defer conn.Close()
@@ -313,12 +309,104 @@ func startClient(file *os.File, serverAddress string, skipIdx uint32, fileSize u
 		return
 	}
 
-	Log("DONE, waiting for the workers\n")
-	wg.Wait()
-
 	Log("\nDONE, exiting..\n\n")
 	time.Sleep(2 * time.Second)
 	return
+}
+
+// processPrecomputedBlock sends a pre-hashed and pre-compressed block
+func processPrecomputedBlock(conn *AutoReconnectTCP, block PrecomputedBlock, blockSize uint32, fileSize uint64, noCompress bool, checksumCache *ChecksumCache) {
+	magicBytes := stringToFixedSizeArray(magicHead)
+
+	// Send request to server
+	msg, err1 := pack(&Msg{
+		MagicHead:  magicBytes,
+		BlockIdx:   block.BlockIdx,
+		BlockSize:  blockSize,
+		FileSize:   fileSize,
+		DataSize:   0,
+		Compressed: false,
+		Zero:       false,
+		Done:       false,
+	})
+	if err1 != nil {
+		Log("cant pack msg-> %s\n", err1)
+		return
+	}
+
+	n, err2 := conn.Write(msg)
+	if err2 != nil && err2 != io.EOF {
+		Log("\t- error writing net: [%d] %s\n", n, err2.Error())
+		return
+	}
+
+	// Get server hash
+	serverHash := make([]byte, len(block.Hash))
+	_, err := conn.Read(serverHash)
+	if err != nil {
+		Log("[client]\t- read data from net failed: %s\n", err.Error())
+		return
+	}
+
+	// Block is already in sync, skip sending
+	if bytes.Equal(block.Hash, serverHash) {
+		job := BlockJob{blockIdx: block.BlockIdx, data: block.Data, readedBytes: len(block.Data)}
+		printStats(job, "-", 0, 0)
+		return
+	}
+
+	// Determine what to send
+	var dataToSend []byte
+	var compressedFlag bool
+
+	if block.IsZero {
+		compressedFlag = false
+		dataToSend = block.Data
+	} else if noCompress || !block.UseCompressed {
+		compressedFlag = false
+		dataToSend = block.Data
+	} else {
+		compressedFlag = true
+		dataToSend = block.Compressed
+	}
+
+	// Send the data message
+	msg2, err1 := pack(&Msg{
+		MagicHead:  magicBytes,
+		BlockIdx:   block.BlockIdx,
+		BlockSize:  blockSize,
+		FileSize:   fileSize,
+		DataSize:   uint32(len(dataToSend)),
+		Compressed: compressedFlag,
+		Zero:       block.IsZero,
+		Done:       false,
+	})
+	if err1 != nil {
+		Log("\t- cant pack msg-> %s\n", err1)
+		return
+	}
+
+	n, err2 = conn.Write(msg2)
+	if err2 != nil && err2 != io.EOF {
+		Log("\t- error writing net: [%d] %s\n", n, err2.Error())
+		return
+	}
+
+	n, err3 := conn.Write(dataToSend)
+	if err3 != nil && err3 != io.EOF {
+		Log("\t- error writing net: [%d] %s\n", n, err3.Error())
+		return
+	}
+
+	// Update stats
+	job := BlockJob{blockIdx: block.BlockIdx, data: block.Data, readedBytes: len(block.Data)}
+	if block.IsZero {
+		printStats(job, ".", 1, 0)
+	} else if compressedFlag {
+		printStats(job, "c", 1, uint32(len(dataToSend)))
+	} else {
+		printStats(job, "w", 1, uint32(len(dataToSend)))
+	}
 }
 
 // startClientDownload connects to server and downloads file blocks
