@@ -46,6 +46,7 @@ Copy the `bsync` binary to your source and destination servers.
 | `-w` | Number of workers | 1 |
 | `-q` | Quiet mode (no output) | false |
 | `-d` | Download mode: transfer from server to client | false |
+| `-L` | Compression level: `fast`, `default`, `better`, `best` | `default` |
 
 ## 🔄 Examples
 
@@ -84,25 +85,38 @@ The `-e` flag enables ChaCha20-Poly1305 encryption. A 32-byte key is auto-genera
 ./bsync -b 500M -w 4 -l backup -f /dev/sda -r remote-server:8080
 ```
 
-### 5. Resume Interrupted Transfer
+### 5. Fast Compression
+
+**Use fast compression for CPU-limited systems:**
+```bash
+./bsync -L fast -f /dev/shm/test-src -t user@remote-server:/dev/shm/test-dst
+```
+
+The `-L` flag controls compression level:
+- `fast`: Fastest compression, larger output (~25x faster, ~10% larger)
+- `default`: Balanced speed and ratio
+- `better`: Better compression ratio, slower
+- `best`: Best compression ratio, slowest (~2-5x slower, ~10-15% smaller)
+
+### 6. Resume Interrupted Transfer
 
 **Skip first 10 blocks to resume:**
 ```bash
 ./bsync -f /dev/sda -r remote-server:8080 -s 10
 ```
 
-### 6. Quiet Mode for Scripts
+### 7. Quiet Mode for Scripts
 
 ```bash
 ./bsync -f /dev/sda -r remote-server:8080 -q
 ```
 
-### 7. Local File Sync
+### 8. Local File Sync
 ```bash
 ./bsync -n -f /tmp/src.img -t /tmp/dst.img
 ```
 
-### 8. Download Mode Examples
+### 9. Download Mode Examples
 
 **Server (upload mode):**
 ```bash
