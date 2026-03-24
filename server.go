@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/binary"
 	"io"
 	"net"
@@ -95,7 +96,7 @@ func serverHandleReq(conn net.Conn, file *os.File, checksumCache *ChecksumCache)
 			}
 
 			if msg.Zero {
-				zero := make([]byte, msg.DataSize)
+				zero := getZeroBuf(int(msg.DataSize))
 				n, err := file.WriteAt(zero, offset)
 				if err != nil && err != io.EOF {
 					Log("\t- error writing to file: [%d] %s\n", n, err.Error())
@@ -161,6 +162,10 @@ func startServer(file *os.File, bindIp, port string, checksumCache *ChecksumCach
 
 	Log("READY, listening on %s\n", bindTo)
 
+	// Context for cancellation
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	// Idle timeout: exit after 2 seconds of no connections
 	idleTimer := time.NewTimer(2 * time.Second)
 	idleTimer.Stop() // Don't start until we've had at least one connection
@@ -172,15 +177,28 @@ func startServer(file *os.File, bindIp, port string, checksumCache *ChecksumCach
 	connChan := make(chan net.Conn)
 	errChan := make(chan error)
 
-	// Accept connections in goroutine
+	// Accept connections in goroutine with context cancellation
 	go func() {
 		for {
-			conn, err := listener.Accept()
-			if err != nil {
-				errChan <- err
+			select {
+			case <-ctx.Done():
 				return
+			default:
+				conn, err := listener.Accept()
+				if err != nil {
+					select {
+					case errChan <- err:
+					case <-ctx.Done():
+					}
+					return
+				}
+				select {
+				case connChan <- conn:
+				case <-ctx.Done():
+					conn.Close()
+					return
+				}
 			}
-			connChan <- conn
 		}
 	}()
 

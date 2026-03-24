@@ -1,6 +1,7 @@
 package main
 
 import (
+	"hash"
 	"hash/fnv"
 	"sync"
 	"os"
@@ -8,6 +9,13 @@ import (
 )
 
 var zeroBlockHash = make([]byte, 16) // FNV-128a length
+
+// Hasher pool for better performance
+var hasherPool = sync.Pool{
+	New: func() interface{} {
+		return fnv.New128a()
+	},
+}
 
 // PrecomputedBlock contains hash and compressed data
 type PrecomputedBlock struct {
@@ -21,7 +29,9 @@ type PrecomputedBlock struct {
 
 // compute FNV1a checksum
 func checksum(data []byte) []byte {
-	hasher := fnv.New128a() // Using 128-bit FNV-1a. You can also use New32a(), New64a() for smaller sizes.
+	hasher := hasherPool.Get().(hash.Hash)
+	defer hasherPool.Put(hasher)
+	hasher.Reset()
 	hasher.Write(data)
 	return hasher.Sum(nil)
 }
@@ -68,6 +78,14 @@ func (cc *ChecksumCache) WaitFor(idx uint32) []byte {
 	return cc.data[idx]
 }
 
+// Delete removes a cached checksum to free memory (optional cleanup)
+func (cc *ChecksumCache) Delete(idx uint32) {
+	cc.mu.Lock()
+	defer cc.mu.Unlock()
+	delete(cc.data, idx)
+	delete(cc.ready, idx)
+}
+
 // precomputeChecksumsParallel uses channel-based reader for parallel checksum + compression
 func precomputeChecksumsParallel(reader *SequentialReader, cache *ChecksumCache, precompressedChan chan<- PrecomputedBlock, workers int) {
 	Log("checksums: start computing with %d parallel workers..\n", workers)
@@ -84,6 +102,7 @@ func precomputeChecksumsParallel(reader *SequentialReader, cache *ChecksumCache,
 				var isZero bool
 				var compressed []byte
 				var useCompressed bool
+				var originalData []byte
 
 				if isZeroBlock(block.Data) {
 					hash = zeroBlockHash
@@ -97,9 +116,12 @@ func precomputeChecksumsParallel(reader *SequentialReader, cache *ChecksumCache,
 					if err == nil && len(comp) < len(block.Data) {
 						compressed = comp
 						useCompressed = true
+						// Don't need original data if using compressed - save memory
+						originalData = nil
 					} else {
 						compressed = nil
 						useCompressed = false
+						originalData = block.Data
 					}
 				}
 
@@ -110,7 +132,7 @@ func precomputeChecksumsParallel(reader *SequentialReader, cache *ChecksumCache,
 				precompressedChan <- PrecomputedBlock{
 					BlockIdx:      block.BlockIdx,
 					Hash:          hash,
-					Data:          block.Data,
+					Data:          originalData,
 					Compressed:    compressed,
 					UseCompressed: useCompressed,
 					IsZero:        isZero,

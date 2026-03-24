@@ -6,10 +6,11 @@ import (
 )
 
 var (
+	encoderLevel zstd.EncoderLevel = zstd.SpeedDefault
 	encoderPool = sync.Pool{
 		New: func() interface{} {
 			enc, err := zstd.NewWriter(nil,
-				zstd.WithEncoderLevel(zstd.SpeedBestCompression),
+				zstd.WithEncoderLevel(encoderLevel),
 				zstd.WithWindowSize(1<<18),
 			)
 			if err != nil {
@@ -28,6 +29,21 @@ var (
 		},
 	}
 )
+
+// SetCompressionLevel sets the compression level for new encoders
+// Must be called before any compression is done
+func SetCompressionLevel(level string) {
+	switch level {
+	case "fast":
+		encoderLevel = zstd.SpeedFastest
+	case "better":
+		encoderLevel = zstd.SpeedBetterCompression
+	case "best":
+		encoderLevel = zstd.SpeedBestCompression
+	default:
+		encoderLevel = zstd.SpeedDefault
+	}
+}
 
 func compressData(data []byte) ([]byte, error) {
 	encoder := encoderPool.Get().(*zstd.Encoder)

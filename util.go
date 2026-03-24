@@ -3,7 +3,28 @@ package main
 import (
 	"io"
 	"os"
+	"sync"
+	"unsafe"
 )
+
+// Shared zero buffer for writing zero blocks (1MB max)
+var (
+	zeroBuf    []byte
+	zeroBufMu  sync.Mutex
+	zeroBufMax = 1024 * 1024 // 1MB
+)
+
+func getZeroBuf(size int) []byte {
+	if size <= zeroBufMax {
+		zeroBufMu.Lock()
+		defer zeroBufMu.Unlock()
+		if zeroBuf == nil {
+			zeroBuf = make([]byte, zeroBufMax)
+		}
+		return zeroBuf[:size]
+	}
+	return make([]byte, size)
+}
 
 func getDeviceSize(file *os.File) uint64 {
 	pos, err := file.Seek(0, io.SeekEnd)
@@ -15,10 +36,29 @@ func getDeviceSize(file *os.File) uint64 {
 	return uint64(pos)
 }
 
-// isZeroBlock -> true if every byte is 0
+// isZeroBlock checks if all bytes are zero using optimized 8-byte comparison
 func isZeroBlock(b []byte) bool {
-	for _, v := range b {
-		if v != 0 {
+	// Check 8 bytes at a time for better performance
+	if len(b) < 8 {
+		for _, v := range b {
+			if v != 0 {
+				return false
+			}
+		}
+		return true
+	}
+
+	// Use unsafe pointer arithmetic for fast comparison
+	n := len(b)
+	for i := 0; i < n-7; i += 8 {
+		if *(*uint64)(unsafe.Pointer(&b[i])) != 0 {
+			return false
+		}
+	}
+
+	// Check remaining bytes
+	for i := n - (n % 8); i < n; i++ {
+		if b[i] != 0 {
 			return false
 		}
 	}

@@ -370,6 +370,12 @@ func processPrecomputedBlock(conn *AutoReconnectTCP, block PrecomputedBlock, blo
 		dataToSend = block.Compressed
 	}
 
+	// Ensure we have data to send
+	if len(dataToSend) == 0 && !block.IsZero {
+		Log("\t- error: no data to send for block %d\n", block.BlockIdx)
+		return
+	}
+
 	// Send the data message
 	msg2, err1 := pack(&Msg{
 		MagicHead:  magicBytes,
@@ -525,7 +531,7 @@ func startClientDownload(file *os.File, serverAddress string, skipIdx uint32, bl
 			}
 
 			if blockMsg.Zero {
-				zero := make([]byte, blockMsg.DataSize)
+				zero := getZeroBuf(int(blockMsg.DataSize))
 				n, err := file.WriteAt(zero, offset)
 				if err != nil && err != io.EOF {
 					Log("\t- error writing zero block: [%d] %s\n", n, err.Error())

@@ -1,14 +1,20 @@
 package main
 
 import (
+	"crypto/cipher"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"sync"
 
 	"golang.org/x/crypto/chacha20poly1305"
 )
 
-var encryptionKey []byte
+var (
+	encryptionKey []byte
+	aeadCipher    cipher.AEAD
+	aeadOnce      sync.Once
+)
 
 // GenerateEncryptionKey creates a new random 32-byte key
 func GenerateEncryptionKey() []byte {
@@ -27,6 +33,8 @@ func SetEncryptionKey(hexKey string) error {
 		return errors.New("encryption key must be 32 bytes")
 	}
 	encryptionKey = key
+	// Reset aeadOnce so getAEAD creates new cipher with new key
+	aeadOnce = sync.Once{}
 	return nil
 }
 
@@ -43,6 +51,14 @@ func IsEncryptionEnabled() bool {
 	return encryptionKey != nil
 }
 
+// getAEAD returns cached AEAD cipher instance
+func getAEAD() cipher.AEAD {
+	aeadOnce.Do(func() {
+		aeadCipher, _ = chacha20poly1305.New(encryptionKey)
+	})
+	return aeadCipher
+}
+
 // encryptBlock encrypts data with ChaCha20-Poly1305
 // Returns: nonce (12 bytes) + ciphertext + tag (16 bytes)
 func encryptBlock(plaintext []byte) []byte {
@@ -50,7 +66,7 @@ func encryptBlock(plaintext []byte) []byte {
 		return plaintext
 	}
 
-	aead, _ := chacha20poly1305.New(encryptionKey)
+	aead := getAEAD()
 
 	// Generate random nonce
 	nonce := make([]byte, chacha20poly1305.NonceSize)
@@ -73,7 +89,7 @@ func decryptBlock(data []byte) ([]byte, error) {
 		return data, nil
 	}
 
-	aead, _ := chacha20poly1305.New(encryptionKey)
+	aead := getAEAD()
 
 	nonceSize := chacha20poly1305.NonceSize
 	if len(data) < nonceSize {

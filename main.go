@@ -25,6 +25,7 @@ func main() {
 	var reverse bool
 	var encrypt bool
 	var encKeyReceived string
+	var compLevel string
 
 	flag.StringVar(&device, "f", "/dev/zero", "specify file or device, i.e. '/dev/vda'")
 	flag.StringVar(&remoteAddr, "r", "", "specify remote address of server")
@@ -33,6 +34,7 @@ func main() {
 	flag.StringVar(&port, "p", "8080", "bind to port, default 8080")
 	flag.StringVar(&bindIp, "i", "0.0.0.0", "bind to IP, default 0.0.0.0")
 	flag.BoolVar(&noCompress, "n", false, "do not compress blocks (by default compress)")
+	flag.StringVar(&compLevel, "L", "default", "compression level: fast, default, better, best")
 	flag.StringVar(&sshTarget, "t", "", "launch remote server via ssh: user@host:/remote_path")
 	flag.StringVar(&logPrefix, "l", "", "custom log prefix")
 	flag.UintVar(&workers, "w", 1, "workers count, default 1")
@@ -42,6 +44,9 @@ func main() {
 	flag.StringVar(&encKeyReceived, "K", "", "encryption key (internal use)")
 
 	flag.Parse() // after declaring flags we need to call it
+
+	// Set compression level
+	SetCompressionLevel(compLevel)
 
 	blockSize = uint32(bSize)
 
