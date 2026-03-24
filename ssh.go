@@ -99,6 +99,10 @@ func startRemoteSSH(targetPath, port string, blockSize, skipIdx uint32, quiet bo
 		if quiet {
 			args = append(args, "-q")
 		}
+		// Pass encryption key if enabled
+		if IsEncryptionEnabled() {
+			args = append(args, "-K", GetEncryptionKeyHex())
+		}
 		cmd := exec.Command(args[0], args[1:]...)
 
 		// Set up stdout pipe to capture READY signal
@@ -146,6 +150,11 @@ func startRemoteSSH(targetPath, port string, blockSize, skipIdx uint32, quiet bo
 		args = append(args, "-q")
 	}
 
+	// Pass encryption key if enabled
+	if IsEncryptionEnabled() {
+		args = append(args, "-K", GetEncryptionKeyHex())
+	}
+
 	Log("spawning ssh with args: %s\n", args)
 	cmd := exec.Command(args[0], args[1:]...)
 
@@ -189,6 +198,10 @@ func startRemoteSSHDownload(targetPath, port string, blockSize, skipIdx uint32, 
 		args := []string{execPath, "-f", file, "-p", port, "-b", strconv.FormatUint(uint64(blockSize), 10), "-d"}
 		if quiet {
 			args = append(args, "-q")
+		}
+		// Pass encryption key if enabled
+		if IsEncryptionEnabled() {
+			args = append(args, "-K", GetEncryptionKeyHex())
 		}
 		cmd := exec.Command(args[0], args[1:]...)
 
@@ -235,6 +248,11 @@ func startRemoteSSHDownload(targetPath, port string, blockSize, skipIdx uint32, 
 
 	if quiet {
 		args = append(args, "-q")
+	}
+
+	// Pass encryption key if enabled
+	if IsEncryptionEnabled() {
+		args = append(args, "-K", GetEncryptionKeyHex())
 	}
 
 	Log("spawning ssh for download with args: %s\n", args)

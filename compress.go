@@ -34,10 +34,26 @@ func compressData(data []byte) ([]byte, error) {
 	defer encoderPool.Put(encoder)
 
 	buffer := make([]byte, 0, len(data))
-	return encoder.EncodeAll(data, buffer), nil
+	result := encoder.EncodeAll(data, buffer)
+
+	// Encrypt after compression if enabled
+	if IsEncryptionEnabled() {
+		result = encryptBlock(result)
+	}
+
+	return result, nil
 }
 
 func decompressData(data []byte) ([]byte, error) {
+	// Decrypt before decompression if enabled
+	if IsEncryptionEnabled() {
+		decrypted, err := decryptBlock(data)
+		if err != nil {
+			return nil, err
+		}
+		data = decrypted
+	}
+
 	decoder := decoderPool.Get().(*zstd.Decoder)
 	defer decoderPool.Put(decoder)
 

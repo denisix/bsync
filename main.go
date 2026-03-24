@@ -23,6 +23,8 @@ func main() {
 	var workers uint
 	var quiet bool
 	var reverse bool
+	var encrypt bool
+	var encKeyReceived string
 
 	flag.StringVar(&device, "f", "/dev/zero", "specify file or device, i.e. '/dev/vda'")
 	flag.StringVar(&remoteAddr, "r", "", "specify remote address of server")
@@ -36,6 +38,8 @@ func main() {
 	flag.UintVar(&workers, "w", 1, "workers count, default 1")
 	flag.BoolVar(&quiet, "q", false, "be quiet, without output")
 	flag.BoolVar(&reverse, "d", false, "download mode: transfer from server to client")
+	flag.BoolVar(&encrypt, "e", false, "enable encryption (auto-generates key)")
+	flag.StringVar(&encKeyReceived, "K", "", "encryption key (internal use)")
 
 	flag.Parse() // after declaring flags we need to call it
 
@@ -43,6 +47,17 @@ func main() {
 
 	if blockSize == 0 {
 		Err("Block size cannot be zero\n")
+	}
+
+	// Handle encryption
+	if encKeyReceived != "" {
+		if err := SetEncryptionKey(encKeyReceived); err != nil {
+			Err("Invalid encryption key: %v\n", err)
+		}
+	} else if encrypt && sshTarget != "" {
+		// Auto-generate key for SSH transfer
+		encryptionKey = GenerateEncryptionKey()
+		Log("encryption enabled with auto-generated key\n")
 	}
 
 	if sshTarget != "" {

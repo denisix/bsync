@@ -7,9 +7,10 @@
 ## ✨ Features
 
 - **Smart Transfer**: Only transfers blocks that differ (checksum-based)
-- **Compression**: Built-in compression for efficient network usage
+- **Compression**: Built-in zstd compression for efficient network usage
+- **Encryption**: Optional ChaCha20-Poly1305 encryption for secure transfers
 - **SSH Integration**: Automatic remote server deployment via SSH
-- **Multi-worker Support**: Parallel processing for faster transfers
+- **Multi-worker Support**: Parallel processing with HDD-friendly sequential reads
 - **Resume Capability**: Skip blocks to resume interrupted transfers
 - **Progress Monitoring**: Real-time transfer progress with speed and ETA
 
@@ -39,7 +40,8 @@ Copy the `bsync` binary to your source and destination servers.
 | `-s` | Skip blocks (for resume) | 0 |
 | `-p` | Server port | 8080 |
 | `-n` | Disable compression | false |
-| `-t` | SSH target (`user@host:/remote_path`) | - |
+| `-e` | Enable encryption (auto-generates key) | false |
+| `-t` | SSH target (`user@host:/remote_path` or `user@host:port:/remote_path`) | - |
 | `-l` | Custom log prefix | - |
 | `-w` | Number of workers | 1 |
 | `-q` | Quiet mode (no output) | false |
@@ -63,35 +65,44 @@ Copy the `bsync` binary to your source and destination servers.
 
 **Single command (automatically starts remote server):**
 ```bash
-./bsync -b 200M -f /dev/shm/test-src -t user@remote-server:/dev/shm/test-dst 
+./bsync -b 200M -f /dev/shm/test-src -t user@remote-server:/dev/shm/test-dst
 ```
 
-### 3. High-Performance Transfer
+### 3. Encrypted Transfer
+
+**Secure transfer with auto-generated encryption key:**
+```bash
+./bsync -e -f /dev/shm/test-src -t user@remote-server:/dev/shm/test-dst
+```
+
+The `-e` flag enables ChaCha20-Poly1305 encryption. A 32-byte key is auto-generated and securely passed to the remote server via SSH. Data is encrypted after compression and decrypted before decompression.
+
+### 4. High-Performance Transfer
 
 **Multi-worker (4 workers selected) transfer with custom block size and label `backup`:**
 ```bash
 ./bsync -b 500M -w 4 -l backup -f /dev/sda -r remote-server:8080
 ```
 
-### 4. Resume Interrupted Transfer
+### 5. Resume Interrupted Transfer
 
 **Skip first 10 blocks to resume:**
 ```bash
 ./bsync -f /dev/sda -r remote-server:8080 -s 10
 ```
 
-### 5. Quiet Mode for Scripts
+### 6. Quiet Mode for Scripts
 
 ```bash
-./bsync -f /dev/sda -r remote-server:8080  -q
+./bsync -f /dev/sda -r remote-server:8080 -q
 ```
 
-### 6. Bonus: it's also possible to sync local files
+### 7. Local File Sync
 ```bash
 ./bsync -n -f /tmp/src.img -t /tmp/dst.img
 ```
 
-### 7. Download Mode Examples
+### 8. Download Mode Examples
 
 **Server (upload mode):**
 ```bash
