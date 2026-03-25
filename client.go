@@ -112,14 +112,14 @@ func processBlockJob(conn *AutoReconnectTCP, job BlockJob, blockSize uint32, fil
 		return
 	}
 
-	// Block zero, just send that it's zero
+	// Block zero, just send Msg - NO data (sparse file optimization)
 	if bytes.Equal(hash, zeroBlockHash) {
 		msg, err1 := pack(&Msg{
 			MagicHead:  magicBytes,
 			BlockIdx:   job.blockIdx,
 			BlockSize:  blockSize,
 			FileSize:   fileSize,
-			DataSize:   uint32(job.readedBytes),
+			DataSize:   0, // NO data payload
 			Compressed: false,
 			Zero:       true,
 			Done:       false,
@@ -133,11 +133,7 @@ func processBlockJob(conn *AutoReconnectTCP, job BlockJob, blockSize uint32, fil
 			Err("\t- error writing net: [%d] %s\n", n, err2.Error())
 			return
 		}
-		n, err3 := conn.Write(job.data)
-		if err3 != nil && err3 != io.EOF {
-			Log("\t- error writing net: [%d] %s\n", n, err3.Error())
-			return
-		}
+		// DON'T send job.data - server knows it's zero, will create sparse hole
 		printStats(job, ".", 1, 0)
 		return
 	}
@@ -355,14 +351,40 @@ func processPrecomputedBlock(conn *AutoReconnectTCP, block PrecomputedBlock, blo
 		return
 	}
 
-	// Determine what to send
+	// Handle zero blocks - send only Msg, NO data (sparse file optimization)
+	if block.IsZero {
+		msg2, err1 := pack(&Msg{
+			MagicHead:  magicBytes,
+			BlockIdx:   block.BlockIdx,
+			BlockSize:  blockSize,
+			FileSize:   fileSize,
+			DataSize:   0, // NO data payload
+			Compressed: false,
+			Zero:       true,
+			Done:       false,
+		})
+		if err1 != nil {
+			Log("\t- cant pack msg-> %s\n", err1)
+			return
+		}
+
+		n, err2 = conn.Write(msg2)
+		if err2 != nil && err2 != io.EOF {
+			Log("\t- error writing net: [%d] %s\n", n, err2.Error())
+			return
+		}
+		// DON'T send data - server knows it's zero, will create sparse hole
+
+		job := BlockJob{blockIdx: block.BlockIdx, data: nil, readedBytes: int(blockSize)}
+		printStats(job, ".", 1, 0)
+		return
+	}
+
+	// Determine what to send for non-zero blocks
 	var dataToSend []byte
 	var compressedFlag bool
 
-	if block.IsZero {
-		compressedFlag = false
-		dataToSend = block.Data
-	} else if noCompress || !block.UseCompressed {
+	if noCompress || !block.UseCompressed {
 		compressedFlag = false
 		dataToSend = block.Data
 	} else {
@@ -371,7 +393,7 @@ func processPrecomputedBlock(conn *AutoReconnectTCP, block PrecomputedBlock, blo
 	}
 
 	// Ensure we have data to send
-	if len(dataToSend) == 0 && !block.IsZero {
+	if len(dataToSend) == 0 {
 		Log("\t- error: no data to send for block %d\n", block.BlockIdx)
 		return
 	}
@@ -384,7 +406,7 @@ func processPrecomputedBlock(conn *AutoReconnectTCP, block PrecomputedBlock, blo
 		FileSize:   fileSize,
 		DataSize:   uint32(len(dataToSend)),
 		Compressed: compressedFlag,
-		Zero:       block.IsZero,
+		Zero:       false,
 		Done:       false,
 	})
 	if err1 != nil {
@@ -406,9 +428,7 @@ func processPrecomputedBlock(conn *AutoReconnectTCP, block PrecomputedBlock, blo
 
 	// Update stats
 	job := BlockJob{blockIdx: block.BlockIdx, data: block.Data, readedBytes: len(block.Data)}
-	if block.IsZero {
-		printStats(job, ".", 1, 0)
-	} else if compressedFlag {
+	if compressedFlag {
 		printStats(job, "c", 1, uint32(len(dataToSend)))
 	} else {
 		printStats(job, "w", 1, uint32(len(dataToSend)))
@@ -468,7 +488,7 @@ func startClientDownload(file *os.File, serverAddress string, skipIdx uint32, bl
 	}
 
 	fileSize := metaMsg.FileSize
-	lastBlockNum := uint32(fileSize / uint64(blockSize))
+	lastBlockNum := uint32((fileSize - 1) / uint64(blockSize))
 
 	Log("remote file size: %d bytes, block %d bytes, blockNum: %d\n", fileSize, blockSize, lastBlockNum)
 
@@ -522,6 +542,14 @@ func startClientDownload(file *os.File, serverAddress string, skipIdx uint32, bl
 
 		offset := int64(blockIdx) * int64(blockSize)
 
+		// Handle zero blocks (DataSize=0, Zero=true) - no data sent, preserve sparse hole
+		if blockMsg.Zero && blockMsg.DataSize == 0 {
+			// Don't write anything - file is pre-truncated, creates sparse hole
+			if debug {
+				Log("\t- zero block at %d, skipping write\n", blockIdx)
+			}
+		}
+
 		if blockMsg.DataSize > 0 {
 			// Read block data
 			_, err1 := io.ReadFull(conn, filebuf[:blockMsg.DataSize])
@@ -530,14 +558,7 @@ func startClientDownload(file *os.File, serverAddress string, skipIdx uint32, bl
 				return
 			}
 
-			if blockMsg.Zero {
-				zero := getZeroBuf(int(blockMsg.DataSize))
-				n, err := file.WriteAt(zero, offset)
-				if err != nil && err != io.EOF {
-					Log("\t- error writing zero block: [%d] %s\n", n, err.Error())
-					break
-				}
-			} else if blockMsg.Compressed {
+			if blockMsg.Compressed {
 				decompressed, err := decompressData(filebuf[:blockMsg.DataSize])
 				if err != nil {
 					Log("\t- error decompressing: %s\n", err.Error())

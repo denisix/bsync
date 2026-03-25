@@ -146,7 +146,7 @@ func main() {
 				Err("Error: zero source file: %s\n", device)
 			}
 
-			lastBlockNum := uint32(fileSize / uint64(blockSize))
+			lastBlockNum := uint32((fileSize - 1) / uint64(blockSize))
 
 			checksumCache := NewChecksumCache(lastBlockNum)
 			// Note: startClient now handles checksum precomputation with sequential reader
@@ -176,7 +176,7 @@ func main() {
 			if fileSize == 0 {
 				Err("Error: zero source file: %s\n", device)
 			}
-			lastBlockNum := uint32(fileSize / uint64(blockSize))
+			lastBlockNum := uint32((fileSize - 1) / uint64(blockSize))
 
 			checksumCache := NewChecksumCache(lastBlockNum)
 			go precomputeChecksums(file, blockSize, lastBlockNum, checksumCache, uint32(skipIdx), int(workers))
@@ -194,7 +194,7 @@ func main() {
 			defer file.Close()
 
 			fileSize := getDeviceSize(file)
-			lastBlockNum := uint32(fileSize / uint64(blockSize))
+			lastBlockNum := uint32((fileSize - 1) / uint64(blockSize))
 
 			checksumCache := NewChecksumCache(lastBlockNum)
 			go precomputeChecksums(file, blockSize, lastBlockNum, checksumCache, uint32(skipIdx), int(workers))

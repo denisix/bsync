@@ -64,6 +64,31 @@ func serverHandleReq(conn net.Conn, file *os.File, checksumCache *ChecksumCache)
 			}
 		}
 
+		// Handle zero blocks (Zero=true, DataSize=0) - no data sent
+		if msg.Zero && msg.DataSize == 0 {
+			// Check if destination block is already zero or doesn't exist (EOF)
+			destHash := checksumCache.WaitFor(msg.BlockIdx)
+			if bytes.Equal(destHash, zeroBlockHash) || string(destHash) == "EOF" {
+				// Destination already zero or beyond file size - nothing to do
+				if debug {
+					Log("\t- zero block at offset %d, already zero/EOF, skipping\n", offset)
+				}
+				continue
+			}
+
+			// Destination is non-zero - write zeros to overwrite
+			if debug {
+				Log("\t- zero block at offset %d, writing zeros to overwrite\n", offset)
+			}
+			zero := getZeroBuf(int(blockSize))
+			n, err := file.WriteAt(zero, offset)
+			if err != nil && err != io.EOF {
+				Log("\t- error writing zero block: [%d] %s\n", n, err.Error())
+				break
+			}
+			continue
+		}
+
 		if msg.DataSize == 0 {
 			if debug {
 				Log("\t- read block from file\n")
@@ -93,15 +118,6 @@ func serverHandleReq(conn net.Conn, file *os.File, checksumCache *ChecksumCache)
 			if err1 != nil {
 				Log("\t- (2) connection closed: %s\n", err1)
 				return
-			}
-
-			if msg.Zero {
-				zero := getZeroBuf(int(msg.DataSize))
-				n, err := file.WriteAt(zero, offset)
-				if err != nil && err != io.EOF {
-					Log("\t- error writing to file: [%d] %s\n", n, err.Error())
-					break
-				}
 			}
 
 			if msg.Compressed {
@@ -289,7 +305,7 @@ func serverHandleUpload(conn net.Conn, file *os.File, fileSize uint64, checksumC
 	filebuf := make([]byte, blockSize)
 	msgBuf := make([]byte, binary.Size(Msg{}))
 
-	lastBlockNum := uint32(fileSize / uint64(blockSize))
+	lastBlockNum := uint32((fileSize - 1) / uint64(blockSize))
 
 	c := bufio.NewReader(conn)
 
@@ -378,14 +394,14 @@ func serverHandleUpload(conn net.Conn, file *os.File, fileSize uint64, checksumC
 		// Get precomputed hash
 		hash := checksumCache.WaitFor(msg.BlockIdx)
 
-		// Check if block is zero
+		// Check if block is zero - send only Msg, NO data (sparse file optimization)
 		if bytes.Equal(hash, zeroBlockHash) {
-			msg, err1 := pack(&Msg{
+			respMsg, err1 := pack(&Msg{
 				MagicHead:  magicBytes,
 				BlockIdx:   msg.BlockIdx,
 				BlockSize:  blockSize,
 				FileSize:   fileSize,
-				DataSize:   uint32(n),
+				DataSize:   0, // NO data payload
 				Compressed: false,
 				Zero:       true,
 				Done:       false,
@@ -394,8 +410,8 @@ func serverHandleUpload(conn net.Conn, file *os.File, fileSize uint64, checksumC
 				Log("\t- cant pack zero msg-> %s\n", err1)
 				return
 			}
-			connWrite(conn, msg)
-			connWrite(conn, filebuf[:n])
+			connWrite(conn, respMsg)
+			// DON'T send filebuf[:n] - client knows it's zero, will create sparse hole
 			continue
 		}
 

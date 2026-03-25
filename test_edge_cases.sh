@@ -100,6 +100,59 @@ run_test() {
   echo ""
 }
 
+# Function to run a test with custom flags
+run_test_with_flags() {
+  local test_name="$1"
+  local src_file="$2"
+  local dst_file="$3"
+  local extra_flags="$4"
+  local expected_exit="${5:-0}"
+  local expected_crc="${6:-0}"
+
+  TOTAL_TESTS=$((TOTAL_TESTS + 1))
+  echo "[TEST $TOTAL_TESTS] $test_name"
+  echo -e "\t$extra_flags -f $src_file -t $dst_file"
+
+  # Run bsync with custom flags
+  set +e
+  ./bsync -q $extra_flags -f "$src_file" -t "$dst_file"
+  exit_code=$?
+  set -e
+
+  local test_passed=true
+
+  if [ "$exit_code" = "$expected_exit" ]; then
+    echo "✓ PASS: Exit code matches expected"
+    if [ "$expected_exit" = "0" ] && [ -f "$src_file" ] && [ -f "$dst_file" ]; then
+      src_md5=$(md5sum "$src_file" | awk '{print $1}')
+      dst_md5=$(md5sum "$dst_file" | awk '{print $1}')
+
+      if [ "$src_md5" = "$dst_md5" ]; then
+        echo "✓ PASS: Source and destination files match (md5sum: $src_md5)"
+      else
+        if [ "$expected_crc" = "1" ]; then
+          echo "✓ PASS: Source and destination files differ (src: $src_md5, dst: $dst_md5)"
+        else
+          echo "✗ FAIL: Source and destination files differ (src: $src_md5, dst: $dst_md5)"
+          test_passed=false
+        fi
+      fi
+    fi
+  else
+    echo "✗ FAIL: Expected exit code $expected_exit, got $exit_code"
+    test_passed=false
+  fi
+
+  if [ "$test_passed" = true ]; then
+    PASSED_TESTS=$((PASSED_TESTS + 1))
+  else
+    FAILED_TESTS=$((FAILED_TESTS + 1))
+    FAILED_TEST_NAMES+=("$test_name")
+  fi
+
+  echo ""
+}
+
 # Test 1: Source file absent
 run_test "Source file absent (should fail)" "/nonexistent/file" "$TEST_DIR/dst1.img" 1
 
@@ -313,6 +366,72 @@ run_test "Destination file is a symlink" "$TEST_DIR/random_src.img" "$TEST_DIR/s
 # Test 45: Source file is a symlink
 ln -sf "$TEST_DIR/random_src.img" "$TEST_DIR/symlink_src.img"
 run_test "Source file is a symlink" "$TEST_DIR/symlink_src.img" "$TEST_DIR/dst_symlink.img" 0
+
+echo ""
+echo "=========================================="
+echo "FLAG TESTS"
+echo "=========================================="
+
+# Create a fresh test file for flag tests
+create_random_file "$TEST_DIR/flag_test_src.img" 10485760 # 10MB
+
+# ==========================================
+# Multi-Worker Tests
+# ==========================================
+run_test_with_flags "Multi-worker (2 workers)" "$TEST_DIR/flag_test_src.img" "$TEST_DIR/dst_w2.img" "-w 2"
+run_test_with_flags "Multi-worker (4 workers)" "$TEST_DIR/flag_test_src.img" "$TEST_DIR/dst_w4.img" "-w 4"
+run_test_with_flags "Multi-worker (8 workers)" "$TEST_DIR/flag_test_src.img" "$TEST_DIR/dst_w8.img" "-w 8"
+
+# ==========================================
+# Encryption Tests
+# ==========================================
+run_test_with_flags "Encrypted transfer" "$TEST_DIR/flag_test_src.img" "$TEST_DIR/dst_enc.img" "-e"
+run_test_with_flags "Encrypted multi-worker" "$TEST_DIR/flag_test_src.img" "$TEST_DIR/dst_enc_w4.img" "-e -w 4"
+
+# ==========================================
+# Compression Level Tests
+# ==========================================
+run_test_with_flags "Compression fast" "$TEST_DIR/flag_test_src.img" "$TEST_DIR/dst_comp_fast.img" "-L fast"
+run_test_with_flags "Compression better" "$TEST_DIR/flag_test_src.img" "$TEST_DIR/dst_comp_better.img" "-L better"
+run_test_with_flags "Compression best" "$TEST_DIR/flag_test_src.img" "$TEST_DIR/dst_comp_best.img" "-L best"
+
+# ==========================================
+# No Compression Tests
+# ==========================================
+run_test_with_flags "No compression" "$TEST_DIR/flag_test_src.img" "$TEST_DIR/dst_nocomp.img" "-n"
+run_test_with_flags "No compression multi-worker" "$TEST_DIR/flag_test_src.img" "$TEST_DIR/dst_nocomp_w4.img" "-n -w 4"
+
+# ==========================================
+# Encryption + No Compression
+# ==========================================
+run_test_with_flags "Encrypted no compression" "$TEST_DIR/flag_test_src.img" "$TEST_DIR/dst_enc_nocomp.img" "-e -n"
+
+# ==========================================
+# Block Size Tests
+# ==========================================
+run_test_with_flags "Block size 1MB" "$TEST_DIR/flag_test_src.img" "$TEST_DIR/dst_b1m.img" "-b 1048576"
+run_test_with_flags "Block size 5MB" "$TEST_DIR/flag_test_src.img" "$TEST_DIR/dst_b5m.img" "-b 5242880"
+run_test_with_flags "Block size 2MB non-aligned" "$TEST_DIR/flag_test_src.img" "$TEST_DIR/dst_b2m.img" "-b 2097152"
+
+# ==========================================
+# Combined Flag Tests
+# ==========================================
+run_test_with_flags "Encrypted + fast compression + 4 workers" "$TEST_DIR/flag_test_src.img" "$TEST_DIR/dst_combined1.img" "-e -L fast -w 4"
+run_test_with_flags "No compression + 8 workers + 1MB blocks" "$TEST_DIR/flag_test_src.img" "$TEST_DIR/dst_combined2.img" "-n -w 8 -b 1048576"
+
+# ==========================================
+# Sparse File Tests with Flags
+# ==========================================
+create_zero_file "$TEST_DIR/sparse_flag_src.img" 10485760
+run_test_with_flags "Sparse file with encryption" "$TEST_DIR/sparse_flag_src.img" "$TEST_DIR/dst_sparse_enc.img" "-e"
+run_test_with_flags "Sparse file with 4 workers" "$TEST_DIR/sparse_flag_src.img" "$TEST_DIR/dst_sparse_w4.img" "-w 4"
+
+# ==========================================
+# Mixed Content with Various Flags
+# ==========================================
+create_mixed_file "$TEST_DIR/mixed_flag_src.img" 10485760
+run_test_with_flags "Mixed content encrypted" "$TEST_DIR/mixed_flag_src.img" "$TEST_DIR/dst_mixed_enc.img" "-e"
+run_test_with_flags "Mixed content multi-worker" "$TEST_DIR/mixed_flag_src.img" "$TEST_DIR/dst_mixed_w4.img" "-w 4"
 
 # Edge: Destination file is locked by another process
 # create_random_file "$TEST_DIR/locked_dst.img" 10485760 # 10MB

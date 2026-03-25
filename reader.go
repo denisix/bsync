@@ -24,7 +24,7 @@ type SequentialReader struct {
 
 // NewSequentialReader creates a new sequential reader
 func NewSequentialReader(file *os.File, blockSize uint32, fileSize uint64, skipIdx uint32, bufferAhead int) *SequentialReader {
-	lastBlock := uint32(fileSize / uint64(blockSize))
+	lastBlock := uint32((fileSize - 1) / uint64(blockSize))
 
 	return &SequentialReader{
 		file:         file,

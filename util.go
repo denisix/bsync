@@ -7,11 +7,11 @@ import (
 	"unsafe"
 )
 
-// Shared zero buffer for writing zero blocks (1MB max)
+// Shared zero buffer for writing zero blocks (100MB max to handle typical block sizes)
 var (
 	zeroBuf    []byte
 	zeroBufMu  sync.Mutex
-	zeroBufMax = 1024 * 1024 // 1MB
+	zeroBufMax = 100 * 1024 * 1024 // 100MB - covers most block sizes
 )
 
 func getZeroBuf(size int) []byte {

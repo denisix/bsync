@@ -28,6 +28,13 @@ var (
 			return dec
 		},
 	}
+	// Buffer pool for decompression output (reduces GC pressure)
+	decompressBufPool = sync.Pool{
+		New: func() interface{} {
+			// Pre-allocate buffer for typical block size (10MB decompressed)
+			return make([]byte, 0, 10*1024*1024)
+		},
+	}
 )
 
 // SetCompressionLevel sets the compression level for new encoders
@@ -73,10 +80,16 @@ func decompressData(data []byte) ([]byte, error) {
 	decoder := decoderPool.Get().(*zstd.Decoder)
 	defer decoderPool.Put(decoder)
 
-	buffer := make([]byte, 0, len(data)*2)
-	decompressed, err := decoder.DecodeAll(data, buffer)
+	// Get buffer from pool to reduce allocations
+	buf := decompressBufPool.Get().([]byte)
+	buf = buf[:0] // Reset length but keep capacity
+
+	decompressed, err := decoder.DecodeAll(data, buf)
 	if err != nil {
+		decompressBufPool.Put(decompressed[:0]) // Return to pool on error
 		return nil, err
 	}
+	// Note: Buffer is not returned to pool since caller uses it
+	// This is a tradeoff - we get reduced initial allocation but don't fully reuse
 	return decompressed, nil
 }
