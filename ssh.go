@@ -1,12 +1,14 @@
 package main
 
 import (
+	"bufio"
+	"encoding/base64"
+	"fmt"
+	"io"
 	"os"
 	"os/exec"
-	"strings"
-	"bufio"
-	"io"
 	"strconv"
+	"strings"
 )
 
 func isPortNumber(s string) bool {
@@ -79,8 +81,62 @@ func waitForReady(stdout io.ReadCloser, isLocal bool) error {
 	return scanner.Err()
 }
 
+func copyBinaryToRemote(sshTarget, sshPort string) (string, error) {
+	// Get local binary path
+	localPath, err := os.Executable()
+	if err != nil {
+		return "", err
+	}
 
-func startRemoteSSH(targetPath, port string, blockSize, skipIdx uint32, quiet bool) (*exec.Cmd, error) {
+	// Generate unique remote path
+	remotePath := fmt.Sprintf("/tmp/bsync-%d", os.Getpid())
+
+	// Read local binary
+	data, err := os.ReadFile(localPath)
+	if err != nil {
+		return "", err
+	}
+
+	// Build remote command: decode base64, write to file, make executable
+	remoteCmd := fmt.Sprintf("base64 -d > %s && chmod +x %s", remotePath, remotePath)
+
+	// Build SSH args
+	sshArgs := []string{"ssh"}
+	if sshPort != "" {
+		sshArgs = append(sshArgs, "-p", sshPort)
+	}
+	sshArgs = append(sshArgs, sshTarget, remoteCmd)
+
+	Log("copying binary to remote via SSH: %s\n", remotePath)
+
+	// Run SSH with stdin receiving base64-encoded binary
+	cmd := exec.Command(sshArgs[0], sshArgs[1:]...)
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return "", err
+	}
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	if err := cmd.Start(); err != nil {
+		return "", err
+	}
+
+	// Write base64-encoded binary to SSH stdin
+	encoder := base64.NewEncoder(base64.StdEncoding, stdin)
+	encoder.Write(data)
+	encoder.Close()
+	stdin.Close()
+
+	if err := cmd.Wait(); err != nil {
+		return "", fmt.Errorf("binary transfer failed: %v", err)
+	}
+
+	return remotePath, nil
+}
+
+
+func startRemoteSSH(targetPath, port string, blockSize, skipIdx uint32, quiet bool, noCompress bool) (*exec.Cmd, error) {
 	// split sshTarget "user@host:/remote/path" -> "user@host" and "/remote/path"
 	user, host, sshPort, file := parseSSHTarget(targetPath)
 
@@ -98,6 +154,9 @@ func startRemoteSSH(targetPath, port string, blockSize, skipIdx uint32, quiet bo
 		args := []string{execPath, "-f", file, "-p", port, "-b", strconv.FormatUint(uint64(blockSize), 10)}
 		if quiet {
 			args = append(args, "-q")
+		}
+		if noCompress {
+			args = append(args, "-n")
 		}
 		// Pass encryption key if enabled
 		if IsEncryptionEnabled() {
@@ -131,6 +190,12 @@ func startRemoteSSH(targetPath, port string, blockSize, skipIdx uint32, quiet bo
 		host = user + "@" + host
 	}
 
+	// Copy binary to remote server
+	remoteBinPath, err := copyBinaryToRemote(host, sshPort)
+	if err != nil {
+		return nil, err
+	}
+
 	// run SSH command
 	args := []string{"ssh"}
 
@@ -140,7 +205,7 @@ func startRemoteSSH(targetPath, port string, blockSize, skipIdx uint32, quiet bo
 	}
 
 	args = append(args, host,
-		"bsync", "-f", file,
+		remoteBinPath, "-f", file,
 		"-p", port,
 		"-b", strconv.FormatUint(uint64(blockSize), 10),
 		"-s", strconv.FormatUint(uint64(skipIdx), 10),
@@ -148,6 +213,10 @@ func startRemoteSSH(targetPath, port string, blockSize, skipIdx uint32, quiet bo
 
 	if quiet {
 		args = append(args, "-q")
+	}
+
+	if noCompress {
+		args = append(args, "-n")
 	}
 
 	// Pass encryption key if enabled
@@ -180,7 +249,7 @@ func startRemoteSSH(targetPath, port string, blockSize, skipIdx uint32, quiet bo
 	return cmd, nil
 }
 
-func startRemoteSSHDownload(targetPath, port string, blockSize, skipIdx uint32, quiet bool) (*exec.Cmd, error) {
+func startRemoteSSHDownload(targetPath, port string, blockSize, skipIdx uint32, quiet bool, noCompress bool) (*exec.Cmd, error) {
 	// split sshTarget "user@host:/remote/path" -> "user@host" and "/remote/path"
 	user, host, sshPort, file := parseSSHTarget(targetPath)
 
@@ -198,6 +267,9 @@ func startRemoteSSHDownload(targetPath, port string, blockSize, skipIdx uint32, 
 		args := []string{execPath, "-f", file, "-p", port, "-b", strconv.FormatUint(uint64(blockSize), 10), "-d"}
 		if quiet {
 			args = append(args, "-q")
+		}
+		if noCompress {
+			args = append(args, "-n")
 		}
 		// Pass encryption key if enabled
 		if IsEncryptionEnabled() {
@@ -230,6 +302,12 @@ func startRemoteSSHDownload(targetPath, port string, blockSize, skipIdx uint32, 
 		host = user + "@" + host
 	}
 
+	// Copy binary to remote server
+	remoteBinPath, err := copyBinaryToRemote(host, sshPort)
+	if err != nil {
+		return nil, err
+	}
+
 	// run SSH command with -d flag for download mode
 	args := []string{"ssh"}
 
@@ -239,7 +317,7 @@ func startRemoteSSHDownload(targetPath, port string, blockSize, skipIdx uint32, 
 	}
 
 	args = append(args, host,
-		"bsync", "-f", file,
+		remoteBinPath, "-f", file,
 		"-p", port,
 		"-b", strconv.FormatUint(uint64(blockSize), 10),
 		"-s", strconv.FormatUint(uint64(skipIdx), 10),
@@ -248,6 +326,10 @@ func startRemoteSSHDownload(targetPath, port string, blockSize, skipIdx uint32, 
 
 	if quiet {
 		args = append(args, "-q")
+	}
+
+	if noCompress {
+		args = append(args, "-n")
 	}
 
 	// Pass encryption key if enabled

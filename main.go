@@ -81,7 +81,7 @@ func main() {
 			if sshTarget != "" {
 				Log("launching remote server via SSH: %s\n", sshTarget)
 				var err error
-				sshCmd, err = startRemoteSSHDownload(sshTarget, port, blockSize, uint32(skipIdx), quiet)
+				sshCmd, err = startRemoteSSHDownload(sshTarget, port, blockSize, uint32(skipIdx), quiet, noCompress)
 				if err != nil {
 					Err("Error: SSH launch failed: %s\n", err)
 					return
@@ -118,7 +118,7 @@ func main() {
 			if sshTarget != "" {
 				Log("launching remote server via SSH: %s\n", sshTarget)
 				var err error
-				sshCmd, err = startRemoteSSH(sshTarget, port, blockSize, uint32(skipIdx), quiet)
+				sshCmd, err = startRemoteSSH(sshTarget, port, blockSize, uint32(skipIdx), quiet, noCompress)
 				if err != nil {
 					Err("Error: SSH launch failed: %s\n", err)
 					return

@@ -1,5 +1,6 @@
 all:
-	CGO_ENABLED=0 go build -ldflags "-s -w" -o bsync
+	CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o bsync
+	upx --best bsync
 
 test:
 	bash ./test_edge_cases.sh
