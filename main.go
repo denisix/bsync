@@ -44,6 +44,7 @@ func main() {
 	flag.BoolVar(&reverse, "d", false, "download mode: transfer from server to client")
 	flag.BoolVar(&encrypt, "e", false, "enable encryption (auto-generates key)")
 	flag.StringVar(&encKeyReceived, "K", "", "encryption key (internal use)")
+	flag.BoolVar(&suppressProgress, "P", false, "suppress server progress output (set automatically when launched via -t)")
 
 	flag.Parse() // after declaring flags we need to call it
 

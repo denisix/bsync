@@ -209,6 +209,7 @@ func startRemoteSSH(targetPath, port string, blockSize, skipIdx uint32, quiet bo
 		"-p", port,
 		"-b", strconv.FormatUint(uint64(blockSize), 10),
 		"-s", strconv.FormatUint(uint64(skipIdx), 10),
+		"-P", // suppress server-side progress (client shows its own)
 	)
 
 	if quiet {
@@ -322,6 +323,7 @@ func startRemoteSSHDownload(targetPath, port string, blockSize, skipIdx uint32, 
 		"-b", strconv.FormatUint(uint64(blockSize), 10),
 		"-s", strconv.FormatUint(uint64(skipIdx), 10),
 		"-d",
+		"-P", // suppress server-side progress (client shows its own)
 	)
 
 	if quiet {

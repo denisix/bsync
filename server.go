@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -16,10 +17,79 @@ var (
 	activeConns   int64
 	doneReceived  int32
 	shutdownTimer *time.Timer
+
+	// Server-side progress stats
+	suppressProgress bool // set via -P flag when launched as remote server via -t
+	srvOnce          sync.Once
+	srvT0           time.Time
+	srvLastBlockNum uint32 // written once via atomic.StoreUint32, then read-only
+	srvFileSize     uint64
+	srvBytesNet     uint64 // atomic - compressed/raw bytes received over network
+	srvBytesOrig    uint64 // atomic - original bytes written (for ratio)
+	srvDiffs        int32  // atomic - blocks actually written
 )
+
+func serverPrintStats(blockIdx uint32, indicator string, netBytes uint32) {
+	if suppressProgress {
+		return
+	}
+	if netBytes > 0 {
+		atomic.AddUint64(&srvBytesNet, uint64(netBytes))
+		atomic.AddUint64(&srvBytesOrig, uint64(blockSize))
+		atomic.AddInt32(&srvDiffs, 1)
+	}
+
+	last := atomic.LoadUint32(&srvLastBlockNum)
+	if last == 0 {
+		return
+	}
+
+	blockMb := float64(blockSize) / float64(mb1)
+	elapsed := time.Since(srvT0).Seconds()
+
+	var mbs float64
+	if elapsed > 0 {
+		mbs = float64(blockIdx) * blockMb / elapsed
+	}
+
+	blocksLeft := float64(last) - float64(blockIdx)
+	eta := 0
+	etaUnit := "min"
+	if mbs > 0 {
+		eta = int(blocksLeft * blockMb / mbs / 60)
+		if eta > 180 {
+			eta /= 60
+			etaUnit = "hr"
+		}
+	}
+	if eta < 0 {
+		eta = 0
+	}
+	if blockIdx >= last {
+		eta = 0
+	}
+
+	percent := 100.0 * float64(blockIdx) / float64(last)
+	totalNet := atomic.LoadUint64(&srvBytesNet)
+	totalOrig := atomic.LoadUint64(&srvBytesOrig)
+	ratio := 100.0
+	if totalOrig > 0 {
+		ratio = 100.0 * float64(totalNet) / float64(totalOrig)
+	}
+	diffs := atomic.LoadInt32(&srvDiffs)
+
+	Log("recv block %d/%d (%0.2f%%) [%s] size=%d ratio=%0.2f %0.2f MB/s ETA=%d %s diffs=%d\r",
+		blockIdx, last, percent, indicator, srvFileSize, ratio, mbs, eta, etaUnit, diffs)
+}
 
 func serverHandleReq(conn net.Conn, file *os.File, checksumCache *ChecksumCache) {
 	defer conn.Close()
+
+	if tc, ok := conn.(*net.TCPConn); ok {
+		tc.SetKeepAlive(true)
+		tc.SetKeepAlivePeriod(keepAlivePeriod)
+	}
+
 	magicBytes := stringToFixedSizeArray(magicHead)
 
 	filebuf := make([]byte, blockSize)
@@ -30,6 +100,7 @@ func serverHandleReq(conn net.Conn, file *os.File, checksumCache *ChecksumCache)
 	c := bufio.NewReader(conn)
 
 	for {
+		conn.SetDeadline(time.Now().Add(ioTimeout))
 		_, err1 := io.ReadFull(c, msgBuf)
 		if err1 != nil {
 			Log("\t- (1) connection ended: %s\n", err1)
@@ -61,6 +132,11 @@ func serverHandleReq(conn net.Conn, file *os.File, checksumCache *ChecksumCache)
 			if lastBlockNum == 0 {
 				lastBlockNum = uint32(msg.FileSize / uint64(blockSize))
 				truncateIfRegularFile(file, msg.FileSize)
+				srvOnce.Do(func() {
+					srvFileSize = msg.FileSize
+					atomic.StoreUint32(&srvLastBlockNum, lastBlockNum)
+					srvT0 = time.Now()
+				})
 			}
 		}
 
@@ -73,6 +149,7 @@ func serverHandleReq(conn net.Conn, file *os.File, checksumCache *ChecksumCache)
 				if debug {
 					Log("\t- zero block at offset %d, already zero/EOF, skipping\n", offset)
 				}
+				serverPrintStats(msg.BlockIdx, "-", 0)
 				continue
 			}
 
@@ -86,6 +163,7 @@ func serverHandleReq(conn net.Conn, file *os.File, checksumCache *ChecksumCache)
 				Log("\t- error writing zero block: [%d] %s\n", n, err.Error())
 				break
 			}
+			serverPrintStats(msg.BlockIdx, ".", 0)
 			continue
 		}
 
@@ -106,7 +184,11 @@ func serverHandleReq(conn net.Conn, file *os.File, checksumCache *ChecksumCache)
 			if debug {
 				Log("\t- send hash [%d] %x\n", msg.BlockIdx, hash)
 			}
-			connWrite(conn, hash[:])
+			if err := connWrite(conn, hash[:]); err != nil {
+				Log("\t- send hash failed: %s\n", err)
+				return
+			}
+			serverPrintStats(msg.BlockIdx, "-", 0)
 		}
 
 		if msg.DataSize > 0 {
@@ -114,6 +196,7 @@ func serverHandleReq(conn net.Conn, file *os.File, checksumCache *ChecksumCache)
 				Log("\t- read block from network %d\n", msg.DataSize)
 			}
 
+			conn.SetDeadline(time.Now().Add(ioTimeout))
 			_, err1 := io.ReadFull(c, filebuf[:msg.DataSize])
 			if err1 != nil {
 				Log("\t- (2) connection closed: %s\n", err1)
@@ -135,6 +218,7 @@ func serverHandleReq(conn net.Conn, file *os.File, checksumCache *ChecksumCache)
 					Log("\t- error writing to file: [%d] %s\n", n, err2.Error())
 					break
 				}
+				serverPrintStats(msg.BlockIdx, "c", msg.DataSize)
 			} else {
 
 				if debug {
@@ -145,7 +229,7 @@ func serverHandleReq(conn net.Conn, file *os.File, checksumCache *ChecksumCache)
 					Log("\t- error reading from file: [%d] %s\n", n, err2.Error())
 					break
 				}
-
+				serverPrintStats(msg.BlockIdx, "w", msg.DataSize)
 			}
 		}
 
@@ -300,6 +384,12 @@ func startServerUpload(file *os.File, bindIp, port string, fileSize uint64, chec
 func serverHandleUpload(conn net.Conn, file *os.File, fileSize uint64, checksumCache *ChecksumCache) {
 	Log("serverHandleUpload()\n")
 	defer conn.Close()
+
+	if tc, ok := conn.(*net.TCPConn); ok {
+		tc.SetKeepAlive(true)
+		tc.SetKeepAlivePeriod(keepAlivePeriod)
+	}
+
 	magicBytes := stringToFixedSizeArray(magicHead)
 
 	filebuf := make([]byte, blockSize)
@@ -310,6 +400,7 @@ func serverHandleUpload(conn net.Conn, file *os.File, fileSize uint64, checksumC
 	c := bufio.NewReader(conn)
 
 	for {
+		conn.SetDeadline(time.Now().Add(ioTimeout))
 		_, err1 := io.ReadFull(c, msgBuf)
 		if err1 != nil {
 			Log("\t- (upload) connection ended: %s\n", err1)
