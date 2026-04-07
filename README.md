@@ -2,7 +2,7 @@
 
 🚀 **Efficient block-level synchronization tool for large data transfer between servers**
 
-`bsync` transfers data between block devices or files block-by-block, comparing checksums and only transmitting differences with compression. Perfect for syncing large datasets, disk images, or virtual machine storage.
+`bsync` transfers data between block devices or files block-by-block, comparing checksums and only transmitting differences with compression. Perfect for syncing large datasets, disk images, or virtual machine storage. Runs on Linux and Windows.
 
 ## ✨ Features
 
@@ -13,17 +13,20 @@
 - **SSH Integration**: Automatic remote server deployment via SSH
 - **Multi-worker Support**: Parallel processing with HDD-friendly sequential reads
 - **Resume Capability**: Skip blocks to resume interrupted transfers
-- **Progress Monitoring**: Real-time transfer progress with speed and ETA
+- **Progress Monitoring**: Real-time transfer progress with speed and ETA on both sender and receiver
 - **Download Mode**: Transfer from server to client (reverse direction)
 - **IP Binding**: Bind server to specific network interface
+- **Windows Support**: Native Windows binary with physical drive and volume enumeration
+- **Connection Robustness**: TCP keep-alive, per-operation deadlines, and automatic retry with reconnect
 
 ## 🛠️ Installation
 
 ```bash
-make
+make          # Linux binary
+make windows  # Windows binary (cross-compile from Linux)
 ```
 
-Copy the `bsync` binary to your source and destination servers.
+Copy the `bsync` (or `bsync.exe`) binary to your source and destination servers.
 
 ## 📖 Usage
 
@@ -37,7 +40,7 @@ Copy the `bsync` binary to your source and destination servers.
 
 | Option | Description | Default |
 |--------|-------------|---------|
-| `-f` | File or device path (e.g., `/dev/vda`, `/path/to/file`) | `/dev/zero` |
+| `-f` | File or device path (e.g., `/dev/vda`, `\\.\PhysicalDrive0`) | `/dev/zero` |
 | `-r` | Remote server address (`host:port`) | - |
 | `-b` | Block size in bytes | 10485760 (10MB) |
 | `-s` | Skip blocks (for resume) | 0 |
@@ -51,6 +54,8 @@ Copy the `bsync` binary to your source and destination servers.
 | `-w` | Number of workers | 1 |
 | `-q` | Quiet mode (no output) | false |
 | `-d` | Download mode: transfer from server to client | false |
+| `-a` | List available drives and partitions (Windows: physical drives + volumes) | false |
+| `-P` | Suppress server-side progress output (set automatically via `-t`) | false |
 
 ## 🔄 Examples
 
@@ -152,6 +157,25 @@ The `-L` flag controls compression level:
 ./bsync -e -L fast -w 4 -f /dev/sda -t user@remote:/backup/disk.img
 ```
 
+### 12. Windows — List Drives
+
+```bat
+bsync.exe -a
+```
+
+Lists physical drives (`\\.\PhysicalDrive0`, etc.) and logical volumes with sizes.
+
+### 13. Windows — Sync Physical Drive to Linux Server
+
+```bat
+bsync.exe -f \\.\PhysicalDrive0 -r 192.168.1.100:8080
+```
+
+On the Linux server:
+```bash
+./bsync -f /dev/sdb -p 8080
+```
+
 ## 🕳️ Sparse File Support
 
 `bsync` efficiently handles sparse files:
@@ -197,6 +221,8 @@ make test
 - **Encryption**: ChaCha20-Poly1305 AEAD cipher
 - **Protocol**: Custom binary protocol over TCP
 - **Concurrency**: Parallel checksum computation and compression
+- **Reliability**: TCP keep-alive (30s), 5-minute I/O deadlines per operation, automatic retry with reconnect on failure (up to 3 attempts per block)
+- **Windows**: Physical drive access via `DeviceIoControl` (`IOCTL_DISK_GET_DRIVE_GEOMETRY_EX`); drive enumeration via `GetLogicalDriveStrings`
 
 ## 🚨 Requirements
 
@@ -204,6 +230,7 @@ make test
 - Network connectivity between servers
 - SSH access (if using `-t` option)
 - Read/write permissions on source/destination files
+- Windows: run as Administrator to access physical drives (`\\.\PhysicalDriveN`)
 
 ## 📝 License
 
