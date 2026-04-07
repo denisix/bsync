@@ -26,7 +26,9 @@ func main() {
 	var encrypt bool
 	var encKeyReceived string
 	var compLevel string
+	var listAllDrives bool
 
+	flag.BoolVar(&listAllDrives, "a", false, "list available drives and partitions")
 	flag.StringVar(&device, "f", "/dev/zero", "specify file or device, i.e. '/dev/vda'")
 	flag.StringVar(&remoteAddr, "r", "", "specify remote address of server")
 	flag.UintVar(&bSize, "b", uint(blockSize), "block size, default 100M")
@@ -44,6 +46,11 @@ func main() {
 	flag.StringVar(&encKeyReceived, "K", "", "encryption key (internal use)")
 
 	flag.Parse() // after declaring flags we need to call it
+
+	if listAllDrives {
+		listDrives()
+		return
+	}
 
 	// Set compression level
 	SetCompressionLevel(compLevel)
