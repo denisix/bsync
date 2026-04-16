@@ -75,7 +75,7 @@ func printStats(job BlockJob, indicator string, diff, bytes uint32) {
 // startClient launches threadsCount workers, each with a persistent connection, and pushes file blocks to a jobs channel
 func startClient(file *os.File, serverAddress string, skipIdx uint32, fileSize uint64, blockSize uint32, noCompress bool, checksumCache *ChecksumCache, workers int) {
 	Log("startClient()\n")
-	lastBlockNum = uint32(fileSize / uint64(blockSize))
+	lastBlockNum = uint32((fileSize - 1) / uint64(blockSize))
 	Log("source size: %d bytes, block %d bytes, blockNum: %d\n", fileSize, blockSize, lastBlockNum)
 
 	var wg sync.WaitGroup

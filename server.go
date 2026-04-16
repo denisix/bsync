@@ -130,7 +130,7 @@ func serverHandleReq(conn net.Conn, file *os.File, checksumCache *ChecksumCache)
 
 		if msg.FileSize > 0 {
 			if lastBlockNum == 0 {
-				lastBlockNum = uint32(msg.FileSize / uint64(blockSize))
+				lastBlockNum = uint32((msg.FileSize - 1) / uint64(blockSize))
 				truncateIfRegularFile(file, msg.FileSize)
 				srvOnce.Do(func() {
 					srvFileSize = msg.FileSize
@@ -163,6 +163,7 @@ func serverHandleReq(conn net.Conn, file *os.File, checksumCache *ChecksumCache)
 				Log("\t- error writing zero block: [%d] %s\n", n, err.Error())
 				break
 			}
+			checksumCache.Set(msg.BlockIdx, zeroBlockHash)
 			serverPrintStats(msg.BlockIdx, ".", 0)
 			continue
 		}
@@ -218,6 +219,7 @@ func serverHandleReq(conn net.Conn, file *os.File, checksumCache *ChecksumCache)
 					Log("\t- error writing to file: [%d] %s\n", n, err2.Error())
 					break
 				}
+				checksumCache.Set(msg.BlockIdx, checksum(decompressed))
 				serverPrintStats(msg.BlockIdx, "c", msg.DataSize)
 			} else {
 
@@ -229,6 +231,7 @@ func serverHandleReq(conn net.Conn, file *os.File, checksumCache *ChecksumCache)
 					Log("\t- error reading from file: [%d] %s\n", n, err2.Error())
 					break
 				}
+				checksumCache.Set(msg.BlockIdx, checksum(filebuf[:msg.DataSize]))
 				serverPrintStats(msg.BlockIdx, "w", msg.DataSize)
 			}
 		}
