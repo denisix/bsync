@@ -202,10 +202,15 @@ func main() {
 			defer file.Close()
 
 			fileSize := getDeviceSize(file)
-			lastBlockNum := uint32((fileSize - 1) / uint64(blockSize))
-
-			checksumCache := NewChecksumCache(lastBlockNum)
-			go precomputeChecksums(file, blockSize, lastBlockNum, checksumCache, uint32(skipIdx), int(workers))
+			var checksumCache *ChecksumCache
+			if fileSize > 0 {
+				lastBlockNum := uint32((fileSize - 1) / uint64(blockSize))
+				checksumCache = NewChecksumCache(lastBlockNum)
+				go precomputeChecksums(file, blockSize, lastBlockNum, checksumCache, uint32(skipIdx), int(workers))
+			} else {
+				checksumCache = NewChecksumCache(0)
+				Log("destination file is empty, skipping precompute\n")
+			}
 
 			startServer(file, bindIp, port, checksumCache)
 		}

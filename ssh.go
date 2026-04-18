@@ -151,7 +151,7 @@ func startRemoteSSH(targetPath, port string, blockSize, skipIdx uint32, quiet bo
 		}
 
 		// Create command with absolute path to bsync
-		args := []string{execPath, "-f", file, "-p", port, "-b", strconv.FormatUint(uint64(blockSize), 10)}
+		args := []string{execPath, "-f", file, "-p", port, "-b", strconv.FormatUint(uint64(blockSize), 10), "-s", strconv.FormatUint(uint64(skipIdx), 10)}
 		if quiet {
 			args = append(args, "-q")
 		}
@@ -265,7 +265,7 @@ func startRemoteSSHDownload(targetPath, port string, blockSize, skipIdx uint32, 
 		}
 
 		// Create command with absolute path to bsync with -d flag for download mode
-		args := []string{execPath, "-f", file, "-p", port, "-b", strconv.FormatUint(uint64(blockSize), 10), "-d"}
+		args := []string{execPath, "-f", file, "-p", port, "-b", strconv.FormatUint(uint64(blockSize), 10), "-s", strconv.FormatUint(uint64(skipIdx), 10), "-d"}
 		if quiet {
 			args = append(args, "-q")
 		}

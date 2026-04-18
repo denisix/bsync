@@ -319,6 +319,10 @@ func startClientDownload(file *os.File, serverAddress string, skipIdx uint32, bl
 	}
 
 	fileSize := metaMsg.FileSize
+	if fileSize == 0 {
+		Log("remote file is empty, nothing to download\n")
+		return
+	}
 	lastBlockNum := uint32((fileSize - 1) / uint64(blockSize))
 
 	Log("remote file size: %d bytes, block %d bytes, blockNum: %d\n", fileSize, blockSize, lastBlockNum)

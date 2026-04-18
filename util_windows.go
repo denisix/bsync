@@ -33,7 +33,7 @@ type winDiskGeometryEx struct {
 // falls back to IOCTL_DISK_GET_DRIVE_GEOMETRY_EX.
 func getDeviceSize(file *os.File) uint64 {
 	pos, err := file.Seek(0, io.SeekEnd)
-	if err == nil && pos > 0 {
+	if err == nil && pos >= 0 {
 		file.Seek(0, io.SeekStart)
 		Log("file size -> %d bytes.\n", pos)
 		return uint64(pos)
