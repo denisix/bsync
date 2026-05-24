@@ -37,11 +37,12 @@ func checksum(data []byte) []byte {
 }
 
 type ChecksumCache struct {
-	data  map[uint32][]byte
-	ready map[uint32]bool
-	mu    sync.Mutex
-	cond  *sync.Cond
-	maxId uint32
+	data         map[uint32][]byte
+	ready        map[uint32]bool
+	mu           sync.Mutex
+	cond         *sync.Cond
+	maxId        uint32
+	noPrecompute bool // if true, WaitFor returns zero hash immediately (empty destination)
 }
 
 func NewChecksumCache(maxId uint32) *ChecksumCache {
@@ -66,9 +67,8 @@ func (cc *ChecksumCache) WaitFor(idx uint32) []byte {
 	cc.mu.Lock()
 	defer cc.mu.Unlock()
 
-	if idx > cc.maxId {
-		// Out of bounds — return placeholder or nil
-		return make([]byte, 16) // all-zero hash
+	if idx > cc.maxId || cc.noPrecompute {
+		return make([]byte, 16) // all-zero hash (out of bounds or no precomputation)
 	}
 
 	for !cc.ready[idx] {

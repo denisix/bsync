@@ -3,6 +3,7 @@ all:
 	upx --best bsync
 
 test:
+	go test -v ./...
 	bash ./test_edge_cases.sh
 
 # Windows cross-compile (run from Linux: requires GOOS=windows)

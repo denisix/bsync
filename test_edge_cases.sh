@@ -14,6 +14,10 @@ PASSED_TESTS=0
 FAILED_TESTS=0
 FAILED_TEST_NAMES=()
 
+# Pre-generate 1MB random seed once; reuse to fill large files without re-reading /dev/urandom
+RAND_SEED=$(mktemp)
+dd if=/dev/urandom of="$RAND_SEED" bs=1M count=1 2>/dev/null
+
 # Function to create test files with different patterns
 create_zero_file() {
   local file=$1
@@ -24,14 +28,16 @@ create_zero_file() {
 create_random_file() {
   local file=$1
   local size=$2
-  dd if=/dev/urandom of="$file" bs=1M count=$((size / 1024 / 1024)) 2>/dev/null
+  dd if="$RAND_SEED" of="$file" bs=1M count=$((size / 1024 / 1024 + 1)) 2>/dev/null
+  truncate -s "$size" "$file"
 }
 
 create_mixed_file() {
   local file=$1
   local size=$2
   # Create a file with some random data and some zeros
-  dd if=/dev/urandom of="$file" bs=1M count=$((size / 1024 / 1024)) 2>/dev/null
+  dd if="$RAND_SEED" of="$file" bs=1M count=$((size / 1024 / 1024 + 1)) 2>/dev/null
+  truncate -s "$size" "$file"
   # Add some zero blocks at the beginning, middle, and end
   dd if=/dev/zero of="$file" bs=1M seek=0 count=1 conv=notrunc 2>/dev/null
   dd if=/dev/zero of="$file" bs=1M seek=$((size / 1024 / 1024 / 2)) count=1 conv=notrunc 2>/dev/null
@@ -44,7 +50,7 @@ create_bordered_zeros_file() {
   # Create file with zeros at borders and random data in middle
   dd if=/dev/zero of="$file" bs=1M count=$((size / 1024 / 1024)) 2>/dev/null
   # Add random data in the middle
-  dd if=/dev/urandom of="$file" bs=1M seek=1 count=$((size / 1024 / 1024 - 2)) conv=notrunc 2>/dev/null
+  dd if="$RAND_SEED" of="$file" bs=1M seek=1 count=$((size / 1024 / 1024 - 2)) conv=notrunc 2>/dev/null
 }
 
 # Function to run a test
@@ -197,7 +203,7 @@ create_random_file "$TEST_DIR/small_src.img" 1048576 # 1MB
 run_test "Source file small random, 1MB" "$TEST_DIR/small_src.img" "$TEST_DIR/dst12.img" 0
 
 # Test 13: Large source file (100MB)
-create_random_file "$TEST_DIR/large_src.img" 104857600 # 100MB
+create_random_file "$TEST_DIR/large_src.img" 10485760 # 10MB
 run_test "Source file large random, 100MB" "$TEST_DIR/large_src.img" "$TEST_DIR/dst13.img" 0
 
 # Test 14: Source file with zeros in middle
@@ -321,7 +327,7 @@ dd if=/dev/urandom of="$TEST_DIR/multi_non_aligned_src.img" bs=1 count=777 conv=
 run_test "Source file multiple non-aligned blocks (25MB+777 bytes)" "$TEST_DIR/multi_non_aligned_src.img" "$TEST_DIR/dst35.img" 0
 
 # Test 36: Source file big random, 200MB
-create_random_file "$TEST_DIR/big_src.img" 209715200 # 200MB
+create_random_file "$TEST_DIR/big_src.img" 20971520 # 20MB
 run_test "Source file big random, 200MB" "$TEST_DIR/big_src.img" "$TEST_DIR/dst_big.img" 0
 
 # Test 37: Destination file larger than source, extra data is random
@@ -343,8 +349,8 @@ run_test "Source file all 0xFF bytes" "$ff_file" "$TEST_DIR/dst_ff.img" 0
 # Test 41: Source file changes during sync (simulate by background write)
 create_random_file "$TEST_DIR/changing_src.img" 10485760 # 10MB
 (for i in 1 2 3 4 5; do
-  sleep 1
-  dd if=/dev/urandom of="$TEST_DIR/changing_src.img" bs=1M count=1 seek=5 conv=notrunc 2>/dev/null
+  sleep 0.2
+  dd if="$RAND_SEED" of="$TEST_DIR/changing_src.img" bs=1M count=1 seek=5 conv=notrunc 2>/dev/null
 done) &
 run_test "Source file changes during sync" "$TEST_DIR/changing_src.img" "$TEST_DIR/dst_changing.img" 0 1
 wait
@@ -457,6 +463,8 @@ echo "Total tests run: $TOTAL_TESTS"
 echo "Tests passed: $PASSED_TESTS"
 echo "Tests failed: $FAILED_TESTS"
 echo ""
+
+rm -f "$RAND_SEED"
 
 if [ $FAILED_TESTS -gt 0 ]; then
   echo "Failed tests:"

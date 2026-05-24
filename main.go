@@ -209,6 +209,7 @@ func main() {
 				go precomputeChecksums(file, blockSize, lastBlockNum, checksumCache, uint32(skipIdx), int(workers))
 			} else {
 				checksumCache = NewChecksumCache(0)
+				checksumCache.noPrecompute = true
 				Log("destination file is empty, skipping precompute\n")
 			}
 
