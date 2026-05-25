@@ -46,9 +46,10 @@ type ChecksumCache struct {
 }
 
 func NewChecksumCache(maxId uint32) *ChecksumCache {
+	// Pre-allocate map capacity to avoid resizing during transfer
 	cc := &ChecksumCache{
-		data:   make(map[uint32][]byte),
-		ready:  make(map[uint32]bool),
+		data:   make(map[uint32][]byte, maxId+1),
+		ready:  make(map[uint32]bool, maxId+1),
 		maxId: maxId,
 	}
 	cc.cond = sync.NewCond(&cc.mu)
@@ -87,7 +88,7 @@ func (cc *ChecksumCache) Delete(idx uint32) {
 }
 
 // precomputeChecksumsParallel uses channel-based reader for parallel checksum + compression
-func precomputeChecksumsParallel(reader *SequentialReader, cache *ChecksumCache, precompressedChan chan<- PrecomputedBlock, workers int) {
+func precomputeChecksumsParallel(reader *SequentialReader, cache *ChecksumCache, precompressedChan chan<- PrecomputedBlock, workers int, noCompress bool) {
 	Log("checksums: start computing with %d parallel workers..\n", workers)
 
 	var wg sync.WaitGroup
@@ -111,9 +112,12 @@ func precomputeChecksumsParallel(reader *SequentialReader, cache *ChecksumCache,
 					hash = checksum(block.Data)
 					isZero = false
 
-					// Compress the block
-					comp, err := compressData(block.Data)
-					if err == nil && len(comp) < len(block.Data) {
+					if noCompress {
+						// -n: never compress; keep the raw block to send.
+						compressed = nil
+						useCompressed = false
+						originalData = block.Data
+					} else if comp, err := compressData(block.Data); err == nil && len(comp) < len(block.Data) {
 						compressed = comp
 						useCompressed = true
 						// Don't need original data if using compressed - save memory
@@ -151,44 +155,49 @@ func precomputeChecksumsParallel(reader *SequentialReader, cache *ChecksumCache,
 // Note: precomputeChecksumsSequential removed - use precomputeChecksumsParallel instead
 
 
+// precomputeChecksums computes block hashes for the destination/source file.
+// To stay HDD-friendly the disk is read by a SINGLE sequential goroutine
+// (ascending offsets, one continuous stream); the CPU-bound hashing is then
+// fanned out to `workers` goroutines. Reads no longer scatter across the
+// platter the way a per-worker ReadAt pool did.
 func precomputeChecksums(file *os.File, blockSize uint32, lastBlockNum uint32, cache *ChecksumCache, skipIdx uint32, workers int) {
-	Log("checksums: start computing with %d workers..\n", workers)
+	Log("checksums: start computing with %d workers (sequential read)..\n", workers)
 
-	jobs := make(chan uint32, workers*2)
+	jobs := make(chan BlockData, workers*2)
 	var wg sync.WaitGroup
 
-	// Start worker goroutines
+	// CPU-bound hashing workers (parallel)
 	for i := 0; i < workers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			buf := make([]byte, blockSize)
-			for idx := range jobs {
-				offset := int64(idx) * int64(blockSize)
-				n, err := file.ReadAt(buf, offset)
-				if err != nil && err != io.EOF {
-					cache.Set(idx, []byte("ERR"))
+			for blk := range jobs {
+				if isZeroBlock(blk.Data) {
+					cache.Set(blk.BlockIdx, zeroBlockHash)
 					continue
 				}
-				if n == 0 && err == io.EOF {
-					cache.Set(idx, []byte("EOF"))
-					continue
-				}
-
-				if isZeroBlock(buf[:n]) {
-					cache.Set(idx, zeroBlockHash)
-					continue
-				}
-
-				hash := checksum(buf[:n])
-				cache.Set(idx, hash)
+				cache.Set(blk.BlockIdx, checksum(blk.Data))
 			}
 		}()
 	}
 
-	// Distribute jobs
+	// Single sequential reader: one continuous pass over the device.
+	buf := make([]byte, blockSize)
 	for idx := skipIdx; idx <= lastBlockNum; idx++ {
-		jobs <- idx
+		offset := int64(idx) * int64(blockSize)
+		n, err := file.ReadAt(buf, offset)
+		if err != nil && err != io.EOF {
+			cache.Set(idx, []byte("ERR"))
+			continue
+		}
+		if n == 0 && err == io.EOF {
+			cache.Set(idx, []byte("EOF"))
+			continue
+		}
+		// Copy out the slice before handing to a worker (buf is reused).
+		dataCopy := make([]byte, n)
+		copy(dataCopy, buf[:n])
+		jobs <- BlockData{BlockIdx: idx, Data: dataCopy}
 	}
 	close(jobs)
 	wg.Wait()

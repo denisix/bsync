@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"fmt"
 	"io"
 	"net"
 	"os"
@@ -21,12 +22,12 @@ var (
 	// Server-side progress stats
 	suppressProgress bool // set via -P flag when launched as remote server via -t
 	srvOnce          sync.Once
-	srvT0           time.Time
-	srvLastBlockNum uint32 // written once via atomic.StoreUint32, then read-only
-	srvFileSize     uint64
-	srvBytesNet     uint64 // atomic - compressed/raw bytes received over network
-	srvBytesOrig    uint64 // atomic - original bytes written (for ratio)
-	srvDiffs        int32  // atomic - blocks actually written
+	srvT0            time.Time
+	srvLastBlockNum  uint32 // written once via atomic.StoreUint32, then read-only
+	srvFileSize      uint64
+	srvBytesNet      uint64 // atomic - compressed/raw bytes received over network
+	srvBytesOrig     uint64 // atomic - original bytes written (for ratio)
+	srvDiffs         int32  // atomic - blocks actually written
 )
 
 func serverPrintStats(blockIdx uint32, indicator string, netBytes uint32) {
@@ -35,7 +36,7 @@ func serverPrintStats(blockIdx uint32, indicator string, netBytes uint32) {
 	}
 	if netBytes > 0 {
 		atomic.AddUint64(&srvBytesNet, uint64(netBytes))
-		atomic.AddUint64(&srvBytesOrig, uint64(blockSize))
+		atomic.AddUint64(&srvBytesOrig, uint64(atomic.LoadUint32(&blockSize)))
 		atomic.AddInt32(&srvDiffs, 1)
 	}
 
@@ -44,7 +45,8 @@ func serverPrintStats(blockIdx uint32, indicator string, netBytes uint32) {
 		return
 	}
 
-	blockMb := float64(blockSize) / float64(mb1)
+	currentBlockSize := atomic.LoadUint32(&blockSize)
+	blockMb := float64(currentBlockSize) / float64(mb1)
 	elapsed := time.Since(srvT0).Seconds()
 
 	var mbs float64
@@ -82,7 +84,31 @@ func serverPrintStats(blockIdx uint32, indicator string, netBytes uint32) {
 		blockIdx, last, percent, indicator, srvFileSize, ratio, mbs, eta, etaUnit, diffs)
 }
 
-func serverHandleReq(conn net.Conn, file *os.File, checksumCache *ChecksumCache) {
+func sendBlockAck(conn net.Conn, blockIdx, currentBlockSize uint32, fileSize uint64) error {
+	ack, err := pack(&Msg{
+		MagicHead: stringToFixedSizeArray(magicHead),
+		BlockIdx:  blockIdx,
+		BlockSize: currentBlockSize,
+		FileSize:  fileSize,
+	})
+	if err != nil {
+		return err
+	}
+	return connWrite(conn, ack)
+}
+
+func writeBlock(file *os.File, data []byte, offset int64) error {
+	n, err := file.WriteAt(data, offset)
+	if err != nil {
+		return err
+	}
+	if n != len(data) {
+		return io.ErrShortWrite
+	}
+	return nil
+}
+
+func serverHandleReq(conn net.Conn, file *os.File, _ *ChecksumCache) error {
 	defer conn.Close()
 
 	if tc, ok := conn.(*net.TCPConn); ok {
@@ -92,10 +118,15 @@ func serverHandleReq(conn net.Conn, file *os.File, checksumCache *ChecksumCache)
 
 	magicBytes := stringToFixedSizeArray(magicHead)
 
-	filebuf := make([]byte, blockSize)
+	// Reserve room for encryption overhead: an encrypted, uncompressed block
+	// is blockSize+encryptOverhead bytes on the wire.
+	initialBlockSize := atomic.LoadUint32(&blockSize)
+	filebuf := make([]byte, initialBlockSize+encryptOverhead)
 	msgBuf := make([]byte, binary.Size(Msg{}))
 
 	var lastBlockNum uint32 = 0
+	var currentBlockSize uint32 = initialBlockSize
+	var pendingWrite *Msg
 
 	c := bufio.NewReader(conn)
 
@@ -103,154 +134,159 @@ func serverHandleReq(conn net.Conn, file *os.File, checksumCache *ChecksumCache)
 		conn.SetDeadline(time.Now().Add(ioTimeout))
 		_, err1 := io.ReadFull(c, msgBuf)
 		if err1 != nil {
-			Log("\t- (1) connection ended: %s\n", err1)
-			return
+			if err1 == io.EOF || err1 == io.ErrUnexpectedEOF {
+				return nil
+			}
+			return fmt.Errorf("read request: %w", err1)
 		}
 
 		msg, err2 := unpack(msgBuf)
 		if err2 != nil {
-			Log("\t- unpack msg failed: %s\n", err2)
+			return fmt.Errorf("unpack request: %w", err2)
 		}
 
 		if msg.MagicHead != magicBytes {
-			conn.Close()
-			return
+			return fmt.Errorf("invalid request magic")
+		}
+		if msg.BlockSize == 0 {
+			return fmt.Errorf("invalid zero block size")
+		}
+		if err := validateUploadMessage(msg); err != nil {
+			return err
 		}
 
 		if debug {
 			Log("\t- unpacked Msg-> %v\n", msg)
 		}
 
-		if msg.BlockSize != blockSize {
-			blockSize = msg.BlockSize
-			filebuf = make([]byte, blockSize)
+		// Use atomic load/store for blockSize to avoid race conditions
+		currentBlockSize = atomic.LoadUint32(&blockSize)
+		if msg.BlockSize != currentBlockSize {
+			atomic.StoreUint32(&blockSize, msg.BlockSize)
+			currentBlockSize = msg.BlockSize
+			filebuf = make([]byte, currentBlockSize+encryptOverhead)
 		}
 
-		offset := int64(msg.BlockIdx) * int64(blockSize)
+		offset := int64(msg.BlockIdx) * int64(currentBlockSize)
 
-		if msg.FileSize > 0 {
-			if lastBlockNum == 0 {
-				lastBlockNum = uint32((msg.FileSize - 1) / uint64(blockSize))
-				truncateIfRegularFile(file, msg.FileSize)
-				srvOnce.Do(func() {
-					srvFileSize = msg.FileSize
-					atomic.StoreUint32(&srvLastBlockNum, lastBlockNum)
-					srvT0 = time.Now()
-				})
+		// Handle DONE before any block processing. The DONE message carries
+		// the final source size, including zero for an empty source.
+		if msg.Done {
+			truncateIfRegularFile(file, msg.FileSize)
+			Log("\ntransfer DONE message received, starting graceful shutdown\n")
+			atomic.StoreInt32(&doneReceived, 1)
+			if shutdownTimer != nil {
+				shutdownTimer.Reset(shutdownLingerPeriod)
+			}
+			return nil
+		}
+
+		expectedSize := blockPayloadSize(msg.FileSize, currentBlockSize, msg.BlockIdx)
+		if expectedSize == 0 {
+			return fmt.Errorf("invalid block %d for source size %d", msg.BlockIdx, msg.FileSize)
+		}
+		lastBlockNum = uint32((msg.FileSize - 1) / uint64(currentBlockSize))
+		truncateIfRegularFile(file, msg.FileSize)
+		srvOnce.Do(func() {
+			srvFileSize = msg.FileSize
+			atomic.StoreUint32(&srvLastBlockNum, lastBlockNum)
+			srvT0 = time.Now()
+		})
+
+		if uint64(msg.DataSize) > uint64(currentBlockSize)+uint64(encryptOverhead) {
+			return fmt.Errorf("payload for block %d is too large", msg.BlockIdx)
+		}
+		isWrite := msg.Zero || msg.DataSize > 0
+		if isWrite {
+			if pendingWrite == nil || msg.BlockIdx != pendingWrite.BlockIdx ||
+				msg.BlockSize != pendingWrite.BlockSize || msg.FileSize != pendingWrite.FileSize {
+				return fmt.Errorf("unsolicited or mismatched write for block %d", msg.BlockIdx)
 			}
 		}
 
 		// Handle zero blocks (Zero=true, DataSize=0) - no data sent
 		if msg.Zero && msg.DataSize == 0 {
-			// Check if destination block is already zero or doesn't exist (EOF)
-			destHash := checksumCache.WaitFor(msg.BlockIdx)
-			if bytes.Equal(destHash, zeroBlockHash) || string(destHash) == "EOF" {
-				// Destination already zero or beyond file size - nothing to do
-				if debug {
-					Log("\t- zero block at offset %d, already zero/EOF, skipping\n", offset)
-				}
-				serverPrintStats(msg.BlockIdx, "-", 0)
-				continue
+			if err := writeBlock(file, getZeroBuf(int(expectedSize)), offset); err != nil {
+				return fmt.Errorf("write zero block %d: %w", msg.BlockIdx, err)
 			}
-
-			// Destination is non-zero - write zeros to overwrite
-			if debug {
-				Log("\t- zero block at offset %d, writing zeros to overwrite\n", offset)
-			}
-			zero := getZeroBuf(int(blockSize))
-			n, err := file.WriteAt(zero, offset)
-			if err != nil && err != io.EOF {
-				Log("\t- error writing zero block: [%d] %s\n", n, err.Error())
-				break
-			}
-			checksumCache.Set(msg.BlockIdx, zeroBlockHash)
 			serverPrintStats(msg.BlockIdx, ".", 0)
+			if err := sendBlockAck(conn, msg.BlockIdx, currentBlockSize, msg.FileSize); err != nil {
+				return nil
+			}
+			pendingWrite = nil
 			continue
 		}
 
 		if msg.DataSize == 0 {
-			if debug {
-				Log("\t- read block from file\n")
-			}
-
-			n, err := file.ReadAt(filebuf, offset)
+			n, err := file.ReadAt(filebuf[:expectedSize], offset)
 			if err != nil && err != io.EOF {
-				Log("\t- error reading from file: [%d] %s\n", n, err.Error())
-				break
+				return fmt.Errorf("read destination block %d: %w", msg.BlockIdx, err)
+			}
+			if n != int(expectedSize) {
+				return fmt.Errorf("read destination block %d: %w", msg.BlockIdx, io.ErrUnexpectedEOF)
 			}
 
-			// if debug { Log("\t- wait for precomputed hash\n") }
-			hash := checksumCache.WaitFor(msg.BlockIdx)
-
-			if debug {
-				Log("\t- send hash [%d] %x\n", msg.BlockIdx, hash)
+			var hash []byte
+			if isZeroBlock(filebuf[:expectedSize]) {
+				hash = zeroBlockHash
+			} else {
+				hash = checksum(filebuf[:expectedSize])
 			}
 			if err := connWrite(conn, hash[:]); err != nil {
-				Log("\t- send hash failed: %s\n", err)
-				return
+				return nil
 			}
+			request := *msg
+			pendingWrite = &request
 			serverPrintStats(msg.BlockIdx, "-", 0)
+			continue
 		}
 
 		if msg.DataSize > 0 {
-			if debug {
-				Log("\t- read block from network %d\n", msg.DataSize)
-			}
-
 			conn.SetDeadline(time.Now().Add(ioTimeout))
 			_, err1 := io.ReadFull(c, filebuf[:msg.DataSize])
 			if err1 != nil {
-				Log("\t- (2) connection closed: %s\n", err1)
-				return
+				return nil
 			}
 
+			var payload []byte
 			if msg.Compressed {
 				decompressed, err := decompressData(filebuf[:msg.DataSize])
 				if err != nil {
-					Log("\t- error uncompressing: %s\n", err.Error())
-					break
+					return fmt.Errorf("decompress block %d: %w", msg.BlockIdx, err)
 				}
-
-				if debug {
-					Log("\t- write uncompressed bytes: %d [%d bytes]\n", msg.DataSize, len(decompressed))
-				}
-				n, err2 := file.WriteAt(decompressed, offset)
-				if err2 != nil && err2 != io.EOF {
-					Log("\t- error writing to file: [%d] %s\n", n, err2.Error())
-					break
-				}
-				checksumCache.Set(msg.BlockIdx, checksum(decompressed))
-				serverPrintStats(msg.BlockIdx, "c", msg.DataSize)
+				payload = decompressed
 			} else {
-
-				if debug {
-					Log("\t- write non-compressed bytes: %d\n", msg.DataSize)
+				if IsEncryptionEnabled() {
+					plain, err := decryptBlock(filebuf[:msg.DataSize])
+					if err != nil {
+						return fmt.Errorf("decrypt block %d: %w", msg.BlockIdx, err)
+					}
+					payload = plain
+				} else {
+					payload = make([]byte, msg.DataSize)
+					copy(payload, filebuf[:msg.DataSize])
 				}
-				n, err2 := file.WriteAt(filebuf[:msg.DataSize], offset)
-				if err2 != nil && err2 != io.EOF {
-					Log("\t- error reading from file: [%d] %s\n", n, err2.Error())
-					break
-				}
-				checksumCache.Set(msg.BlockIdx, checksum(filebuf[:msg.DataSize]))
-				serverPrintStats(msg.BlockIdx, "w", msg.DataSize)
 			}
-		}
-
-		// Check for DONE message
-		if msg.Done {
-			Log("\ntransfer DONE message received, starting graceful shutdown\n")
-			atomic.StoreInt32(&doneReceived, 1)
-			// Start shutdown timer in main loop
-			if shutdownTimer != nil {
-				shutdownTimer.Reset(10 * time.Second)
+			if uint32(len(payload)) != expectedSize {
+				return fmt.Errorf("block %d has invalid decoded size %d", msg.BlockIdx, len(payload))
 			}
-			return
+			if err := writeBlock(file, payload, offset); err != nil {
+				return fmt.Errorf("write block %d: %w", msg.BlockIdx, err)
+			}
+			indicator := "w"
+			if msg.Compressed {
+				indicator = "c"
+			}
+			serverPrintStats(msg.BlockIdx, indicator, msg.DataSize)
+			if err := sendBlockAck(conn, msg.BlockIdx, currentBlockSize, msg.FileSize); err != nil {
+				return nil
+			}
+			pendingWrite = nil
 		}
-
 	}
 }
 
-func startServer(file *os.File, bindIp, port string, checksumCache *ChecksumCache) {
+func startServer(file *os.File, bindIp, port string, checksumCache *ChecksumCache, workers int) error {
 	bindTo := ":" + port
 	if bindIp != "0.0.0.0" {
 		bindTo = bindIp + ":" + port
@@ -258,8 +294,7 @@ func startServer(file *os.File, bindIp, port string, checksumCache *ChecksumCach
 
 	listener, err := net.Listen("tcp", bindTo)
 	if err != nil {
-		Err("listening: %s\n", err.Error())
-		return
+		return fmt.Errorf("listening: %w", err)
 	}
 	defer listener.Close()
 
@@ -274,11 +309,12 @@ func startServer(file *os.File, bindIp, port string, checksumCache *ChecksumCach
 	idleTimer.Stop() // Don't start until we've had at least one connection
 
 	// Shutdown timer: started when DONE received
-	shutdownTimer = time.NewTimer(10 * time.Second)
+	shutdownTimer = time.NewTimer(shutdownLingerPeriod)
 	shutdownTimer.Stop() // Don't start until DONE received
 
 	connChan := make(chan net.Conn)
 	errChan := make(chan error)
+	handlerErrChan := make(chan error)
 
 	// Accept connections in goroutine with context cancellation
 	go func() {
@@ -305,60 +341,74 @@ func startServer(file *os.File, bindIp, port string, checksumCache *ChecksumCach
 		}
 	}()
 
-	hadConnection := false
-
 	for {
 		select {
 		case conn := <-connChan:
-			hadConnection = true
 			idleTimer.Stop()
 			shutdownTimer.Stop() // Stop shutdown timer when new activity
 			atomic.AddInt64(&activeConns, 1)
 			go func(c net.Conn) {
 				defer atomic.AddInt64(&activeConns, -1)
-				serverHandleReq(c, file, checksumCache)
-
-				// Check if we should exit after DONE
-				if atomic.LoadInt32(&doneReceived) == 1 {
-					active := atomic.LoadInt64(&activeConns)
-					if active == 0 {
-						Log("All connections finished after DONE, exiting\n")
-						return
+				handlerErr := serverHandleReq(c, file, checksumCache)
+				if handlerErr != nil {
+					select {
+					case handlerErrChan <- handlerErr:
+					case <-ctx.Done():
 					}
-					Log("Graceful shutdown: %d connections still active, waiting...\n", active)
+					return
 				}
 
-				// Normal idle timer (only when NOT done)
-				if atomic.LoadInt64(&activeConns) == 0 && hadConnection && atomic.LoadInt32(&doneReceived) == 0 {
+				// Exclude self (still counted until the deferred decrement)
+				// so `remaining` reflects other live connections.
+				remaining := atomic.LoadInt64(&activeConns) - 1
+
+				// Exit path after DONE: leave promptly when no others remain.
+				if atomic.LoadInt32(&doneReceived) == 1 {
+					if remaining <= 0 {
+						Log("All connections finished after DONE, exiting\n")
+						shutdownTimer.Reset(shutdownGracePeriod)
+					} else {
+						Log("Graceful shutdown: %d connections still active, waiting...\n", remaining)
+						shutdownTimer.Reset(shutdownLingerPeriod)
+					}
+					return
+				}
+
+				// Normal idle timer (only when NOT done). A connection
+				// goroutine only runs after at least one connection, so no
+				// "had a connection" guard is needed here.
+				if remaining <= 0 {
 					Log("Last connection closed, starting idle timer\n")
 					idleTimer.Reset(2 * time.Second)
 				}
 			}(conn)
 
 		case err := <-errChan:
-			Log("Error accepting: %s\n", err.Error())
-			return
+			return fmt.Errorf("accept: %w", err)
+
+		case err := <-handlerErrChan:
+			return err
 
 		case <-idleTimer.C:
 			if atomic.LoadInt64(&activeConns) == 0 && atomic.LoadInt32(&doneReceived) == 0 {
 				Log("Server idle timeout, exiting\n")
-				return
+				return nil
 			}
 
 		case <-shutdownTimer.C:
 			active := atomic.LoadInt64(&activeConns)
 			if active == 0 {
 				Log("Graceful shutdown: no active connections, exiting\n")
-				return
+				return nil
 			}
-			Log("Graceful shutdown: %d connections still active, waiting another 10s\n", active)
-			shutdownTimer.Reset(10 * time.Second)
+			Log("Graceful shutdown: %d connections still active, waiting another %s\n", active, shutdownLingerPeriod)
+			shutdownTimer.Reset(shutdownLingerPeriod)
 		}
 	}
 }
 
 // startServerUpload serves file blocks to requesting clients (upload mode)
-func startServerUpload(file *os.File, bindIp, port string, fileSize uint64, checksumCache *ChecksumCache, workers int) {
+func startServerUpload(file *os.File, bindIp, port string, fileSize uint64, checksumCache *ChecksumCache, workers int, noCompress bool) error {
 	bindTo := ":" + port
 	if bindIp != "0.0.0.0" {
 		bindTo = bindIp + ":" + port
@@ -366,25 +416,89 @@ func startServerUpload(file *os.File, bindIp, port string, fileSize uint64, chec
 
 	listener, err := net.Listen("tcp", bindTo)
 	if err != nil {
-		Err("listening: %s\n", err.Error())
-		return
+		return fmt.Errorf("listening: %w", err)
 	}
 	defer listener.Close()
 
 	Log("READY for upload, listening on %s\n", bindTo)
 
-	for {
-		conn, err := listener.Accept()
-		if err != nil {
-			Log("Error accepting: %s\n", err.Error())
-			return
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Idle exit: once a client has connected and all connections close, exit
+	// after a short idle period instead of Accept-looping forever. This lets
+	// `-d -t` (download via SSH) terminate cleanly rather than hanging on
+	// sshCmd.Wait().
+	var upActive int64
+	idleTimer := time.NewTimer(uploadIdlePeriod)
+	idleTimer.Stop()
+
+	connChan := make(chan net.Conn)
+	errChan := make(chan error)
+	handlerErrChan := make(chan error)
+
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				select {
+				case errChan <- err:
+				case <-ctx.Done():
+				}
+				return
+			}
+			select {
+			case connChan <- conn:
+			case <-ctx.Done():
+				conn.Close()
+				return
+			}
 		}
-		go serverHandleUpload(conn, file, fileSize, checksumCache)
+	}()
+
+	for {
+		select {
+		case conn := <-connChan:
+			idleTimer.Stop()
+			atomic.AddInt64(&upActive, 1)
+			go func(c net.Conn) {
+				handlerErr := serverHandleUpload(c, file, fileSize, checksumCache, workers, noCompress)
+				if handlerErr != nil {
+					select {
+					case handlerErrChan <- handlerErr:
+					case <-ctx.Done():
+					}
+					return
+				}
+				if atomic.AddInt64(&upActive, -1) == 0 {
+					idleTimer.Reset(uploadIdlePeriod)
+				}
+			}(conn)
+
+		case err := <-errChan:
+			return fmt.Errorf("accept: %w", err)
+
+		case err := <-handlerErrChan:
+			return err
+
+		case <-idleTimer.C:
+			if atomic.LoadInt64(&upActive) == 0 {
+				Log("Upload server idle, exiting\n")
+				return nil
+			}
+		}
 	}
 }
 
-// serverHandleUpload handles upload requests from clients
-func serverHandleUpload(conn net.Conn, file *os.File, fileSize uint64, checksumCache *ChecksumCache) {
+// serverHandleUpload handles upload requests from clients.
+//
+// The download client requests blocks strictly in ascending, contiguous order
+// over a single connection, so we drive a single sequential read-ahead reader
+// (SequentialReader) that keeps the source HDD reading as one continuous
+// stream and overlaps disk I/O with network transfer, instead of doing one
+// idle round-trip per block. If a request ever arrives out of the expected
+// order we transparently fall back to a direct ReadAt for that block.
+func serverHandleUpload(conn net.Conn, file *os.File, fileSize uint64, checksumCache *ChecksumCache, workers int, noCompress bool) error {
 	Log("serverHandleUpload()\n")
 	defer conn.Close()
 
@@ -398,7 +512,20 @@ func serverHandleUpload(conn net.Conn, file *os.File, fileSize uint64, checksumC
 	filebuf := make([]byte, blockSize)
 	msgBuf := make([]byte, binary.Size(Msg{}))
 
-	lastBlockNum := uint32((fileSize - 1) / uint64(blockSize))
+	var lastBlockNum uint32
+	if fileSize > 0 {
+		lastBlockNum = uint32((fileSize - 1) / uint64(blockSize))
+	}
+
+	// Sequential read-ahead, lazily started on the first block request so we
+	// can seed it at the client's starting block (honors -s skip).
+	// Use global prefetchDepth from main.go (default: workers*4)
+	depth := prefetchDepth
+	if depth < 4 {
+		depth = 4
+	}
+	var pf *SequentialReader
+	var pfChan <-chan BlockData
 
 	c := bufio.NewReader(conn)
 
@@ -406,19 +533,22 @@ func serverHandleUpload(conn net.Conn, file *os.File, fileSize uint64, checksumC
 		conn.SetDeadline(time.Now().Add(ioTimeout))
 		_, err1 := io.ReadFull(c, msgBuf)
 		if err1 != nil {
-			Log("\t- (upload) connection ended: %s\n", err1)
-			return
+			if err1 == io.EOF || err1 == io.ErrUnexpectedEOF {
+				return nil
+			}
+			return fmt.Errorf("read download request: %w", err1)
 		}
 
 		msg, err2 := unpack(msgBuf)
 		if err2 != nil {
-			Log("\t- unpack msg failed: %s\n", err2)
-			return
+			return fmt.Errorf("unpack download request: %w", err2)
 		}
 
 		if msg.MagicHead != magicBytes {
-			conn.Close()
-			return
+			return fmt.Errorf("invalid download request magic")
+		}
+		if err := validateDownloadRequest(msg); err != nil {
+			return err
 		}
 
 		if debug {
@@ -438,22 +568,22 @@ func serverHandleUpload(conn net.Conn, file *os.File, fileSize uint64, checksumC
 				Done:       false,
 			})
 			if err1 != nil {
-				Log("cant pack metadata msg-> %s\n", err1)
-				return
+				return fmt.Errorf("pack metadata: %w", err1)
 			}
 
-			n, err2 := conn.Write(metaMsg)
-			if err2 != nil && err2 != io.EOF {
-				Log("\t- error writing metadata: [%d] %s\n", n, err2.Error())
-				return
+			if err := connWrite(conn, metaMsg); err != nil {
+				return fmt.Errorf("write metadata: %w", err)
 			}
 			continue
+		}
+		if msg.BlockSize != blockSize || msg.FileSize != fileSize {
+			return fmt.Errorf("invalid download request metadata")
 		}
 
 		// Handle block request
 		offset := int64(msg.BlockIdx) * int64(blockSize)
 
-		if msg.BlockIdx > lastBlockNum {
+		if fileSize == 0 || msg.BlockIdx > lastBlockNum {
 			// Send done message
 			doneMsg, err1 := pack(&Msg{
 				MagicHead:  magicBytes,
@@ -466,24 +596,35 @@ func serverHandleUpload(conn net.Conn, file *os.File, fileSize uint64, checksumC
 				Done:       true,
 			})
 			if err1 != nil {
-				Log("cant pack done msg-> %s\n", err1)
-				return
+				return fmt.Errorf("pack download done: %w", err1)
 			}
 
-			n, err2 := conn.Write(doneMsg)
-			if err2 != nil && err2 != io.EOF {
-				Log("\t- error writing done msg: [%d] %s\n", n, err2.Error())
-				return
+			if err := connWrite(conn, doneMsg); err != nil {
+				return fmt.Errorf("write download done: %w", err)
 			}
-			return
+			return nil
 		}
 
-		// Read block from file
-		n, err := file.ReadAt(filebuf, offset)
-		if err != nil && err != io.EOF {
-			Log("\t- error reading from file: [%d] %s\n", n, err.Error())
-			break
+		// Lazily start the sequential read-ahead at the first requested block.
+		if pf == nil {
+			pf = NewSequentialReader(file, blockSize, fileSize, msg.BlockIdx, depth)
+			pf.Start()
+			pfChan = pf.Blocks()
 		}
+
+		// Read block: prefer the sequential prefetch stream; fall back to a
+		// direct read if the request is out of the expected order.
+		var data []byte
+		if bd, ok := <-pfChan; ok && bd.BlockIdx == msg.BlockIdx {
+			data = bd.Data
+		} else {
+			n, err := file.ReadAt(filebuf, offset)
+			if err != nil && err != io.EOF {
+				return fmt.Errorf("read source block %d: %w", msg.BlockIdx, err)
+			}
+			data = filebuf[:n]
+		}
+		n := len(data)
 
 		// Get precomputed hash
 		hash := checksumCache.WaitFor(msg.BlockIdx)
@@ -501,59 +642,94 @@ func serverHandleUpload(conn net.Conn, file *os.File, fileSize uint64, checksumC
 				Done:       false,
 			})
 			if err1 != nil {
-				Log("\t- cant pack zero msg-> %s\n", err1)
-				return
+				return fmt.Errorf("pack zero response: %w", err1)
 			}
-			connWrite(conn, respMsg)
-			// DON'T send filebuf[:n] - client knows it's zero, will create sparse hole
+			if err := connWrite(conn, respMsg); err != nil {
+				return fmt.Errorf("send zero response: %w", err)
+			}
+			// Do not send zero payload bytes; the client clears the destination range.
 			continue
 		}
 
-		// Compress if beneficial
-		compBuf, err := compressData(filebuf[:n])
-		if err != nil {
-			Log("Error: compressing upload data: %s\n", err)
-			break
+		// Compress if beneficial, unless the user disabled compression (-n).
+		var compBuf []byte
+		if !noCompress {
+			var cerr error
+			compBuf, cerr = compressData(data)
+			if cerr != nil {
+				return fmt.Errorf("compress source block %d: %w", msg.BlockIdx, cerr)
+			}
 		}
 
-		compressedBytes := uint32(len(compBuf))
-
-		if compressedBytes < uint32(n) {
-			// Send compressed
+		if !noCompress && uint32(len(compBuf)) < uint32(n) {
+			// Send compressed (compressData also encrypts when -e is set)
 			msg, err1 := pack(&Msg{
 				MagicHead:  magicBytes,
 				BlockIdx:   msg.BlockIdx,
 				BlockSize:  blockSize,
 				FileSize:   fileSize,
-				DataSize:   compressedBytes,
+				DataSize:   uint32(len(compBuf)),
 				Compressed: true,
 				Zero:       false,
 				Done:       false,
 			})
 			if err1 != nil {
-				Log("\t- cant pack compressed msg-> %s\n", err1)
-				return
+				return fmt.Errorf("pack compressed response: %w", err1)
 			}
-			connWrite(conn, msg)
-			connWrite(conn, compBuf)
+			if err := connWrite(conn, msg); err != nil {
+				return fmt.Errorf("send compressed header: %w", err)
+			}
+			if err := connWrite(conn, compBuf); err != nil {
+				return fmt.Errorf("send compressed payload: %w", err)
+			}
 		} else {
-			// Send uncompressed
+			// Send uncompressed. When encryption is on, encrypt the raw block
+			// so -n still produces an encrypted stream.
+			var payload []byte
+			var pooledPayload []byte // Track to return to pool after send
+			if IsEncryptionEnabled() {
+				payload = encryptBlock(data)
+			} else {
+				// CRITICAL FIX: data points to a reused buffer (either bd.Data from
+				// SequentialReader or filebuf[:n] from direct ReadAt). connWrite
+				// reads asynchronously and the buffer will be overwritten in the next
+				// loop iteration, so we must copy the data first.
+				// Use pooled buffer to reduce GC pressure.
+				payload = GetPayload(data)
+				pooledPayload = payload
+			}
 			msg, err1 := pack(&Msg{
 				MagicHead:  magicBytes,
 				BlockIdx:   msg.BlockIdx,
 				BlockSize:  blockSize,
 				FileSize:   fileSize,
-				DataSize:   uint32(n),
+				DataSize:   uint32(len(payload)),
 				Compressed: false,
 				Zero:       false,
 				Done:       false,
 			})
 			if err1 != nil {
-				Log("\t- cant pack uncompressed msg-> %s\n", err1)
-				return
+				if pooledPayload != nil {
+					PutPayload(pooledPayload)
+				}
+				return fmt.Errorf("pack uncompressed response: %w", err1)
 			}
-			connWrite(conn, msg)
-			connWrite(conn, filebuf[:n])
+			if err := connWrite(conn, msg); err != nil {
+				if pooledPayload != nil {
+					PutPayload(pooledPayload)
+				}
+				return fmt.Errorf("send uncompressed header: %w", err)
+			}
+			if err := connWrite(conn, payload); err != nil {
+				if pooledPayload != nil {
+					PutPayload(pooledPayload)
+				}
+				return fmt.Errorf("send uncompressed payload: %w", err)
+			}
+			// Return pooled buffer to pool for reuse
+			if pooledPayload != nil {
+				PutPayload(pooledPayload)
+			}
 		}
 
 		if debug {

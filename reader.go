@@ -6,6 +6,43 @@ import (
 	"sync"
 )
 
+// Reader buffer pool for reusing read buffers
+// Pool buffers are locked in memory on creation to prevent swap
+// Buffers use huge pages (MADV_HUGEPAGE) to reduce TLB misses
+var readerBufPool = sync.Pool{
+	New: func() interface{} {
+		// Pre-allocate with 10MB capacity for typical block size
+		buf := make([]byte, 0, 10*1024*1024)
+		// Lock the full capacity to prevent swap
+		TryLockBuffer(buf[:cap(buf)])
+		// Advise kernel to use huge pages (2MB) for better TLB utilization
+		AdviseHugePage(buf[:cap(buf)])
+		return buf
+	},
+}
+
+// getReaderBuf gets a buffer from the pool or allocates a new one
+func getReaderBuf(size uint32) []byte {
+	buf := readerBufPool.Get().([]byte)
+	if cap(buf) < int(size) {
+		// Pool buffer too small, allocate new one (not returned to pool)
+		// New buffers are automatically locked
+		newBuf := make([]byte, size)
+		TryLockBuffer(newBuf)
+		return newBuf
+	}
+	return buf[:size]
+}
+
+// putReaderBuf returns a buffer to the pool if it's appropriately sized
+func putReaderBuf(buf []byte) {
+	if cap(buf) <= 10*1024*1024 {
+		readerBufPool.Put(buf[:0])
+	}
+	// Large buffers are GC'd instead of polluting the pool
+	// Note: munlock happens automatically when GC frees the memory
+}
+
 // BlockData represents a block with its index and data
 type BlockData struct {
 	BlockIdx uint32
@@ -42,7 +79,9 @@ func (sr *SequentialReader) Start() {
 		defer sr.wg.Done()
 		defer close(sr.blockChan)
 
-		buf := make([]byte, sr.blockSize)
+		buf := getReaderBuf(sr.blockSize)
+		defer putReaderBuf(buf)
+
 		for blockIdx := sr.skipIdx; blockIdx <= sr.lastBlockNum; blockIdx++ {
 			// Read block sequentially
 			offset := int64(blockIdx) * int64(sr.blockSize)

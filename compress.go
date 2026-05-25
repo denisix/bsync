@@ -6,7 +6,7 @@ import (
 )
 
 var (
-	encoderLevel zstd.EncoderLevel = zstd.SpeedDefault
+	encoderLevel zstd.EncoderLevel = zstd.SpeedFastest
 	encoderPool = sync.Pool{
 		New: func() interface{} {
 			enc, err := zstd.NewWriter(nil,
@@ -17,6 +17,12 @@ var (
 				panic(err)
 			}
 			return enc
+		},
+	}
+	// Buffer pool for compression output (reduces GC pressure)
+	compressOutputPool = sync.Pool{
+		New: func() interface{} {
+			return make([]byte, 0, 10*1024*1024)
 		},
 	}
 	decoderPool = sync.Pool{
@@ -56,15 +62,22 @@ func compressData(data []byte) ([]byte, error) {
 	encoder := encoderPool.Get().(*zstd.Encoder)
 	defer encoderPool.Put(encoder)
 
-	buffer := make([]byte, 0, len(data))
-	result := encoder.EncodeAll(data, buffer)
+	// Get buffer from pool to reduce allocations
+	buf := compressOutputPool.Get().([]byte)
+	buf = buf[:cap(buf)] // Use full capacity
+	result := encoder.EncodeAll(data, buf[:0])
+
+	// Copy result since we need to return the buffer to pool
+	output := make([]byte, len(result))
+	copy(output, result)
+	compressOutputPool.Put(buf[:0])
 
 	// Encrypt after compression if enabled
 	if IsEncryptionEnabled() {
-		result = encryptBlock(result)
+		output = encryptBlock(output)
 	}
 
-	return result, nil
+	return output, nil
 }
 
 func decompressData(data []byte) ([]byte, error) {

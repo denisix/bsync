@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -35,12 +36,19 @@ func printStats(job BlockJob, indicator string, diff, bytes uint32) {
 	mu.Lock()
 	diffs = diffs + diff
 	if bytes > 0 {
-		totOrigSize = totOrigSize + uint64(blockSize)
+		currentBlockSize := atomic.LoadUint32(&blockSize)
+		totOrigSize = totOrigSize + uint64(currentBlockSize)
 		totCompSize = totCompSize + uint64(bytes)
 	}
+	// Snapshot shared counters while holding the lock; reading them below
+	// without the lock would race with other workers' printStats calls.
+	localDiffs := diffs
+	localComp := totCompSize
+	localOrig := totOrigSize
 	mu.Unlock()
 
-	blockMb := float64(blockSize) / float64(mb1)
+	currentBlockSize := atomic.LoadUint32(&blockSize)
+	blockMb := float64(currentBlockSize) / float64(mb1)
 
 	blocksLeft := float64(lastBlockNum - job.blockIdx)
 	mbsLeft := blocksLeft * blockMb
@@ -66,16 +74,32 @@ func printStats(job BlockJob, indicator string, diff, bytes uint32) {
 		eta = 0
 	}
 
-	percent := 100 * float64(job.blockIdx) / float64(lastBlockNum)
-	ratio := 100 * float64(totCompSize) / float64(totOrigSize)
+	percent := 100.0
+	if lastBlockNum > 0 {
+		percent = 100 * float64(job.blockIdx) / float64(lastBlockNum)
+	}
+	ratio := 100.0
+	if localOrig > 0 {
+		ratio = 100 * float64(localComp) / float64(localOrig)
+	}
 
-	Log("block %d/%d (%0.2f%%) [%s] size=%d ratio=%0.2f %0.2f MB/s ETA=%d %s diffs=%d\r", job.blockIdx, lastBlockNum, percent, indicator, v_fileSize, ratio, mbs, eta, etaUnit, diffs)
+	Log("block %d/%d (%0.2f%%) [%s] size=%d ratio=%0.2f %0.2f MB/s ETA=%d %s diffs=%d\r", job.blockIdx, lastBlockNum, percent, indicator, v_fileSize, ratio, mbs, eta, etaUnit, localDiffs)
 }
 
-// startClient launches threadsCount workers, each with a persistent connection, and pushes file blocks to a jobs channel
-func startClient(file *os.File, serverAddress string, skipIdx uint32, fileSize uint64, blockSize uint32, noCompress bool, checksumCache *ChecksumCache, workers int) {
+// startClient launches workers with persistent connections and uploads blocks.
+func startClient(file *os.File, serverAddress string, skipIdx uint32, fileSize uint64, blockSize uint32, noCompress bool, checksumCache *ChecksumCache, workers int) error {
 	Log("startClient()\n")
-	lastBlockNum = uint32((fileSize - 1) / uint64(blockSize))
+	if blockSize == 0 {
+		return fmt.Errorf("block size must be at least 1")
+	}
+	if workers < 1 {
+		return fmt.Errorf("worker count must be at least 1")
+	}
+	if fileSize > 0 {
+		lastBlockNum = uint32((fileSize - 1) / uint64(blockSize))
+	} else {
+		lastBlockNum = 0
+	}
 	Log("source size: %d bytes, block %d bytes, blockNum: %d\n", fileSize, blockSize, lastBlockNum)
 
 	var wg sync.WaitGroup
@@ -86,22 +110,22 @@ func startClient(file *os.File, serverAddress string, skipIdx uint32, fileSize u
 	// Resolve server address once
 	saddr, err := net.ResolveTCPAddr("tcp", serverAddress)
 	if err != nil {
-		Err("resolving: %s\n", err.Error())
-		return
+		return fmt.Errorf("resolving: %w", err)
 	}
-
-	// Create sequential reader with channel-based output
-	reader := NewSequentialReader(file, blockSize, fileSize, skipIdx, workers*2)
-	reader.Start()
 
 	// Channel for precomputed blocks (hash + compressed data)
 	precompressedChan := make(chan PrecomputedBlock, workers*2)
-
-	// Start parallel checksum + compression workers
-	go precomputeChecksumsParallel(reader, checksumCache, precompressedChan, workers)
+	if fileSize > 0 {
+		reader := NewSequentialReader(file, blockSize, fileSize, skipIdx, prefetchDepth)
+		reader.Start()
+		go precomputeChecksumsParallel(reader, checksumCache, precompressedChan, workers, noCompress)
+	} else {
+		close(precompressedChan)
+	}
 
 	// Start worker goroutines for network transfer
 	Log("starting %d transfer workers\n", workers)
+	errChan := make(chan error, 1)
 	for i := 0; i < workers; i++ {
 		wg.Add(1)
 		go func(saddr *net.TCPAddr) {
@@ -122,6 +146,10 @@ func startClient(file *os.File, serverAddress string, skipIdx uint32, fileSize u
 				}
 				if lastErr != nil {
 					Log("block %d: failed after %d retries: %v\n", block.BlockIdx, maxRetries, lastErr)
+					select {
+					case errChan <- fmt.Errorf("block %d: %w", block.BlockIdx, lastErr):
+					default:
+					}
 				}
 			}
 		}(saddr)
@@ -129,6 +157,11 @@ func startClient(file *os.File, serverAddress string, skipIdx uint32, fileSize u
 
 	Log("DONE, waiting for the workers\n")
 	wg.Wait()
+	select {
+	case err := <-errChan:
+		return err
+	default:
+	}
 
 	// Send DONE message to server
 	magicBytes := stringToFixedSizeArray(magicHead)
@@ -145,19 +178,34 @@ func startClient(file *os.File, serverAddress string, skipIdx uint32, fileSize u
 		Done:       true,
 	})
 	if err1 != nil {
-		Log("cant pack msg-> %s\n", err1)
-		return
+		return fmt.Errorf("pack done: %w", err1)
 	}
 
-	n, err2 := conn.Write(msg)
-	if err2 != nil && err2 != io.EOF {
-		Log("\t- error writing net: [%d] %s\n", n, err2.Error())
-		return
+	if err := connWrite(conn, msg); err != nil {
+		return fmt.Errorf("send done: %w", err)
 	}
 
 	Log("\nDONE, exiting..\n\n")
-	time.Sleep(2 * time.Second)
-	return
+	// Brief margin to flush the DONE message; the caller's sshCmd.Wait()
+	// already blocks until the server has fully finished.
+	time.Sleep(doneFlushDelay)
+	return nil
+}
+
+func waitForBlockAck(conn io.Reader, blockIdx uint32) error {
+	buf := make([]byte, binary.Size(Msg{}))
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		return err
+	}
+	ack, err := unpack(buf)
+	if err != nil {
+		return err
+	}
+	if ack.MagicHead != stringToFixedSizeArray(magicHead) || ack.BlockIdx != blockIdx ||
+		ack.Done || ack.Zero || ack.Compressed || ack.DataSize != 0 {
+		return fmt.Errorf("invalid acknowledgement for block %d", blockIdx)
+	}
+	return nil
 }
 
 // processPrecomputedBlock sends a pre-hashed and pre-compressed block.
@@ -215,6 +263,9 @@ func processPrecomputedBlock(conn *AutoReconnectTCP, block PrecomputedBlock, blo
 		if err := connWrite(conn, msg2); err != nil {
 			return fmt.Errorf("send zero: %w", err)
 		}
+		if err := waitForBlockAck(conn, block.BlockIdx); err != nil {
+			return fmt.Errorf("ack zero: %w", err)
+		}
 		job := BlockJob{blockIdx: block.BlockIdx, data: nil, readedBytes: int(blockSize)}
 		printStats(job, ".", 1, 0)
 		return nil
@@ -226,7 +277,13 @@ func processPrecomputedBlock(conn *AutoReconnectTCP, block PrecomputedBlock, blo
 
 	if noCompress || !block.UseCompressed {
 		compressedFlag = false
-		dataToSend = block.Data
+		// Raw block. compressData (the compressed path) is where encryption
+		// normally happens, so encrypt here to keep -n + -e working.
+		if IsEncryptionEnabled() {
+			dataToSend = encryptBlock(block.Data)
+		} else {
+			dataToSend = block.Data
+		}
 	} else {
 		compressedFlag = true
 		dataToSend = block.Compressed
@@ -256,6 +313,9 @@ func processPrecomputedBlock(conn *AutoReconnectTCP, block PrecomputedBlock, blo
 	if err := connWrite(conn, dataToSend); err != nil {
 		return fmt.Errorf("send data payload: %w", err)
 	}
+	if err := waitForBlockAck(conn, block.BlockIdx); err != nil {
+		return fmt.Errorf("ack data: %w", err)
+	}
 
 	job := BlockJob{blockIdx: block.BlockIdx, data: block.Data, readedBytes: len(block.Data)}
 	if compressedFlag {
@@ -266,15 +326,20 @@ func processPrecomputedBlock(conn *AutoReconnectTCP, block PrecomputedBlock, blo
 	return nil
 }
 
-// startClientDownload connects to server and downloads file blocks
-func startClientDownload(file *os.File, serverAddress string, skipIdx uint32, blockSize uint32, noCompress bool, workers int) {
+// startClientDownload connects to server and downloads file blocks.
+func startClientDownload(file *os.File, serverAddress string, skipIdx uint32, blockSize uint32, noCompress bool, workers int) error {
 	Log("startClientDownload()\n")
+	if blockSize == 0 {
+		return fmt.Errorf("block size must be at least 1")
+	}
+	if workers < 1 {
+		return fmt.Errorf("worker count must be at least 1")
+	}
 
 	// Resolve server address once
 	saddr, err := net.ResolveTCPAddr("tcp", serverAddress)
 	if err != nil {
-		Err("resolving: %s\n", err.Error())
-		return
+		return fmt.Errorf("resolving: %w", err)
 	}
 
 	// Connect to server
@@ -294,45 +359,47 @@ func startClientDownload(file *os.File, serverAddress string, skipIdx uint32, bl
 		Done:       false,
 	})
 	if err1 != nil {
-		Log("cant pack download request msg-> %s\n", err1)
-		return
+		return fmt.Errorf("pack download request: %w", err1)
 	}
 
-	n, err2 := conn.Write(msg)
-	if err2 != nil && err2 != io.EOF {
-		Log("\t- error writing download request: [%d] %s\n", n, err2.Error())
-		return
+	if err := connWrite(conn, msg); err != nil {
+		return fmt.Errorf("send download request: %w", err)
 	}
 
 	// Read file metadata from server
 	msgBuf := make([]byte, binary.Size(Msg{}))
 	_, err = io.ReadFull(conn, msgBuf)
 	if err != nil {
-		Log("Error reading metadata from server: %s\n", err.Error())
-		return
+		return fmt.Errorf("read metadata: %w", err)
 	}
 
 	metaMsg, err3 := unpack(msgBuf)
 	if err3 != nil {
-		Log("\t- unpack metadata failed: %s\n", err3)
-		return
+		return fmt.Errorf("unpack metadata: %w", err3)
+	}
+	if metaMsg.MagicHead != magicBytes || metaMsg.BlockSize == 0 ||
+		metaMsg.DataSize != 0 || metaMsg.Compressed || metaMsg.Zero || metaMsg.Done {
+		return fmt.Errorf("invalid metadata from server")
 	}
 
 	fileSize := metaMsg.FileSize
+	blockSize = metaMsg.BlockSize
+	truncateIfRegularFile(file, fileSize)
 	if fileSize == 0 {
 		Log("remote file is empty, nothing to download\n")
-		return
+		return nil
 	}
 	lastBlockNum := uint32((fileSize - 1) / uint64(blockSize))
 
 	Log("remote file size: %d bytes, block %d bytes, blockNum: %d\n", fileSize, blockSize, lastBlockNum)
 
-	// Truncate local file to match remote size
-	truncateIfRegularFile(file, fileSize)
+	// Note: Preallocation skipped - using direct block devices (/dev/sda)
+	// which have fixed size and don't support fallocate
 
-	// Start receiving blocks
+	// Start receiving blocks. Reserve room for encryption overhead (an
+	// encrypted, uncompressed block is blockSize+encryptOverhead on the wire).
 	Log("start downloading from server\n")
-	filebuf := make([]byte, blockSize)
+	filebuf := make([]byte, blockSize+encryptOverhead)
 
 	for blockIdx := uint32(skipIdx); blockIdx <= lastBlockNum; blockIdx++ {
 		// Request block from server
@@ -347,41 +414,47 @@ func startClientDownload(file *os.File, serverAddress string, skipIdx uint32, bl
 			Done:       false,
 		})
 		if err1 != nil {
-			Log("cant pack block request msg-> %s\n", err1)
-			return
+			return fmt.Errorf("pack block request: %w", err1)
 		}
 
-		n, err2 := conn.Write(msg)
-		if err2 != nil && err2 != io.EOF {
-			Log("\t- error writing block request: [%d] %s\n", n, err2.Error())
-			return
+		if err := connWrite(conn, msg); err != nil {
+			return fmt.Errorf("send block request: %w", err)
 		}
 
 		// Read response
 		_, err = io.ReadFull(conn, msgBuf)
 		if err != nil {
-			Log("Error reading block response: %s\n", err.Error())
-			return
+			return fmt.Errorf("read block response: %w", err)
 		}
 
 		blockMsg, err4 := unpack(msgBuf)
 		if err4 != nil {
-			Log("\t- unpack block response failed: %s\n", err4)
-			return
+			return fmt.Errorf("unpack block response: %w", err4)
 		}
 
 		if blockMsg.Done {
-			Log("\ndownload DONE\n\n")
-			break
+			return fmt.Errorf("premature completion while awaiting block %d", blockIdx)
+		}
+		if blockMsg.MagicHead != magicBytes || blockMsg.BlockIdx != blockIdx ||
+			blockMsg.BlockSize != blockSize || blockMsg.FileSize != fileSize ||
+			blockMsg.DataSize > uint32(len(filebuf)) ||
+			(blockMsg.Zero && (blockMsg.DataSize != 0 || blockMsg.Compressed)) ||
+			(!blockMsg.Zero && blockMsg.DataSize == 0) {
+			return fmt.Errorf("invalid block response for block %d", blockIdx)
 		}
 
 		offset := int64(blockIdx) * int64(blockSize)
+		expectedSize := blockPayloadSize(fileSize, blockSize, blockIdx)
 
-		// Handle zero blocks (DataSize=0, Zero=true) - no data sent, preserve sparse hole
+		// A zero notification must clear old destination data; an existing range
+		// cannot be assumed to be a sparse hole.
 		if blockMsg.Zero && blockMsg.DataSize == 0 {
-			// Don't write anything - file is pre-truncated, creates sparse hole
-			if debug {
-				Log("\t- zero block at %d, skipping write\n", blockIdx)
+			n, err := file.WriteAt(getZeroBuf(int(expectedSize)), offset)
+			if err != nil {
+				return fmt.Errorf("write zero block %d: %w", blockIdx, err)
+			}
+			if uint32(n) != expectedSize {
+				return fmt.Errorf("write zero block %d: %w", blockIdx, io.ErrShortWrite)
 			}
 		}
 
@@ -389,33 +462,55 @@ func startClientDownload(file *os.File, serverAddress string, skipIdx uint32, bl
 			// Read block data
 			_, err1 := io.ReadFull(conn, filebuf[:blockMsg.DataSize])
 			if err1 != nil {
-				Log("\t- error reading block data: %s\n", err1)
-				return
+				return fmt.Errorf("read block %d data: %w", blockIdx, err1)
 			}
 
 			if blockMsg.Compressed {
 				decompressed, err := decompressData(filebuf[:blockMsg.DataSize])
 				if err != nil {
-					Log("\t- error decompressing: %s\n", err.Error())
-					break
+					return fmt.Errorf("decompress block %d: %w", blockIdx, err)
+				}
+				if uint32(len(decompressed)) != expectedSize {
+					return fmt.Errorf("block %d has invalid decompressed size %d", blockIdx, len(decompressed))
 				}
 				n, err2 := file.WriteAt(decompressed, offset)
-				if err2 != nil && err2 != io.EOF {
-					Log("\t- error writing decompressed block: [%d] %s\n", n, err2.Error())
-					break
+				if err2 != nil {
+					return fmt.Errorf("write block %d: %w", blockIdx, err2)
+				}
+				if n != len(decompressed) {
+					return fmt.Errorf("write block %d: %w", blockIdx, io.ErrShortWrite)
 				}
 			} else {
-				n, err2 := file.WriteAt(filebuf[:blockMsg.DataSize], offset)
-				if err2 != nil && err2 != io.EOF {
-					Log("\t- error writing block: [%d] %s\n", n, err2.Error())
-					break
+				// Uncompressed payload. With -e the raw block is encrypted on
+				// the wire, so decrypt before writing.
+				out := filebuf[:blockMsg.DataSize]
+				if IsEncryptionEnabled() {
+					dec, err := decryptBlock(out)
+					if err != nil {
+						return fmt.Errorf("decrypt block %d: %w", blockIdx, err)
+					}
+					out = dec
+				}
+				if uint32(len(out)) != expectedSize {
+					return fmt.Errorf("block %d has invalid payload size %d", blockIdx, len(out))
+				}
+				n, err2 := file.WriteAt(out, offset)
+				if err2 != nil {
+					return fmt.Errorf("write block %d: %w", blockIdx, err2)
+				}
+				if n != len(out) {
+					return fmt.Errorf("write block %d: %w", blockIdx, io.ErrShortWrite)
 				}
 			}
 		}
 
-		percent := 100 * float64(blockIdx) / float64(lastBlockNum)
+		percent := 100.0
+		if lastBlockNum > 0 {
+			percent = 100 * float64(blockIdx) / float64(lastBlockNum)
+		}
 		Log("downloaded block %d/%d (%0.2f%%)\r", blockIdx, lastBlockNum, percent)
 	}
 
 	Log("\ndownload complete\n")
+	return nil
 }

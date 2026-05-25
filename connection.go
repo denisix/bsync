@@ -8,10 +8,27 @@ import (
 
 const (
 	dialTimeout     = 30 * time.Second
-	ioTimeout       = 5 * time.Minute  // generous for large blocks on slow links
+	ioTimeout       = 5 * time.Minute // generous for large blocks on slow links
 	keepAlivePeriod = 30 * time.Second
 	maxRetries      = 3
+
+	// Shutdown timing. After the client sends DONE the server should exit
+	// quickly when no connections remain; the longer linger period is only a
+	// cap used while stragglers are still active. These dominate per-transfer
+	// teardown time, so keep the idle exit short.
+	shutdownGracePeriod  = 250 * time.Millisecond // exit this fast after DONE when idle
+	shutdownLingerPeriod = 10 * time.Second       // cap while connections still active
+	doneFlushDelay       = 200 * time.Millisecond // client flush margin after DONE
+	uploadIdlePeriod     = 1 * time.Second        // upload server exits this long after last conn
 )
+
+// TCP buffer size, can be overridden by auto-tuning
+var tcpBufferSize int = 4 * 1024 * 1024 // Default 4MB
+
+// SetTCPBufferSize sets the TCP buffer size for new connections.
+func SetTCPBufferSize(size int) {
+	tcpBufferSize = size
+}
 
 // connWrite writes all bytes to conn, retrying on partial writes.
 // Sets a per-iteration write deadline to detect stalled peers.
@@ -56,6 +73,11 @@ func (a *AutoReconnectTCP) connect() error {
 	a.conn = c.(*net.TCPConn)
 	a.conn.SetKeepAlive(true)
 	a.conn.SetKeepAlivePeriod(keepAlivePeriod)
+	// Increase TCP buffers for better throughput on fast networks
+	a.conn.SetReadBuffer(tcpBufferSize)
+	a.conn.SetWriteBuffer(tcpBufferSize)
+	// Disable Nagle's algorithm for immediate sending of small packets
+	a.conn.SetNoDelay(true)
 	return nil
 }
 

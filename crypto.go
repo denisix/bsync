@@ -16,6 +16,11 @@ var (
 	aeadOnce      sync.Once
 )
 
+// encryptOverhead is the maximum number of bytes encryptBlock adds to a
+// payload (nonce + Poly1305 tag). Receive buffers must reserve this much extra
+// room because an encrypted-but-uncompressed block is blockSize+overhead.
+const encryptOverhead = chacha20poly1305.NonceSize + chacha20poly1305.Overhead
+
 // GenerateEncryptionKey creates a new random 32-byte key
 func GenerateEncryptionKey() []byte {
 	key := make([]byte, chacha20poly1305.KeySize)

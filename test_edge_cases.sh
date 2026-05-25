@@ -2,6 +2,7 @@
 
 set -e
 
+BSYNC_BIN="${BSYNC_BIN:-./bsync}"
 TEST_DIR="/tmp/bsync_test"
 if [ -d "$TEST_DIR" ]; then
   rm -rf "$TEST_DIR"
@@ -66,7 +67,7 @@ run_test() {
 
   # Run bsync and capture exit code
   set +e
-  ./bsync -q -f "$src_file" -t "$dst_file"
+  "$BSYNC_BIN" -q -f "$src_file" -t "$dst_file"
   exit_code=$?
   set -e
 
@@ -76,8 +77,8 @@ run_test() {
     echo "✓ PASS: Exit code matches expected"
     # If expected to succeed, check md5sum of both files
     if [ "$expected_exit" = "0" ] && [ -f "$src_file" ] && [ -f "$dst_file" ]; then
-      src_md5=$(md5sum "$src_file" | awk '{print $1}')
-      dst_md5=$(md5sum "$dst_file" | awk '{print $1}')
+      src_md5=$(md5sum "$src_file" | cut -d' ' -f1)
+      dst_md5=$(md5sum "$dst_file" | cut -d' ' -f1)
 
       if [ "$src_md5" = "$dst_md5" ]; then
         echo "✓ PASS: Source and destination files match (md5sum: $src_md5)"
@@ -121,7 +122,7 @@ run_test_with_flags() {
 
   # Run bsync with custom flags
   set +e
-  ./bsync -q $extra_flags -f "$src_file" -t "$dst_file"
+  "$BSYNC_BIN" -q $extra_flags -f "$src_file" -t "$dst_file"
   exit_code=$?
   set -e
 
@@ -130,8 +131,8 @@ run_test_with_flags() {
   if [ "$exit_code" = "$expected_exit" ]; then
     echo "✓ PASS: Exit code matches expected"
     if [ "$expected_exit" = "0" ] && [ -f "$src_file" ] && [ -f "$dst_file" ]; then
-      src_md5=$(md5sum "$src_file" | awk '{print $1}')
-      dst_md5=$(md5sum "$dst_file" | awk '{print $1}')
+      src_md5=$(md5sum "$src_file" | cut -d' ' -f1)
+      dst_md5=$(md5sum "$dst_file" | cut -d' ' -f1)
 
       if [ "$src_md5" = "$dst_md5" ]; then
         echo "✓ PASS: Source and destination files match (md5sum: $src_md5)"
@@ -164,7 +165,7 @@ run_test "Source file absent (should fail)" "/nonexistent/file" "$TEST_DIR/dst1.
 
 # Test 2: Source file empty
 touch "$TEST_DIR/empty_src.img"
-run_test "Source file empty (should fail)" "$TEST_DIR/empty_src.img" "$TEST_DIR/dst2.img" 1
+run_test "Source file empty" "$TEST_DIR/empty_src.img" "$TEST_DIR/dst2.img" 0
 
 # Test 3: Source file with zeros
 create_zero_file "$TEST_DIR/zero_src.img" 10485760 # 10MB
@@ -202,9 +203,9 @@ run_test "Destination file exists and is zeros at borders, 10MB" "$TEST_DIR/rand
 create_random_file "$TEST_DIR/small_src.img" 1048576 # 1MB
 run_test "Source file small random, 1MB" "$TEST_DIR/small_src.img" "$TEST_DIR/dst12.img" 0
 
-# Test 13: Large source file (100MB)
+# Test 13: Large source file (10MB)
 create_random_file "$TEST_DIR/large_src.img" 10485760 # 10MB
-run_test "Source file large random, 100MB" "$TEST_DIR/large_src.img" "$TEST_DIR/dst13.img" 0
+run_test "Source file large random, 10MB" "$TEST_DIR/large_src.img" "$TEST_DIR/dst13.img" 0
 
 # Test 14: Source file with zeros in middle
 create_random_file "$TEST_DIR/middle_zeros_src.img" 10485760 # 10MB
@@ -326,9 +327,9 @@ create_random_file "$TEST_DIR/multi_non_aligned_src.img" 26214400 # 25MB
 dd if=/dev/urandom of="$TEST_DIR/multi_non_aligned_src.img" bs=1 count=777 conv=notrunc 2>/dev/null
 run_test "Source file multiple non-aligned blocks (25MB+777 bytes)" "$TEST_DIR/multi_non_aligned_src.img" "$TEST_DIR/dst35.img" 0
 
-# Test 36: Source file big random, 200MB
+# Test 36: Source file big random, 20MB
 create_random_file "$TEST_DIR/big_src.img" 20971520 # 20MB
-run_test "Source file big random, 200MB" "$TEST_DIR/big_src.img" "$TEST_DIR/dst_big.img" 0
+run_test "Source file big random, 20MB" "$TEST_DIR/big_src.img" "$TEST_DIR/dst_big.img" 0
 
 # Test 37: Destination file larger than source, extra data is random
 create_random_file "$TEST_DIR/large_random_dst.img" 20971520 # 20MB
@@ -355,8 +356,8 @@ done) &
 run_test "Source file changes during sync" "$TEST_DIR/changing_src.img" "$TEST_DIR/dst_changing.img" 0 1
 wait
 
-# Test 42: Destination file is a device (simulate with /dev/null)
-run_test "Destination is /dev/null (should fail or skip)" "$TEST_DIR/random_src.img" "/dev/null" 0
+# Test 42: A destination that cannot retain blocks must fail the transfer.
+run_test "Destination is /dev/null (should fail)" "$TEST_DIR/random_src.img" "/dev/null" 1
 
 # Test 43: Source file with all byte values
 allbytes="$TEST_DIR/allbytes_src.img"
@@ -455,6 +456,115 @@ echo "Cleaning up test files..."
 # rm -rf "$TEST_DIR"
 
 # Print test summary
+# ==========================================
+# Download mode (-d) tests
+# ==========================================
+# In download mode -f is the LOCAL destination and -t is the (here local)
+# remote SOURCE. Verifies the upload server exits cleanly (no hang) and data
+# matches.
+run_download_test() {
+  local test_name="$1"
+  local remote_src="$2"
+  local local_dst="$3"
+  local extra_flags="$4"
+  TOTAL_TESTS=$((TOTAL_TESTS + 1))
+  echo "[TEST $TOTAL_TESTS] $test_name"
+  echo -e "\t-d $extra_flags -f $local_dst -t $remote_src"
+  rm -f "$local_dst"
+
+  set +e
+  "$BSYNC_BIN" -q -d $extra_flags -f "$local_dst" -t "$remote_src"
+  exit_code=$?
+  set -e
+
+  local test_passed=true
+  if [ "$exit_code" != "0" ]; then
+    echo "✗ FAIL: exit code $exit_code"
+    test_passed=false
+  else
+    src_md5=$(md5sum "$remote_src" | cut -d' ' -f1)
+    dst_md5=$(md5sum "$local_dst" | cut -d' ' -f1)
+    if [ "$src_md5" = "$dst_md5" ]; then
+      echo "✓ PASS: downloaded file matches (md5sum: $src_md5)"
+    else
+      echo "✗ FAIL: files differ (src: $src_md5, dst: $dst_md5)"
+      test_passed=false
+    fi
+  fi
+
+  if [ "$test_passed" = true ]; then
+    PASSED_TESTS=$((PASSED_TESTS + 1))
+  else
+    FAILED_TESTS=$((FAILED_TESTS + 1))
+    FAILED_TEST_NAMES+=("$test_name")
+  fi
+  echo ""
+}
+
+create_random_file "$TEST_DIR/dl_src.img" 10485760 # 10MB
+run_download_test "Download mode (-d), 10MB" "$TEST_DIR/dl_src.img" "$TEST_DIR/dl_dst.img" ""
+run_download_test "Download mode (-d) no compression, 4 workers" "$TEST_DIR/dl_src.img" "$TEST_DIR/dl_dst_nw.img" "-n -w 4"
+
+# ==========================================
+# Concurrent transfers (production: several syncs at once)
+# ==========================================
+# Launch multiple -t transfers simultaneously to distinct destinations. With no
+# -p each picks its own free high port; they must not collide and all must match.
+echo "[TEST $((TOTAL_TESTS + 1))] Concurrent transfers (4 simultaneous)"
+create_random_file "$TEST_DIR/conc_src.img" 10485760 # 10MB
+TOTAL_TESTS=$((TOTAL_TESTS + 1))
+pids=()
+for i in 1 2 3 4; do
+  rm -f "$TEST_DIR/conc_dst_$i.img"
+  "$BSYNC_BIN" -q -f "$TEST_DIR/conc_src.img" -t "$TEST_DIR/conc_dst_$i.img" -w 4 >/dev/null 2>&1 &
+  pids+=($!)
+done
+conc_ok=true
+for p in "${pids[@]}"; do
+  wait "$p" || conc_ok=false
+done
+src_md5=$(md5sum "$TEST_DIR/conc_src.img" | cut -d' ' -f1)
+for i in 1 2 3 4; do
+  d=$(md5sum "$TEST_DIR/conc_dst_$i.img" 2>/dev/null | cut -d' ' -f1)
+  if [ "$d" != "$src_md5" ]; then
+    conc_ok=false
+    echo "  dst $i differs (got $d)"
+  fi
+done
+if [ "$conc_ok" = true ]; then
+  echo "✓ PASS: all 4 concurrent transfers matched"
+  PASSED_TESTS=$((PASSED_TESTS + 1))
+else
+  echo "✗ FAIL: a concurrent transfer mismatched"
+  FAILED_TESTS=$((FAILED_TESTS + 1))
+  FAILED_TEST_NAMES+=("Concurrent transfers")
+fi
+echo ""
+
+# ==========================================
+# Resume with -s (skip already-synced leading blocks)
+# ==========================================
+# Seed the destination with the source's first 5 blocks, corrupt the rest, then
+# resume from block 5; the result must still match the full source.
+echo "[TEST $((TOTAL_TESTS + 1))] Resume with -s 5"
+TOTAL_TESTS=$((TOTAL_TESTS + 1))
+create_random_file "$TEST_DIR/resume_src.img" 10485760 # 10MB, 1 block (10MB default)
+# use a 1MB block so -s 5 is meaningful
+cp "$TEST_DIR/resume_src.img" "$TEST_DIR/resume_dst.img"
+dd if=/dev/urandom of="$TEST_DIR/resume_dst.img" bs=1M seek=5 count=5 conv=notrunc 2>/dev/null
+"$BSYNC_BIN" -q -b 1048576 -s 5 -f "$TEST_DIR/resume_src.img" -t "$TEST_DIR/resume_dst.img" -w 4 >/dev/null 2>&1
+src_md5=$(md5sum "$TEST_DIR/resume_src.img" | cut -d' ' -f1)
+dst_md5=$(md5sum "$TEST_DIR/resume_dst.img" | cut -d' ' -f1)
+if [ "$src_md5" = "$dst_md5" ]; then
+  echo "✓ PASS: resume produced a matching file"
+  PASSED_TESTS=$((PASSED_TESTS + 1))
+else
+  echo "✗ FAIL: resume mismatch (src $src_md5, dst $dst_md5)"
+  FAILED_TESTS=$((FAILED_TESTS + 1))
+  FAILED_TEST_NAMES+=("Resume with -s")
+fi
+echo ""
+
 echo ""
 echo "=========================================="
 echo "TEST SUMMARY"

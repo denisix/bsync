@@ -395,8 +395,17 @@ func TestCompressZeros(t *testing.T) {
 		t.Fatalf("compressData() error: %v", err)
 	}
 
-	// Zeros should compress well
+	// Zeros must compress to far smaller than the input.
 	if len(compressed) >= len(zeros) {
-		t.Logf("Warning: zeros didn't compress: %d -> %d", len(zeros), len(compressed))
+		t.Errorf("zeros did not compress: %d -> %d", len(zeros), len(compressed))
+	}
+
+	// And must round-trip back to the original zeros.
+	got, err := decompressData(compressed)
+	if err != nil {
+		t.Fatalf("decompressData() error: %v", err)
+	}
+	if !bytes.Equal(got, zeros) {
+		t.Error("zeros round-trip mismatch")
 	}
 }
