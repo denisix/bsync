@@ -108,6 +108,24 @@ func (t *SysfsTuner) GetNomerges() (int, error) {
 	return strconv.Atoi(string(data))
 }
 
+// TuneHDDReadAhead raises the kernel read-ahead window to 4MB for a block
+// device, which lets large sequential transfers stream off a spinning disk
+// instead of being throttled by the ~128KB default. It is best-effort: it only
+// acts on /dev/ block-device paths and silently does nothing when the path is a
+// regular file or the process lacks the privilege to write sysfs (non-root).
+func TuneHDDReadAhead(path string) {
+	if len(path) < 6 || path[:5] != "/dev/" {
+		return
+	}
+	tuner := NewSysfsTuner(path)
+	if prev, err := tuner.GetReadAhead(); err == nil && prev >= 4096 {
+		return // already at/above target
+	}
+	if err := tuner.SetReadAhead(4096); err == nil {
+		Log("tuned read-ahead to 4MB for %s\n", tuner.diskDevice)
+	}
+}
+
 // OptimizeForHDD applies recommended settings for HDD optimization.
 // This is a convenience function that sets all optimal values.
 func (t *SysfsTuner) OptimizeForHDD() error {

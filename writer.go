@@ -22,7 +22,8 @@ import (
 type writeItem struct {
 	blockIdx uint32
 	offset   int64
-	data     []byte // bytes to write at offset (already decompressed/decrypted)
+	data     []byte     // bytes to write at offset (already decompressed/decrypted)
+	done     chan error // non-nil for SubmitAndWait: receives the write result
 }
 
 type writeHeap []writeItem
@@ -47,6 +48,14 @@ type OrderedWriter struct {
 	errMu sync.Mutex
 	err   error
 
+	// syncEvery triggers an asynchronous SyncFileRange writeback once this many
+	// bytes have been written, smoothing kernel writeback instead of letting
+	// dirty pages flush in large bursts. 0 disables periodic syncing.
+	syncEvery  int64
+	syncMinOff int64
+	syncMaxOff int64
+	sinceSync  int64
+
 	wg sync.WaitGroup
 }
 
@@ -62,6 +71,9 @@ func NewOrderedWriter(file *os.File, workers int) *OrderedWriter {
 		file:   file,
 		ch:     make(chan writeItem, window),
 		window: window,
+		// Flush dirty pages roughly every 64MB to keep writeback steady on HDD.
+		syncEvery:  64 * 1024 * 1024,
+		syncMinOff: -1,
 	}
 	ow.wg.Add(1)
 	go ow.run()
@@ -73,32 +85,79 @@ func (ow *OrderedWriter) run() {
 	h := &writeHeap{}
 	heap.Init(h)
 
-	for it := range ow.ch {
-		heap.Push(h, it)
-		// Keep the buffer bounded: once the reorder window is full, flush the
-		// lowest-offset block so writes stay near-sequential and memory stays
-		// bounded.
-		for h.Len() > ow.window {
+	for {
+		// With nothing buffered we must block for the next block (or exit).
+		if h.Len() == 0 {
+			it, ok := <-ow.ch
+			if !ok {
+				return
+			}
+			heap.Push(h, it)
+			continue
+		}
+
+		select {
+		case it, ok := <-ow.ch:
+			if !ok {
+				// Channel closed: drain remaining blocks in ascending order.
+				for h.Len() > 0 {
+					ow.writeOne(heap.Pop(h).(writeItem))
+				}
+				return
+			}
+			heap.Push(h, it)
+			// While input keeps flowing, buffer up to the reorder window so the
+			// flushed stream stays near-sequential; flush the smallest once full.
+			for h.Len() > ow.window {
+				ow.writeOne(heap.Pop(h).(writeItem))
+			}
+		default:
+			// No input ready. Senders that use SubmitAndWait are blocked until
+			// their block is written, so we must make progress instead of
+			// waiting for the window to fill (which would deadlock). Flush the
+			// lowest-offset buffered block.
 			ow.writeOne(heap.Pop(h).(writeItem))
 		}
-	}
-
-	// Channel closed: drain remaining blocks in ascending order.
-	for h.Len() > 0 {
-		ow.writeOne(heap.Pop(h).(writeItem))
 	}
 }
 
 func (ow *OrderedWriter) writeOne(it writeItem) {
-	if ow.Err() != nil {
+	err := ow.Err()
+	if err == nil {
+		if _, werr := ow.file.WriteAt(it.data, it.offset); werr != nil {
+			ow.errMu.Lock()
+			if ow.err == nil {
+				ow.err = werr
+			}
+			err = ow.err
+			ow.errMu.Unlock()
+		} else {
+			ow.maybeSync(it.offset, int64(len(it.data)))
+		}
+	}
+	if it.done != nil {
+		it.done <- err
+	}
+}
+
+// maybeSync issues a best-effort asynchronous writeback once enough bytes have
+// accumulated, covering the offset range written since the last sync.
+func (ow *OrderedWriter) maybeSync(offset, n int64) {
+	if ow.syncEvery <= 0 {
 		return
 	}
-	if _, err := ow.file.WriteAt(it.data, it.offset); err != nil {
-		ow.errMu.Lock()
-		if ow.err == nil {
-			ow.err = err
-		}
-		ow.errMu.Unlock()
+	if ow.syncMinOff < 0 || offset < ow.syncMinOff {
+		ow.syncMinOff = offset
+	}
+	if end := offset + n; end > ow.syncMaxOff {
+		ow.syncMaxOff = end
+	}
+	ow.sinceSync += n
+	if ow.sinceSync >= ow.syncEvery {
+		SyncFileRange(ow.file, ow.syncMinOff, ow.syncMaxOff-ow.syncMinOff, SyncFileRangeWrite)
+		ow.sinceSync = 0
+		ow.syncMinOff = -1
+		ow.syncMaxOff = 0
 	}
 }
 
@@ -107,6 +166,18 @@ func (ow *OrderedWriter) writeOne(it writeItem) {
 // in the destination file.
 func (ow *OrderedWriter) Submit(blockIdx uint32, offset int64, data []byte) {
 	ow.ch <- writeItem{blockIdx: blockIdx, offset: offset, data: data}
+}
+
+// SubmitAndWait queues a block and blocks until it has been durably written
+// (or a prior write error is observed), returning the write result. This lets
+// concurrent callers preserve a per-block acknowledgement contract while still
+// having their scattered writes serialized into a near-sequential stream by the
+// single writer goroutine. data is only read before this call returns, so the
+// caller may safely reuse the buffer afterwards.
+func (ow *OrderedWriter) SubmitAndWait(blockIdx uint32, offset int64, data []byte) error {
+	done := make(chan error, 1)
+	ow.ch <- writeItem{blockIdx: blockIdx, offset: offset, data: data, done: done}
+	return <-done
 }
 
 // Err returns the first write error encountered, if any.

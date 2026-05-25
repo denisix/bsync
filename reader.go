@@ -79,23 +79,24 @@ func (sr *SequentialReader) Start() {
 		defer sr.wg.Done()
 		defer close(sr.blockChan)
 
-		buf := getReaderBuf(sr.blockSize)
-		defer putReaderBuf(buf)
-
 		for blockIdx := sr.skipIdx; blockIdx <= sr.lastBlockNum; blockIdx++ {
-			// Read block sequentially
+			// Read each block directly into its own buffer. The buffer is handed
+			// off on the channel, so reading straight into it (instead of into a
+			// shared scratch buffer and then copying) saves a full block-sized
+			// memcpy per block.
 			offset := int64(blockIdx) * int64(sr.blockSize)
+			buf := getReaderBuf(sr.blockSize)
 			n, err := sr.file.ReadAt(buf, offset)
 			if err != nil && err != io.EOF {
 				Log("sequential reader error reading block %d: %s\n", blockIdx, err)
 				return
 			}
 
-			// Copy data and push to channel
-			dataCopy := make([]byte, n)
-			copy(dataCopy, buf[:n])
+			// We won't read this source range again; drop its clean page-cache
+			// pages so a large transfer doesn't evict useful read-ahead pages.
+			AdviseDontNeed(sr.file, offset, int64(n))
 
-			sr.blockChan <- BlockData{BlockIdx: blockIdx, Data: dataCopy}
+			sr.blockChan <- BlockData{BlockIdx: blockIdx, Data: buf[:n]}
 		}
 	}()
 }

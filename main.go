@@ -128,6 +128,7 @@ func main() {
 			}
 			defer srcFile.Close()
 			AdviseSequential(srcFile) // Optimise for sequential access
+			TuneHDDReadAhead(device)  // Raise HDD read-ahead (best-effort)
 			dstDir = "/tmp"           // Default temp directory
 		} else {
 			// Auto-tuning not supported in server/download modes yet
@@ -239,7 +240,8 @@ func main() {
 				return
 			}
 			defer file.Close()
-			AdviseSequential(file) // Optimise for sequential access
+			AdviseSequential(file)   // Optimise for sequential access
+			TuneHDDReadAhead(device) // Raise HDD read-ahead (best-effort)
 
 			if err := startClientDownload(file, remoteAddr, uint32(skipIdx), blockSize, noCompress, int(workers)); err != nil {
 				Err("download failed: %s\n", err)
@@ -279,7 +281,8 @@ func main() {
 				return
 			}
 			defer file.Close()
-			AdviseSequential(file) // Optimise for sequential access
+			AdviseSequential(file)   // Optimise for sequential access
+			TuneHDDReadAhead(device) // Raise HDD read-ahead (best-effort)
 
 			fileSize := getDeviceSize(file)
 			checksumCache := NewChecksumCache(0)
@@ -311,7 +314,8 @@ func main() {
 				return
 			}
 			defer file.Close()
-			AdviseSequential(file) // Optimise for sequential access
+			AdviseSequential(file)   // Optimise for sequential access
+			TuneHDDReadAhead(device) // Raise HDD read-ahead (best-effort)
 
 			fileSize := getDeviceSize(file)
 			checksumCache := NewChecksumCache(0)
@@ -334,7 +338,8 @@ func main() {
 				return
 			}
 			defer file.Close()
-			AdviseSequential(file) // Optimise for sequential access
+			AdviseSequential(file)   // Optimise for sequential access
+			TuneHDDReadAhead(device) // Raise HDD read-ahead (best-effort)
 
 			// The sender's first request defines the block size. Hash blocks
 			// on request after negotiation rather than caching with a local default.

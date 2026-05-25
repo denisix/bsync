@@ -192,7 +192,7 @@ func TestFaultServerRejectsContradictoryUploadMessages(t *testing.T) {
 			defer file.Close()
 			server, client := net.Pipe()
 			errCh := make(chan error, 1)
-			go func() { errCh <- serverHandleReq(server, file, NewChecksumCache(0)) }()
+			go func() { errCh <- serverHandleReq(server, file, NewChecksumCache(0), nil) }()
 			bad.MagicHead = stringToFixedSizeArray(magicHead)
 			writeTestMsg(t, client, bad)
 			client.Close()
@@ -247,7 +247,7 @@ func TestFaultServerRejectsUnsolicitedOrChangedUploadWrite(t *testing.T) {
 			defer file.Close()
 			server, client := net.Pipe()
 			errCh := make(chan error, 1)
-			go func() { errCh <- serverHandleReq(server, file, NewChecksumCache(0)) }()
+			go func() { errCh <- serverHandleReq(server, file, NewChecksumCache(0), nil) }()
 			for _, msg := range messages {
 				msg.MagicHead = stringToFixedSizeArray(magicHead)
 				writeTestMsg(t, client, msg)

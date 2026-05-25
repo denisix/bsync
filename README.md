@@ -223,8 +223,9 @@ directory under `/tmp` on the remote host; exercises `-t` uploads and
 downloads with default, explicit-level, disabled, and encrypted compression,
 multiple workers, zero-block overwrites, empty-file truncation, and `-s`
 resume behavior. It also covers quoted remote paths, concurrent moderate-size
-traffic, remote executable cleanup, and removes the temporary artifacts it
-creates.
+traffic, remote executable cleanup, and verifies transfer correctness with
+checksums for uploads and byte-for-byte comparisons for downloads before
+removing the temporary artifacts it creates.
 
 ## 📊 Performance Tips
 
@@ -272,11 +273,15 @@ creates.
 ### I/O Optimizations
 
 - **Sequential Advice**: Uses Linux sequential-access advice for opened transfer files
-- **Sequential Reader**: Reads source blocks in order and prefetches into a bounded queue
+- **Sequential Reader**: Reads source blocks in order, directly into the buffer that is handed downstream (no extra per-block copy), and prefetches into a bounded queue
+- **Read-Ahead Tuning**: Best-effort raises the kernel read-ahead window to 4MB for block-device endpoints; silently skipped on regular files or without root
+- **Cache Hygiene**: Advises the kernel to drop already-read source pages (`POSIX_FADV_DONTNEED`) so large transfers don't evict useful read-ahead pages
 
 ### HDD-Friendly Design
 
 - **Prefetch Window**: Configurable prefetch depth allows overlapping I/O and computation
+- **Ordered Writes**: Destination writes from all concurrent connection handlers are serialized through a single writer into a near-sequential, offset-ordered stream, so a spinning destination disk avoids seek thrashing under `-w > 1` (per-block write acknowledgement is preserved)
+- **Steady Writeback**: Periodic `sync_file_range` writeback keeps dirty pages flushing smoothly instead of in large bursts
 
 ### Network Optimizations
 

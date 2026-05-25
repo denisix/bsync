@@ -108,7 +108,19 @@ func writeBlock(file *os.File, data []byte, offset int64) error {
 	return nil
 }
 
-func serverHandleReq(conn net.Conn, file *os.File, _ *ChecksumCache) error {
+// writeDestBlock routes a destination write through the shared OrderedWriter
+// (which serializes the scattered writes of concurrent connection handlers into
+// a near-sequential, HDD-friendly stream) when one is available, otherwise it
+// writes directly. SubmitAndWait blocks until the block is durably written, so
+// the per-block acknowledgement contract is preserved.
+func writeDestBlock(ow *OrderedWriter, file *os.File, blockIdx uint32, data []byte, offset int64) error {
+	if ow != nil {
+		return ow.SubmitAndWait(blockIdx, offset, data)
+	}
+	return writeBlock(file, data, offset)
+}
+
+func serverHandleReq(conn net.Conn, file *os.File, _ *ChecksumCache, ow *OrderedWriter) error {
 	defer conn.Close()
 
 	if tc, ok := conn.(*net.TCPConn); ok {
@@ -206,7 +218,7 @@ func serverHandleReq(conn net.Conn, file *os.File, _ *ChecksumCache) error {
 
 		// Handle zero blocks (Zero=true, DataSize=0) - no data sent
 		if msg.Zero && msg.DataSize == 0 {
-			if err := writeBlock(file, getZeroBuf(int(expectedSize)), offset); err != nil {
+			if err := writeDestBlock(ow, file, msg.BlockIdx, getZeroBuf(int(expectedSize)), offset); err != nil {
 				return fmt.Errorf("write zero block %d: %w", msg.BlockIdx, err)
 			}
 			serverPrintStats(msg.BlockIdx, ".", 0)
@@ -270,7 +282,7 @@ func serverHandleReq(conn net.Conn, file *os.File, _ *ChecksumCache) error {
 			if uint32(len(payload)) != expectedSize {
 				return fmt.Errorf("block %d has invalid decoded size %d", msg.BlockIdx, len(payload))
 			}
-			if err := writeBlock(file, payload, offset); err != nil {
+			if err := writeDestBlock(ow, file, msg.BlockIdx, payload, offset); err != nil {
 				return fmt.Errorf("write block %d: %w", msg.BlockIdx, err)
 			}
 			indicator := "w"
@@ -299,6 +311,12 @@ func startServer(file *os.File, bindIp, port string, checksumCache *ChecksumCach
 	defer listener.Close()
 
 	Log("READY, listening on %s\n", bindTo)
+
+	// One shared ordered writer serializes the scattered WriteAt calls of all
+	// concurrent connection handlers into a near-sequential stream, which keeps
+	// a spinning destination disk running at full write speed under -w > 1.
+	ow := NewOrderedWriter(file, workers)
+	defer ow.Close()
 
 	// Context for cancellation
 	ctx, cancel := context.WithCancel(context.Background())
@@ -349,7 +367,7 @@ func startServer(file *os.File, bindIp, port string, checksumCache *ChecksumCach
 			atomic.AddInt64(&activeConns, 1)
 			go func(c net.Conn) {
 				defer atomic.AddInt64(&activeConns, -1)
-				handlerErr := serverHandleReq(c, file, checksumCache)
+				handlerErr := serverHandleReq(c, file, checksumCache, ow)
 				if handlerErr != nil {
 					select {
 					case handlerErrChan <- handlerErr:
