@@ -4,10 +4,26 @@ set -euo pipefail
 
 BSYNC_BIN="${BSYNC_BIN:-./bsync}"
 REMOTE="${REMOTE:-}"
-BLOCK_SIZE=4096
-BLOCK_COUNT=6
-SKIP_BLOCKS=2
-STRESS_BLOCK_SIZE=65536
+
+# Matrix dimensions. Every transfer is verified by checksum (uploads, server
+# side) or byte-for-byte compare (downloads) so a single wrong byte fails fast.
+WORKERS=(1 2 4 8)
+DEFAULT_BS=65536
+BLOCK_SIZES=(4096 65536 1048576)
+PATTERNS=(zero ff mixed unaligned)
+# Representative subset used to sweep block sizes and compression/encryption
+# modes without exploding the full matrix.
+SWEEP_PATTERNS=(mixed unaligned)
+SWEEP_BLOCK_SIZES=(4096 1048576)
+# "label|flags" — flags are word-split intentionally when passed to bsync.
+MODES=(
+  "default|"
+  "no-compression|-n"
+  "fast|-L fast"
+  "best|-L best"
+  "encrypted|-e"
+  "enc-nocomp|-e -n"
+)
 
 if [ -z "$REMOTE" ]; then
   echo "usage: REMOTE=user@host BSYNC_BIN=/path/to/bsync bash ./test_remote_ssh.sh" >&2
@@ -36,6 +52,10 @@ cleanup() {
 }
 trap cleanup EXIT
 
+ssh_remote() {
+  ssh -o BatchMode=yes -o ConnectTimeout=10 "$REMOTE" "$@"
+}
+
 run_transfer() {
   "$BSYNC_BIN" "$@" &
   local transfer_pid=$!
@@ -47,130 +67,201 @@ run_transfer() {
 assert_no_remote_binary() {
   local transfer_pid=$1
   local orphan
-  orphan=$(ssh -o BatchMode=yes -o ConnectTimeout=10 "$REMOTE" \
-    "find /tmp -maxdepth 1 -name 'bsync-$transfer_pid-*' -print -quit")
+  orphan=$(ssh_remote "find /tmp -maxdepth 1 -name 'bsync-$transfer_pid-*' -print -quit")
   if [ -n "$orphan" ]; then
     echo "remote executable was not removed: $orphan" >&2
     exit 1
   fi
 }
 
-src="$local_dir/source.img"
-empty_src="$local_dir/empty-source.img"
-resume_expected="$local_dir/resume-expected.img"
-
 remote_hash() {
-  ssh -o BatchMode=yes -o ConnectTimeout=10 "$REMOTE" "sha256sum '$1'" | cut -d' ' -f1
+  ssh_remote "sha256sum '$1'" | cut -d' ' -f1
 }
 
+# Pre-fill a remote/local destination with non-zero (0xFF) bytes so each test
+# proves bsync overwrites stale data and clears zero ranges.
 seed_remote_nonzero() {
-  ssh -o BatchMode=yes -o ConnectTimeout=10 "$REMOTE" \
-    "dd if=/dev/zero bs=$BLOCK_SIZE count=$BLOCK_COUNT 2>/dev/null | tr '\\000' '\\377' > '$1'"
+  ssh_remote "head -c $2 /dev/zero | tr '\\000' '\\377' > '$1'"
 }
 
 seed_local_nonzero() {
-  dd if=/dev/zero bs="$BLOCK_SIZE" count="$BLOCK_COUNT" 2>/dev/null | tr '\000' '\377' > "$1"
-}
-
-assert_remote_equals_source() {
-  local destination=$1
-  assert_remote_equals_file "$src" "$destination"
+  head -c "$2" /dev/zero | tr '\000' '\377' > "$1"
 }
 
 assert_remote_equals_file() {
-  local source=$1
-  local destination=$2
-  local source_hash destination_hash
+  local source=$1 destination=$2 source_hash destination_hash
   source_hash=$(sha256sum "$source" | cut -d' ' -f1)
   destination_hash=$(remote_hash "$destination")
   if [ "$source_hash" != "$destination_hash" ]; then
-    echo "remote upload mismatch: source=$source_hash destination=$destination_hash" >&2
+    echo "remote upload mismatch: dst=$destination source=$source_hash destination=$destination_hash" >&2
     exit 1
   fi
 }
 
-assert_local_equals_source() {
-  local destination=$1
-  assert_local_equals_file "$src" "$destination"
-}
-
 assert_local_equals_file() {
-  local source=$1
-  local destination=$2
+  local source=$1 destination=$2
   if ! cmp -s "$source" "$destination"; then
     echo "remote download mismatch: $destination" >&2
     exit 1
   fi
 }
 
-run_upload_case() {
-  local name=$1
-  shift
-  local destination="$remote_dir/upload-$name.img"
-  echo "Running SSH upload: $name"
-  seed_remote_nonzero "$destination"
-  run_transfer -q -b "$BLOCK_SIZE" -f "$src" -t "$REMOTE:$destination" "$@"
-  assert_remote_equals_source "$destination"
+# Block count scaled per block size: small blocks get more blocks, large blocks
+# fewer, keeping fixtures multi-block but bounded in total size.
+blocks_for_bs() {
+  case "$1" in
+    4096) echo 16 ;;
+    65536) echo 8 ;;
+    *) echo 4 ;;
+  esac
 }
 
-run_download_case() {
-  local name=$1
-  shift
-  local destination="$local_dir/download-$name.img"
-  echo "Running SSH download: $name"
-  seed_local_nonzero "$destination"
-  run_transfer -q -d -b "$BLOCK_SIZE" -f "$destination" -t "$REMOTE:$remote_source" "$@"
-  assert_local_equals_source "$destination"
+# make_pattern <file> <pattern> <block_size> <block_count>
+make_pattern() {
+  local file=$1 pattern=$2 bs=$3 count=$4 idx
+  case "$pattern" in
+    zero)
+      head -c $((bs * count)) /dev/zero > "$file"
+      ;;
+    ff)
+      head -c $((bs * count)) /dev/zero | tr '\000' '\377' > "$file"
+      ;;
+    mixed)
+      dd if=/dev/urandom of="$file" bs="$bs" count="$count" status=none
+      # Zero out even-indexed blocks to exercise zero-omission and clearing.
+      idx=0
+      while [ "$idx" -lt "$count" ]; do
+        dd if=/dev/zero of="$file" bs="$bs" seek="$idx" count=1 conv=notrunc status=none
+        idx=$((idx + 2))
+      done
+      ;;
+    unaligned)
+      make_pattern "$file" mixed "$bs" "$count"
+      # Append a partial trailing block so the file size is not a block multiple.
+      dd if=/dev/urandom bs=$((bs / 2)) count=1 status=none >> "$file"
+      ;;
+    *)
+      echo "unknown pattern: $pattern" >&2
+      exit 2
+      ;;
+  esac
+}
+
+# Generate each fixture once and reuse it. This is called via command
+# substitution ($(get_local_fixture ...)), which runs in a subshell, so an
+# in-memory cache (associative array) set here would NOT persist to the parent
+# and make_pattern would re-run on every call, producing fresh random content
+# each time. Cache by file existence instead, which survives across subshells.
+get_local_fixture() {
+  local pattern=$1 bs=$2 f="$local_dir/fix-$pattern-$bs.img"
+  if [ ! -f "$f" ]; then
+    make_pattern "$f" "$pattern" "$bs" "$(blocks_for_bs "$bs")"
+  fi
+  printf '%s' "$f"
+}
+
+# Upload a verified remote source fixture once per (pattern, block size) and
+# reuse it as the source for all download profiles.
+declare -A remote_src_path
+declare -A remote_src_local
+prepare_remote_source() {
+  local pattern=$1 bs=$2 key="$pattern.$bs" lf rf
+  if [ -n "${remote_src_path[$key]:-}" ]; then return; fi
+  lf=$(get_local_fixture "$pattern" "$bs")
+  rf="$remote_dir/srcfix-$pattern-$bs.img"
+  run_transfer -q -b "$bs" -w 2 -f "$lf" -t "$REMOTE:$rf"
+  assert_remote_equals_file "$lf" "$rf"
+  remote_src_path[$key]="$rf"
+  remote_src_local[$key]="$lf"
+}
+
+# do_upload <label> <pattern> <bs> <workers> [flags...]
+do_upload() {
+  local label=$1 pattern=$2 bs=$3 w=$4; shift 4
+  local flags="$*" f bytes dst
+  f=$(get_local_fixture "$pattern" "$bs")
+  bytes=$(stat -c%s "$f")
+  dst="$remote_dir/up-$label.img"
+  echo "Running SSH upload: $label"
+  seed_remote_nonzero "$dst" $((bytes + bs))
+  # shellcheck disable=SC2086
+  run_transfer -q -b "$bs" -w "$w" -f "$f" -t "$REMOTE:$dst" $flags
+  assert_remote_equals_file "$f" "$dst"
+}
+
+# do_download <label> <pattern> <bs> <workers> [flags...]
+do_download() {
+  local label=$1 pattern=$2 bs=$3 w=$4; shift 4
+  local flags="$*" key="$pattern.$bs" rf lf bytes dst
+  prepare_remote_source "$pattern" "$bs"
+  rf="${remote_src_path[$key]}"
+  lf="${remote_src_local[$key]}"
+  bytes=$(stat -c%s "$lf")
+  dst="$local_dir/dl-$label.img"
+  echo "Running SSH download: $label"
+  seed_local_nonzero "$dst" $((bytes + bs))
+  # shellcheck disable=SC2086
+  run_transfer -q -d -b "$bs" -w "$w" -f "$dst" -t "$REMOTE:$rf" $flags
+  assert_local_equals_file "$lf" "$dst"
 }
 
 echo "Checking SSH access to $REMOTE"
-ssh -o BatchMode=yes -o ConnectTimeout=10 "$REMOTE" "mkdir -p '$remote_dir'"
+ssh_remote "mkdir -p '$remote_dir'"
 
-# Alternate zero and random blocks so pre-filled destinations test zero clearing.
-dd if=/dev/urandom of="$src" bs="$BLOCK_SIZE" count="$BLOCK_COUNT" status=none
-dd if=/dev/zero of="$src" bs="$BLOCK_SIZE" count=1 conv=notrunc status=none
-dd if=/dev/zero of="$src" bs="$BLOCK_SIZE" seek=2 count=1 conv=notrunc status=none
-dd if=/dev/zero of="$src" bs="$BLOCK_SIZE" seek=4 count=1 conv=notrunc status=none
+# --- Grid A: every data pattern x every worker count, default block size/mode.
+for pattern in "${PATTERNS[@]}"; do
+  for w in "${WORKERS[@]}"; do
+    do_upload "A-$pattern-w$w" "$pattern" "$DEFAULT_BS" "$w"
+    do_download "A-$pattern-w$w" "$pattern" "$DEFAULT_BS" "$w"
+  done
+done
 
-# Upload profiles exercise the local SSH sender's compression and encryption.
-run_upload_case default-compression -w 1
-run_upload_case no-compression -n -w 2
-run_upload_case compression-fast -L fast -w 2
-run_upload_case compression-better -L better -w 2
-run_upload_case compression-best -L best -w 2
-run_upload_case encrypted-compression -e -w 2
-run_upload_case encrypted-no-compression -e -n -w 2
+# --- Grid B: block-size sweep on representative patterns x every worker count.
+for pattern in "${SWEEP_PATTERNS[@]}"; do
+  for bs in "${SWEEP_BLOCK_SIZES[@]}"; do
+    for w in "${WORKERS[@]}"; do
+      do_upload "B-$pattern-bs$bs-w$w" "$pattern" "$bs" "$w"
+      do_download "B-$pattern-bs$bs-w$w" "$pattern" "$bs" "$w"
+    done
+  done
+done
 
-# Paths containing spaces and shell punctuation prove SSH command arguments
-# arrive as path data rather than being interpreted by the remote shell.
+# --- Grid C: compression/encryption mode sweep x every worker count.
+for entry in "${MODES[@]}"; do
+  mode_label="${entry%%|*}"
+  mode_flags="${entry#*|}"
+  for pattern in "${SWEEP_PATTERNS[@]}"; do
+    for w in "${WORKERS[@]}"; do
+      do_upload "C-$mode_label-$pattern-w$w" "$pattern" "$DEFAULT_BS" "$w" $mode_flags
+      do_download "C-$mode_label-$pattern-w$w" "$pattern" "$DEFAULT_BS" "$w" $mode_flags
+    done
+  done
+done
+
+# --- Quoted path: punctuation/spaces must arrive as path data, not shell input.
+quoted_fixture=$(get_local_fixture mixed "$DEFAULT_BS")
+quoted_bytes=$(stat -c%s "$quoted_fixture")
 quoted_remote_dst="$remote_dir/upload with spaces;still-data.img"
 echo "Running SSH upload: quoted-remote-path"
-seed_remote_nonzero "$quoted_remote_dst"
-run_transfer -q -b "$BLOCK_SIZE" -f "$src" -t "$REMOTE:$quoted_remote_dst" -L fast -w 2
-assert_remote_equals_source "$quoted_remote_dst"
+seed_remote_nonzero "$quoted_remote_dst" $((quoted_bytes + DEFAULT_BS))
+run_transfer -q -b "$DEFAULT_BS" -w 2 -f "$quoted_fixture" -t "$REMOTE:$quoted_remote_dst" -L fast
+assert_remote_equals_file "$quoted_fixture" "$quoted_remote_dst"
 
-# Keep a verified remote fixture as the source for all download profiles.
-run_upload_case download-source -e -w 2
-remote_source="$remote_dir/upload-download-source.img"
-
-# Download profiles exercise the SSH-launched sender, including forwarded -L.
-run_download_case default-compression -w 1
-run_download_case no-compression -n -w 2
-run_download_case compression-fast -L fast -w 2
-run_download_case compression-better -L better -w 2
-run_download_case compression-best -L best -w 2
-run_download_case encrypted-compression -e -w 2
-run_download_case encrypted-no-compression -e -n -w 2
-
-# Resume tests intentionally preserve the skipped FF prefix and transfer only
-# the suffix. Matching this expected output proves -s is applied remotely.
-seed_local_nonzero "$resume_expected"
-dd if="$src" of="$resume_expected" bs="$BLOCK_SIZE" skip="$SKIP_BLOCKS" seek="$SKIP_BLOCKS" conv=notrunc status=none
+# --- Resume (-s): skipped prefix is preserved, only the suffix is transferred.
+RBS=4096
+RCOUNT=6
+RSKIP=2
+resume_src="$local_dir/resume-src.img"
+resume_expected="$local_dir/resume-expected.img"
+make_pattern "$resume_src" mixed "$RBS" "$RCOUNT"
+resume_bytes=$(stat -c%s "$resume_src")
+seed_local_nonzero "$resume_expected" "$resume_bytes"
+dd if="$resume_src" of="$resume_expected" bs="$RBS" skip="$RSKIP" seek="$RSKIP" conv=notrunc status=none
 
 upload_resume_dst="$remote_dir/upload-resume.img"
 echo "Running SSH upload: resume-skip"
-seed_remote_nonzero "$upload_resume_dst"
-run_transfer -q -b "$BLOCK_SIZE" -s "$SKIP_BLOCKS" -w 2 -f "$src" -t "$REMOTE:$upload_resume_dst"
+seed_remote_nonzero "$upload_resume_dst" "$resume_bytes"
+run_transfer -q -b "$RBS" -s "$RSKIP" -w 2 -f "$resume_src" -t "$REMOTE:$upload_resume_dst"
 expected_hash=$(sha256sum "$resume_expected" | cut -d' ' -f1)
 resume_hash=$(remote_hash "$upload_resume_dst")
 if [ "$expected_hash" != "$resume_hash" ]; then
@@ -178,21 +269,27 @@ if [ "$expected_hash" != "$resume_hash" ]; then
   exit 1
 fi
 
+# Upload a verified remote copy of the resume source to download from.
+remote_resume_source="$remote_dir/resume-source.img"
+run_transfer -q -b "$RBS" -w 2 -f "$resume_src" -t "$REMOTE:$remote_resume_source"
+assert_remote_equals_file "$resume_src" "$remote_resume_source"
+
 download_resume_dst="$local_dir/download-resume.img"
 echo "Running SSH download: resume-skip"
-seed_local_nonzero "$download_resume_dst"
-run_transfer -q -d -b "$BLOCK_SIZE" -s "$SKIP_BLOCKS" -w 2 -f "$download_resume_dst" -t "$REMOTE:$remote_source"
+seed_local_nonzero "$download_resume_dst" "$resume_bytes"
+run_transfer -q -d -b "$RBS" -s "$RSKIP" -w 2 -f "$download_resume_dst" -t "$REMOTE:$remote_resume_source"
 if ! cmp -s "$resume_expected" "$download_resume_dst"; then
   echo "remote download resume mismatch" >&2
   exit 1
 fi
 
-# Empty-file transfers must truncate existing data through both SSH directions.
+# --- Empty source: must truncate an existing destination in both directions.
+empty_src="$local_dir/empty-source.img"
 : > "$empty_src"
 empty_remote_dst="$remote_dir/upload-empty.img"
 echo "Running SSH upload: empty-source"
-seed_remote_nonzero "$empty_remote_dst"
-run_transfer -q -e -b "$BLOCK_SIZE" -f "$empty_src" -t "$REMOTE:$empty_remote_dst"
+seed_remote_nonzero "$empty_remote_dst" "$DEFAULT_BS"
+run_transfer -q -e -b "$DEFAULT_BS" -f "$empty_src" -t "$REMOTE:$empty_remote_dst"
 if [ "$(remote_hash "$empty_remote_dst")" != "$(sha256sum "$empty_src" | cut -d' ' -f1)" ]; then
   echo "remote empty upload did not truncate destination" >&2
   exit 1
@@ -200,26 +297,28 @@ fi
 
 empty_download_dst="$local_dir/download-empty.img"
 echo "Running SSH download: empty-source"
-seed_local_nonzero "$empty_download_dst"
-run_transfer -q -e -d -b "$BLOCK_SIZE" -f "$empty_download_dst" -t "$REMOTE:$empty_remote_dst"
+seed_local_nonzero "$empty_download_dst" "$DEFAULT_BS"
+run_transfer -q -e -d -b "$DEFAULT_BS" -f "$empty_download_dst" -t "$REMOTE:$empty_remote_dst"
 if [ -s "$empty_download_dst" ]; then
   echo "remote empty download did not truncate destination" >&2
   exit 1
 fi
 
-# Moderate concurrent transfers exercise automatic per-process port selection,
-# copied binary lifetime, larger payload boundaries, and simultaneous SSH work.
+# --- Concurrent transfers: per-process port selection, copied-binary lifetime,
+# larger payload boundaries, and simultaneous SSH work under multiple workers.
+STRESS_BLOCK_SIZE=65536
 stress_src="$local_dir/stress-source.img"
 dd if=/dev/urandom of="$stress_src" bs=1M count=8 status=none
 dd if=/dev/zero of="$stress_src" bs="$STRESS_BLOCK_SIZE" seek=10 count=6 conv=notrunc status=none
 truncate -s 8388731 "$stress_src"
 stress_flags=("" "-n" "-L fast" "-e -n")
+stress_workers=(1 2 4 4)
 pids=()
 echo "Running SSH uploads: concurrent-stress"
 for i in "${!stress_flags[@]}"; do
   destination="$remote_dir/stress-upload-$i.img"
   # shellcheck disable=SC2086
-  "$BSYNC_BIN" -q -b "$STRESS_BLOCK_SIZE" -w 2 -f "$stress_src" -t "$REMOTE:$destination" ${stress_flags[$i]} &
+  "$BSYNC_BIN" -q -b "$STRESS_BLOCK_SIZE" -w "${stress_workers[$i]}" -f "$stress_src" -t "$REMOTE:$destination" ${stress_flags[$i]} &
   transfer_pid=$!
   pids+=("$transfer_pid")
   remote_bin_pids+=("$transfer_pid")
@@ -236,7 +335,7 @@ echo "Running SSH downloads: concurrent-stress"
 for i in "${!stress_flags[@]}"; do
   destination="$local_dir/stress-download-$i.img"
   # shellcheck disable=SC2086
-  "$BSYNC_BIN" -q -d -b "$STRESS_BLOCK_SIZE" -w 2 -f "$destination" -t "$REMOTE:$remote_stress_source" ${stress_flags[$i]} &
+  "$BSYNC_BIN" -q -d -b "$STRESS_BLOCK_SIZE" -w "${stress_workers[$i]}" -f "$destination" -t "$REMOTE:$remote_stress_source" ${stress_flags[$i]} &
   transfer_pid=$!
   pids+=("$transfer_pid")
   remote_bin_pids+=("$transfer_pid")

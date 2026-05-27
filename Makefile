@@ -1,6 +1,6 @@
 all:
 	CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o bsync
-	upx --best bsync
+	-upx --best bsync || true
 
 test:
 	go test -v ./...
@@ -33,7 +33,7 @@ test-remote:
 # Windows cross-compile (run from Linux: requires GOOS=windows)
 windows:
 	GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o bsync.exe
-	upx --best bsync.exe
+	-upx --best bsync.exe || true
 
 clean:
 	rm -f bsync

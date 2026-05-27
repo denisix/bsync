@@ -11,7 +11,7 @@
 - **Compression**: Built-in zstd compression with configurable levels (fast/default/better/best)
 - **Encryption**: Optional ChaCha20-Poly1305 encryption for SSH-automated transfers
 - **SSH Integration**: Automatic remote server deployment via SSH
-- **Multi-worker Support**: Parallel processing with HDD-friendly sequential reads
+- **Multi-worker Support**: Parallel processing with HDD-friendly sequential source reads and ordered destination writes
 - **Resume Capability**: Skip blocks to resume interrupted transfers
 - **Progress Monitoring**: Real-time transfer progress with speed and ETA on both sender and receiver
 - **Download Mode**: Transfer from server to client (reverse direction)
@@ -22,9 +22,10 @@
 
 ```bash
 make          # Linux binary
+make windows  # Windows binary (bsync.exe)
 ```
 
-Copy the `bsync` binary to your source and destination servers.
+Copy the `bsync` binary (Linux) or `bsync.exe` (Windows) to your source and destination servers. Both binaries must be built from the same source commit for protocol compatibility.
 
 ## 📖 Usage
 
@@ -219,13 +220,25 @@ make test-remote REMOTE=cloud@IP
 ```
 
 The remote test requires non-interactive SSH authentication. It uses a unique
-directory under `/tmp` on the remote host; exercises `-t` uploads and
-downloads with default, explicit-level, disabled, and encrypted compression,
-multiple workers, zero-block overwrites, empty-file truncation, and `-s`
-resume behavior. It also covers quoted remote paths, concurrent moderate-size
-traffic, remote executable cleanup, and verifies transfer correctness with
-checksums for uploads and byte-for-byte comparisons for downloads before
-removing the temporary artifacts it creates.
+directory under `/tmp` on the remote host and drives a broad `-t` upload and
+download matrix:
+
+- **Worker counts** `1`, `2`, `4`, and `8`.
+- **Block sizes** spanning small (4 KB), medium (64 KB), and large (1 MB).
+- **Data patterns**: all-zero (fully sparse), all-`0xFF` (fully solid),
+  random with interleaved zero blocks, and non-block-aligned files with a
+  partial trailing block.
+- **Modes**: default, disabled (`-n`), explicit-level (`-L fast`/`-L best`),
+  and encrypted (`-e`, `-e -n`) compression.
+
+Every matrix case pre-fills the destination with non-zero data first, so each
+transfer also proves stale-data overwrite and zero-range clearing. It
+additionally covers quoted/punctuated remote paths, `-s` resume behavior,
+empty-file truncation in both directions, concurrent multi-worker traffic, and
+remote executable cleanup. Correctness is verified on **every** case by
+comparing source and destination checksums on the server for uploads and
+byte-for-byte comparisons for downloads, before removing the temporary
+artifacts it creates.
 
 ## 📊 Performance Tips
 
@@ -239,7 +252,8 @@ removing the temporary artifacts it creates.
 
 ### Worker Count
 
-- **HDD**: Use `-w 1` (default) - sequential reads prevent head thrashing
+- **HDD source**: Use `-w 1` (default) - the sequential reader avoids head thrashing when reading the source
+- **HDD destination**: Higher worker counts are safe - concurrent writes are serialized into a near-sequential stream by the ordered writer, so the destination disk does not seek-thrash
 - **SSD/NVMe**: Use `-w 4` to `-w 8` - parallel I/O beneficial
 - **Multiple Devices**: Worker count should match device count for optimal throughput
 
