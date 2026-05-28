@@ -11,6 +11,7 @@ var (
 	kernel32                         = syscall.NewLazyDLL("kernel32.dll")
 	procGetStdHandle                 = kernel32.NewProc("GetStdHandle")
 	procGetConsoleScreenBufferInfoEx = kernel32.NewProc("GetConsoleScreenBufferInfoEx")
+	procGetConsoleScreenBufferInfo   = kernel32.NewProc("GetConsoleScreenBufferInfo")
 )
 
 const stdOutputHandle = ^uintptr(10) // uintptr(-11) for STD_OUTPUT_HANDLE
@@ -32,6 +33,14 @@ type consoleScreenBufferInfoEx struct {
 	MaximumWindowSize    coordSmall
 	Attributes2          uint16
 	ColorTable           [16]uint32
+}
+
+type consoleScreenBufferInfo struct {
+	Size              coordSmall
+	CursorPosition    coordSmall
+	Attributes        uint16
+	Window            smallRect
+	MaximumWindowSize coordSmall
 }
 
 // getConsoleSize retrieves both terminal width and height via Windows Console API.
