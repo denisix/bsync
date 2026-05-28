@@ -45,7 +45,7 @@ func setupTransfer(t *testing.T, o e2eOpts) {
 	SetCompressionLevel(o.level)
 	blockSize = o.blockSize
 	if o.showProgress {
-		suppressProgress = false // run serverPrintStats; output still gated by quiet
+		setSuppressProgress(false) // run serverPrintStats; output still gated by quiet
 	}
 	if o.encrypt {
 		encryptionKey = GenerateEncryptionKey()

@@ -13,7 +13,7 @@
 - **SSH Integration**: Automatic remote server deployment via SSH
 - **Multi-worker Support**: Parallel processing with HDD-friendly sequential source reads and ordered destination writes
 - **Resume Capability**: Skip blocks to resume interrupted transfers
-- **Progress Monitoring**: Real-time transfer progress with speed and ETA on both sender and receiver
+- **Progress Visualization**: Win98 Defragmenter-style real-time grid display with ANSI-colored blocks for compressed (blue), non-compressed (orange), zero (grey), and skipped (green) transfers, plus speed and ETA on both sender and receiver
 - **Download Mode**: Transfer from server to client (reverse direction)
 - **IP Binding**: Bind server to specific network interface
 - **Connection Robustness**: TCP keep-alive, per-operation deadlines, acknowledged upload writes, and upload retry with reconnect
@@ -313,6 +313,37 @@ artifacts it creates.
 ### Concurrency Safety
 
 - **Race Detection**: Full test suite passes with `-race` flag enabled
+
+## 🖥️ Progress Visualization
+
+`bsync` features a real-time terminal progress display inspired by the classic
+Windows 98 Disk Defragmenter. Each block of the transfer is rendered as a
+colored square in a grid, giving you an at-a-glance view of the transfer state
+and data pattern.
+
+```ansi
+Legend: □ Pending □ Processing ■ Zero ■ Compressed ■ Raw ■ Skipped
+
+□□□□□□□□□□□□□□□■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■
+■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■□□□□□□□□□□□□□□□
+■■■■■■■■■■■■■■■■■■■■■■□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□
+
+Progress:  37.2% block 3047/8192 89.20 MB/s ETA: 4m12s Each cell: 7 blocks
+```
+
+### Color Legend
+
+| Display | Color  | Meaning |
+|---------|--------|---------|
+| `□` | Dim    | Not yet transferred |
+| `■` | Grey   | Zero block — payload omitted from network |
+| `■` | Blue   | Transferred with compression |
+| `■` | Orange | Transferred without compression |
+| `■` | Green  | Skipped — blocks already equal at destination |
+
+The ANSI escape sequences render in any terminal that supports ECMA-48 / ISO-6429
+color codes. The `ansi` fenced code block also renders on GitHub and other
+platforms with ANSI-aware Markdown renderers.
 
 ## 🔧 Technical Details
 

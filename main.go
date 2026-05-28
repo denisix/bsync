@@ -7,12 +7,22 @@ import (
 	"os"
 	"os/exec"
 	"strconv"
+	"sync/atomic"
 )
 
 var debug bool = false
 var blockSize uint32 = 10485760
 var mb1 float64 = 1048576.0
 var prefetchDepth int // Configurable prefetch depth for SequentialReader
+var vVisual atomic.Bool
+
+func setVisual(enabled bool) {
+	vVisual.Store(enabled)
+}
+
+func visualEnabled() bool {
+	return vVisual.Load()
+}
 
 // pickHighPort returns a currently-free high (>10000) TCP port. It asks the OS
 // for an unused port (so it won't collide with a still-lingering server), and
@@ -51,6 +61,7 @@ func main() {
 	var encKeyReceived string
 	var compLevel string
 	var listAllDrives bool
+	var visual bool
 
 	flag.BoolVar(&listAllDrives, "a", false, "list available drives and partitions")
 	flag.StringVar(&device, "f", "/dev/zero", "specify file or device, i.e. '/dev/vda'")
@@ -72,6 +83,7 @@ func main() {
 	flag.IntVar(&prefetchDepth, "prefetch", 0, "prefetch depth (default: workers*4)")
 	var autoTune bool
 	flag.BoolVar(&autoTune, "auto", false, "auto-tune parameters for optimal HDD performance")
+	flag.BoolVar(&visual, "v", false, "enable visual block-by-block progress display")
 
 	flag.Parse() // after declaring flags we need to call it
 
@@ -82,6 +94,9 @@ func main() {
 
 	// Set compression level
 	SetCompressionLevel(compLevel)
+
+	// Set visual mode
+	setVisual(visual)
 
 	if bSize == 0 || uint64(bSize) > uint64(^uint32(0)) {
 		Err("Block size must be between 1 and %d bytes\n", ^uint32(0))

@@ -28,10 +28,17 @@ var (
 	v_fileSize   uint64 = 0
 	t0           time.Time
 	mu           sync.Mutex
+
+	// Visualization
+	cliVisualizer *Visualizer
 )
 
 // ETA, stats
 func printStats(job BlockJob, indicator string, diff, bytes uint32) {
+	// Skip progress output when visualizer is active
+	if visualEnabled() {
+		return
+	}
 
 	mu.Lock()
 	diffs = diffs + diff
@@ -102,6 +109,12 @@ func startClient(file *os.File, serverAddress string, skipIdx uint32, fileSize u
 	}
 	Log("source size: %d bytes, block %d bytes, blockNum: %d\n", fileSize, blockSize, lastBlockNum)
 
+	// Initialize visualizer with total block count
+	if visualEnabled() {
+		cliVisualizer = NewVisualizer(lastBlockNum + 1)
+		cliVisualizer.renderInitial()
+	}
+
 	var wg sync.WaitGroup
 	t0 = time.Now()
 	v_skipIdx = skipIdx
@@ -139,6 +152,9 @@ func startClient(file *os.File, serverAddress string, skipIdx uint32, fileSize u
 						Log("block %d: retry %d/%d after: %v\n", block.BlockIdx, retry, maxRetries-1, lastErr)
 						conn.Close() // force reconnect on next call
 						time.Sleep(time.Duration(retry) * time.Second)
+					}
+					if cliVisualizer != nil {
+						cliVisualizer.UpdateBlockStatus(block.BlockIdx, StatusProcessing)
 					}
 					if lastErr = processPrecomputedBlock(conn, block, blockSize, fileSize, noCompress, checksumCache); lastErr == nil {
 						break
@@ -186,6 +202,9 @@ func startClient(file *os.File, serverAddress string, skipIdx uint32, fileSize u
 	}
 
 	Log("\nDONE, exiting..\n\n")
+	if cliVisualizer != nil {
+		cliVisualizer.RenderFinal()
+	}
 	// Brief margin to flush the DONE message; the caller's sshCmd.Wait()
 	// already blocks until the server has fully finished.
 	time.Sleep(doneFlushDelay)
@@ -242,6 +261,9 @@ func processPrecomputedBlock(conn *AutoReconnectTCP, block PrecomputedBlock, blo
 	if bytes.Equal(block.Hash, serverHash) {
 		job := BlockJob{blockIdx: block.BlockIdx, data: block.Data, readedBytes: len(block.Data)}
 		printStats(job, "-", 0, 0)
+		if cliVisualizer != nil {
+			cliVisualizer.UpdateBlockStatus(block.BlockIdx, StatusSkipped)
+		}
 		return nil
 	}
 
@@ -268,6 +290,9 @@ func processPrecomputedBlock(conn *AutoReconnectTCP, block PrecomputedBlock, blo
 		}
 		job := BlockJob{blockIdx: block.BlockIdx, data: nil, readedBytes: int(blockSize)}
 		printStats(job, ".", 1, 0)
+		if cliVisualizer != nil {
+			cliVisualizer.UpdateBlockStatus(block.BlockIdx, StatusZero)
+		}
 		return nil
 	}
 
@@ -320,8 +345,14 @@ func processPrecomputedBlock(conn *AutoReconnectTCP, block PrecomputedBlock, blo
 	job := BlockJob{blockIdx: block.BlockIdx, data: block.Data, readedBytes: len(block.Data)}
 	if compressedFlag {
 		printStats(job, "c", 1, uint32(len(dataToSend)))
+		if cliVisualizer != nil {
+			cliVisualizer.UpdateBlockStatus(block.BlockIdx, StatusCompressed)
+		}
 	} else {
 		printStats(job, "w", 1, uint32(len(dataToSend)))
+		if cliVisualizer != nil {
+			cliVisualizer.UpdateBlockStatus(block.BlockIdx, StatusRaw)
+		}
 	}
 	return nil
 }
@@ -393,6 +424,13 @@ func startClientDownload(file *os.File, serverAddress string, skipIdx uint32, bl
 
 	Log("remote file size: %d bytes, block %d bytes, blockNum: %d\n", fileSize, blockSize, lastBlockNum)
 
+	var downloadVisualizer *Visualizer
+	if visualEnabled() {
+		downloadVisualizer = NewVisualizer(lastBlockNum + 1)
+		downloadVisualizer.renderInitial()
+		defer downloadVisualizer.RenderFinal()
+	}
+
 	// Note: Preallocation skipped - using direct block devices (/dev/sda)
 	// which have fixed size and don't support fallocate
 
@@ -402,6 +440,9 @@ func startClientDownload(file *os.File, serverAddress string, skipIdx uint32, bl
 	filebuf := make([]byte, blockSize+encryptOverhead)
 
 	for blockIdx := uint32(skipIdx); blockIdx <= lastBlockNum; blockIdx++ {
+		if downloadVisualizer != nil {
+			downloadVisualizer.UpdateBlockStatus(blockIdx, StatusProcessing)
+		}
 		// Request block from server
 		msg, err1 := pack(&Msg{
 			MagicHead:  magicBytes,
@@ -456,6 +497,9 @@ func startClientDownload(file *os.File, serverAddress string, skipIdx uint32, bl
 			if uint32(n) != expectedSize {
 				return fmt.Errorf("write zero block %d: %w", blockIdx, io.ErrShortWrite)
 			}
+			if downloadVisualizer != nil {
+				downloadVisualizer.UpdateBlockStatus(blockIdx, StatusZero)
+			}
 		}
 
 		if blockMsg.DataSize > 0 {
@@ -480,6 +524,9 @@ func startClientDownload(file *os.File, serverAddress string, skipIdx uint32, bl
 				if n != len(decompressed) {
 					return fmt.Errorf("write block %d: %w", blockIdx, io.ErrShortWrite)
 				}
+				if downloadVisualizer != nil {
+					downloadVisualizer.UpdateBlockStatus(blockIdx, StatusCompressed)
+				}
 			} else {
 				// Uncompressed payload. With -e the raw block is encrypted on
 				// the wire, so decrypt before writing.
@@ -501,6 +548,9 @@ func startClientDownload(file *os.File, serverAddress string, skipIdx uint32, bl
 				if n != len(out) {
 					return fmt.Errorf("write block %d: %w", blockIdx, io.ErrShortWrite)
 				}
+				if downloadVisualizer != nil {
+					downloadVisualizer.UpdateBlockStatus(blockIdx, StatusRaw)
+				}
 			}
 		}
 
@@ -508,7 +558,9 @@ func startClientDownload(file *os.File, serverAddress string, skipIdx uint32, bl
 		if lastBlockNum > 0 {
 			percent = 100 * float64(blockIdx) / float64(lastBlockNum)
 		}
-		Log("downloaded block %d/%d (%0.2f%%)\r", blockIdx, lastBlockNum, percent)
+		if !visualEnabled() {
+			Log("downloaded block %d/%d (%0.2f%%)\r", blockIdx, lastBlockNum, percent)
+		}
 	}
 
 	Log("\ndownload complete\n")

@@ -39,8 +39,13 @@ func resetEngineGlobals() {
 	atomic.StoreInt32(&srvDiffs, 0)
 	srvOnce = sync.Once{}
 	shutdownTimer = nil
-	suppressProgress = true
-	quiet = true
+	setSuppressProgress(true)
+	setQuiet(true)
+	setVisual(false)
+	visualTransferStarted.Store(false)
+	logBufferMu.Lock()
+	logBuffer = nil
+	logBufferMu.Unlock()
 
 	// client-side stats globals
 	totCompSize = 0

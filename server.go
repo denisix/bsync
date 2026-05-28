@@ -20,18 +20,38 @@ var (
 	shutdownTimer *time.Timer
 
 	// Server-side progress stats
-	suppressProgress bool // set via -P flag when launched as remote server via -t
-	srvOnce          sync.Once
-	srvT0            time.Time
-	srvLastBlockNum  uint32 // written once via atomic.StoreUint32, then read-only
-	srvFileSize      uint64
-	srvBytesNet      uint64 // atomic - compressed/raw bytes received over network
-	srvBytesOrig     uint64 // atomic - original bytes written (for ratio)
-	srvDiffs         int32  // atomic - blocks actually written
+	suppressProgress   bool // set via -P flag when launched as remote server via -t
+	suppressProgressMu sync.RWMutex
+	srvOnce            sync.Once
+	srvT0              time.Time
+	srvLastBlockNum    uint32 // written once via atomic.StoreUint32, then read-only
+	srvFileSize        uint64
+	srvBytesNet        uint64 // atomic - compressed/raw bytes received over network
+	srvBytesOrig       uint64 // atomic - original bytes written (for ratio)
+	srvDiffs           int32  // atomic - blocks actually written
+
+	// Visualization
+	srvVisualizer *Visualizer
 )
 
+func setSuppressProgress(enabled bool) {
+	suppressProgressMu.Lock()
+	suppressProgress = enabled
+	suppressProgressMu.Unlock()
+}
+
+func suppressProgressEnabled() bool {
+	suppressProgressMu.RLock()
+	defer suppressProgressMu.RUnlock()
+	return suppressProgress
+}
+
 func serverPrintStats(blockIdx uint32, indicator string, netBytes uint32) {
-	if suppressProgress {
+	if suppressProgressEnabled() {
+		return
+	}
+	// Skip progress output when visualizer is active
+	if visualEnabled() {
 		return
 	}
 	if netBytes > 0 {
@@ -186,6 +206,9 @@ func serverHandleReq(conn net.Conn, file *os.File, _ *ChecksumCache, ow *Ordered
 		if msg.Done {
 			truncateIfRegularFile(file, msg.FileSize)
 			Log("\ntransfer DONE message received, starting graceful shutdown\n")
+			if srvVisualizer != nil {
+				srvVisualizer.RenderFinal()
+			}
 			atomic.StoreInt32(&doneReceived, 1)
 			if shutdownTimer != nil {
 				shutdownTimer.Reset(shutdownLingerPeriod)
@@ -203,6 +226,11 @@ func serverHandleReq(conn net.Conn, file *os.File, _ *ChecksumCache, ow *Ordered
 			srvFileSize = msg.FileSize
 			atomic.StoreUint32(&srvLastBlockNum, lastBlockNum)
 			srvT0 = time.Now()
+			// Initialize visualizer with total block count
+			if visualEnabled() {
+				srvVisualizer = NewVisualizer(lastBlockNum + 1)
+				srvVisualizer.renderInitial()
+			}
 		})
 
 		if uint64(msg.DataSize) > uint64(currentBlockSize)+uint64(encryptOverhead) {
@@ -222,6 +250,9 @@ func serverHandleReq(conn net.Conn, file *os.File, _ *ChecksumCache, ow *Ordered
 				return fmt.Errorf("write zero block %d: %w", msg.BlockIdx, err)
 			}
 			serverPrintStats(msg.BlockIdx, ".", 0)
+			if srvVisualizer != nil {
+				srvVisualizer.UpdateBlockStatus(msg.BlockIdx, StatusZero)
+			}
 			if err := sendBlockAck(conn, msg.BlockIdx, currentBlockSize, msg.FileSize); err != nil {
 				return nil
 			}
@@ -254,6 +285,9 @@ func serverHandleReq(conn net.Conn, file *os.File, _ *ChecksumCache, ow *Ordered
 		}
 
 		if msg.DataSize > 0 {
+			if srvVisualizer != nil {
+				srvVisualizer.UpdateBlockStatus(msg.BlockIdx, StatusProcessing)
+			}
 			conn.SetDeadline(time.Now().Add(ioTimeout))
 			_, err1 := io.ReadFull(c, filebuf[:msg.DataSize])
 			if err1 != nil {
@@ -290,6 +324,13 @@ func serverHandleReq(conn net.Conn, file *os.File, _ *ChecksumCache, ow *Ordered
 				indicator = "c"
 			}
 			serverPrintStats(msg.BlockIdx, indicator, msg.DataSize)
+			if srvVisualizer != nil {
+				if msg.Compressed {
+					srvVisualizer.UpdateBlockStatus(msg.BlockIdx, StatusCompressed)
+				} else {
+					srvVisualizer.UpdateBlockStatus(msg.BlockIdx, StatusRaw)
+				}
+			}
 			if err := sendBlockAck(conn, msg.BlockIdx, currentBlockSize, msg.FileSize); err != nil {
 				return nil
 			}
