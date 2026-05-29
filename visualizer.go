@@ -43,7 +43,11 @@ const (
 const (
 	visualRenderMinInterval = 100 * time.Millisecond
 	etaSampleSize           = 100
-	visualHeightRatio       = 0.9
+	visualLogLines          = 5
+	visualScrollGuardLines  = 1
+	minTerminalWidth        = 40 // Minimum terminal width for visual mode
+	minTerminalHeight       = 12 // Minimum terminal height for visual mode
+	resizeCellThresholdPct  = 10
 )
 
 type progressSample struct {
@@ -52,6 +56,15 @@ type progressSample struct {
 }
 
 var visualOutput io.Writer = os.Stdout
+var terminalWidthProbe = getTerminalWidthIoctl
+var terminalHeightProbe = getTerminalHeightIoctl
+
+// isTerminalTooSmall checks if terminal is too small for visual rendering.
+func isTerminalTooSmall() bool {
+	width := getTerminalWidth()
+	height := getTerminalHeight()
+	return width < minTerminalWidth || height < minTerminalHeight
+}
 
 // Visualizer manages block-by-block progress visualization
 type Visualizer struct {
@@ -60,6 +73,7 @@ type Visualizer struct {
 	blocksPerCell   uint32         // How many real blocks each visual cell represents
 	cellStatus      []atomic.Int32 // Per-cell status (thread-safe)
 	realBlockDone   []atomic.Bool
+	realBlockStatus []atomic.Int32
 	cellDone        []atomic.Uint32
 	currentBlock    atomic.Int32 // Real block index of most recently processing block
 	completedBlocks atomic.Uint32
@@ -81,16 +95,15 @@ type Visualizer struct {
 	renderedLines   int
 	renderHook      func()
 	output          io.Writer
-	lastCellStatus  []BlockStatus  // Last displayed status for each cell
-	lastWidth       int             // Last terminal width (for resize detection)
-	lastHeight      int             // Last terminal height (for resize detection)
-	lastLogLines    []string        // Last log lines displayed
-	needsFullRender atomic.Bool     // Force full redraw on resize
+	lastCellStatus  []BlockStatus // Last displayed status for each cell
+	lastWidth       int           // Last terminal width (for resize detection)
+	lastHeight      int           // Last terminal height (for resize detection)
+	lastLogLines    []string      // Last log lines displayed
+	needsFullRender atomic.Bool   // Force full redraw on resize
 }
 
 // terminalGridSize returns the grid dimensions for the visual block area only.
-// 90% of terminal height goes to the visual grid (legend + grid + stats),
-// 10% is reserved for text logs below.
+// Five terminal lines are reserved for logs below the visual section.
 func terminalGridSize() (cols, maxGridRows, maxCells int) {
 	width := getTerminalWidth()
 	height := getTerminalHeight()
@@ -101,21 +114,17 @@ func terminalGridSize() (cols, maxGridRows, maxCells int) {
 		height = 24
 	}
 
-	cols = width - 2
-	if cols < 10 {
-		cols = 10
+	cols = width - 1
+	if cols < 1 {
+		cols = 1
 	}
 
-	// 90% for visual grid, 10% for text logs
-	visualLines := int(float64(height) * visualHeightRatio)
-	if visualLines < 8 {
-		visualLines = 8
-	}
-
-	// Overhead: legend(1) + blank(1) + pre-stats blank(1) + stats(1)
-	maxGridRows = visualLines - 4
-	if maxGridRows < 3 {
-		maxGridRows = 3
+	// Overhead: legend(1) + blank(1) + pre-stats blank(1) + stats(1).
+	// Leave one guard line so full renders do not scroll when they reach the
+	// terminal bottom.
+	maxGridRows = height - visualLogLines - 4 - visualScrollGuardLines
+	if maxGridRows < 1 {
+		maxGridRows = 1
 	}
 
 	maxCells = cols * maxGridRows
@@ -127,7 +136,7 @@ func terminalGridSize() (cols, maxGridRows, maxCells int) {
 // size so the grid fills the screen. For small block counts every block gets
 // its own cell (1:1); for large counts blocks are aggregated into cells.
 func NewVisualizer(blockCount uint32) *Visualizer {
-	if blockCount == 0 {
+	if blockCount == 0 || isTerminalTooSmall() {
 		return &Visualizer{enabled: false}
 	}
 
@@ -158,11 +167,15 @@ func newVisualizer(blockCount, visualCells, bpc uint32) *Visualizer {
 		blocksPerCell:   bpc,
 		cellStatus:      make([]atomic.Int32, visualCells),
 		realBlockDone:   make([]atomic.Bool, blockCount),
+		realBlockStatus: make([]atomic.Int32, blockCount),
 		cellDone:        make([]atomic.Uint32, visualCells),
 		enabled:         true,
 		output:          visualOutput,
 	}
 
+	for i := uint32(0); i < blockCount; i++ {
+		v.realBlockStatus[i].Store(int32(StatusPending))
+	}
 	for i := uint32(0); i < visualCells; i++ {
 		v.cellStatus[i].Store(int32(StatusPending))
 	}
@@ -189,8 +202,7 @@ func (v *Visualizer) renderInitial() {
 }
 
 // calcGridDimensions recalculates grid layout from the current terminal size.
-// Called on every Render() to handle terminal resize. The cell array size
-// (visualCellCount) is fixed at construction — only cols/rows/logLines adapt.
+// Called on every Render() to handle terminal resize.
 func (v *Visualizer) calcGridDimensions() {
 	width := getTerminalWidth()
 	height := getTerminalHeight()
@@ -201,27 +213,18 @@ func (v *Visualizer) calcGridDimensions() {
 		height = 24
 	}
 
-	// 90% for visual grid section, 10% for text log area
-	visualLines := int(float64(height) * visualHeightRatio)
-	if visualLines < 8 {
-		visualLines = 8
-	}
-	v.logLines = height - visualLines
-	if v.logLines < 2 {
-		v.logLines = 2
-		visualLines = height - v.logLines
-	}
+	v.logLines = visualLogLines
 
-	// Overhead: legend(1) + blank(1) + pre-stats blank(1) + stats(1)
+	// Overhead: legend(1) + blank(1) + pre-stats blank(1) + stats(1).
 	overhead := 4
-	maxGridRows := visualLines - overhead
-	if maxGridRows < 3 {
-		maxGridRows = 3
+	maxGridRows := height - v.logLines - overhead - visualScrollGuardLines
+	if maxGridRows < 1 {
+		maxGridRows = 1
 	}
 
-	v.cols = width - 2
-	if v.cols < 10 {
-		v.cols = 10
+	v.cols = width - 1
+	if v.cols < 1 {
+		v.cols = 1
 	}
 	if v.cols > int(v.visualCellCount) {
 		v.cols = int(v.visualCellCount)
@@ -234,24 +237,98 @@ func (v *Visualizer) calcGridDimensions() {
 	v.rows = neededRows
 }
 
+func visualCellsForCapacity(blockCount uint32, maxCells int) (visualCells, bpc uint32) {
+	if blockCount == 0 || maxCells <= 0 {
+		return 0, 1
+	}
+	if blockCount <= uint32(maxCells) {
+		return blockCount, 1
+	}
+	bpc = (blockCount + uint32(maxCells) - 1) / uint32(maxCells)
+	visualCells = (blockCount + bpc - 1) / bpc
+	return visualCells, bpc
+}
+
+func (v *Visualizer) shouldRecalculateCells(maxCells int) bool {
+	targetCells, targetBPC := visualCellsForCapacity(v.realBlockCount, maxCells)
+	if targetCells == 0 {
+		return false
+	}
+	if targetBPC == v.blocksPerCell && targetCells == v.visualCellCount {
+		return false
+	}
+	current := int(v.visualCellCount)
+	target := int(targetCells)
+	diff := current - target
+	if diff < 0 {
+		diff = -diff
+	}
+	if current == 0 {
+		return true
+	}
+	return diff*100/current >= resizeCellThresholdPct
+}
+
+func (v *Visualizer) recalculateCells(maxCells int) {
+	visualCells, bpc := visualCellsForCapacity(v.realBlockCount, maxCells)
+	if visualCells == 0 {
+		return
+	}
+
+	newCellStatus := make([]atomic.Int32, visualCells)
+	newCellDone := make([]atomic.Uint32, visualCells)
+	for cellIdx := uint32(0); cellIdx < visualCells; cellIdx++ {
+		start := cellIdx * bpc
+		end := start + bpc
+		if end > v.realBlockCount {
+			end = v.realBlockCount
+		}
+
+		var done uint32
+		status := StatusPending
+		for blockIdx := start; blockIdx < end; blockIdx++ {
+			blockStatus := BlockStatus(v.realBlockStatus[blockIdx].Load())
+			if isFinalBlockStatus(blockStatus) {
+				done++
+				status = blockStatus
+			} else if blockStatus == StatusProcessing && status == StatusPending {
+				status = StatusProcessing
+			}
+		}
+		if done > 0 && done < end-start {
+			status = StatusProcessing
+		}
+
+		newCellDone[cellIdx].Store(done)
+		newCellStatus[cellIdx].Store(int32(status))
+	}
+
+	v.visualCellCount = visualCells
+	v.blocksPerCell = bpc
+	v.cellStatus = newCellStatus
+	v.cellDone = newCellDone
+	v.lastCellStatus = make([]BlockStatus, visualCells)
+	v.needsFullRender.Store(true)
+}
+
 // getTerminalWidth attempts to get the terminal width.
 func getTerminalWidth() int {
+	if width := terminalWidthProbe(); width > 0 {
+		return width
+	}
 	if cols := getEnvInt("COLUMNS"); cols > 0 {
 		return cols
-	}
-	if width := getTerminalWidthIoctl(); width > 0 {
-		return width
 	}
 	return 80
 }
 
 // getTerminalHeight attempts to get the terminal height.
 func getTerminalHeight() int {
+	if height := terminalHeightProbe(); height > 0 {
+		return height
+	}
 	if rows := getEnvInt("LINES"); rows > 0 {
 		return rows
-	}
-	if height := getTerminalHeightIoctl(); height > 0 {
-		return height
 	}
 	return 24
 }
@@ -269,18 +346,42 @@ func getEnvInt(key string) int {
 	return 0
 }
 
+func visibleLen(s string) int {
+	n := 0
+	inEscape := false
+	for i := 0; i < len(s); i++ {
+		ch := s[i]
+		if inEscape {
+			if ch >= '@' && ch <= '~' {
+				inEscape = false
+			}
+			continue
+		}
+		if ch == '\033' {
+			inEscape = true
+			continue
+		}
+		n++
+	}
+	return n
+}
+
+func fitsTerminalWidth(s string, width int) bool {
+	return visibleLen(s) < width
+}
+
 // cursorPos returns ANSI escape to move cursor to row, col (1-based).
 func cursorPos(row, col int) string {
 	return fmt.Sprintf("\033[%d;%dH", row, col)
 }
 
 // cellPosition returns screen (row, col) for visual cell at idx (1-based).
-// Grid starts at row 3 (after legend + blank line) with 2-column left margin.
+// Grid starts at row 3 (after legend + blank line), column 1 (no margin).
 func (v *Visualizer) cellPosition(idx uint32) (row, col int) {
-	// +3 for legend(1) + blank(1) + baseline offset(1)
-	// +2 for left margin
+	// Row: +2 for legend(1) + blank(1), grid rows start at row 3
+	// Col: +1 for 1-based ANSI coordinates, no left margin in actual layout
 	row = 3 + int(idx)/v.cols
-	col = 2 + int(idx)%v.cols
+	col = 1 + int(idx)%v.cols
 	return
 }
 
@@ -332,13 +433,17 @@ func (v *Visualizer) UpdateBlockStatus(blockIdx uint32, status BlockStatus) {
 	if !v.enabled || blockIdx >= v.realBlockCount {
 		return
 	}
+
+	v.mu.Lock()
 	cellIdx := v.mapToCell(blockIdx)
 	if status == StatusProcessing {
+		v.realBlockStatus[blockIdx].CompareAndSwap(int32(StatusPending), int32(StatusProcessing))
 		v.cellStatus[cellIdx].CompareAndSwap(int32(StatusPending), int32(StatusProcessing))
 		v.currentBlock.Store(int32(blockIdx))
 	}
 	if isFinalBlockStatus(status) {
 		if v.realBlockDone[blockIdx].CompareAndSwap(false, true) {
+			v.realBlockStatus[blockIdx].Store(int32(status))
 			v.recordBlockComplete(time.Now())
 			doneInCell := v.cellDone[cellIdx].Add(1)
 			if doneInCell >= v.realBlocksInCell(cellIdx) {
@@ -348,6 +453,8 @@ func (v *Visualizer) UpdateBlockStatus(blockIdx uint32, status BlockStatus) {
 			}
 		}
 	}
+	v.mu.Unlock()
+
 	if status != StatusPending {
 		MarkVisualTransferStarted()
 		v.RenderIfNeeded(blockIdx)
@@ -389,11 +496,14 @@ func (v *Visualizer) Render() {
 		return
 	}
 
+	if isTerminalTooSmall() {
+		v.Disable()
+		v.writeFrame("\033[2J\033[HTerminal too small for visual mode (min 40x12)\n")
+		return
+	}
+
 	v.mu.Lock()
 	defer v.mu.Unlock()
-
-	// Recalc grid dimensions every render (handles terminal resize)
-	v.calcGridDimensions()
 
 	// Check for terminal resize
 	currentWidth := getTerminalWidth()
@@ -402,8 +512,17 @@ func (v *Visualizer) Render() {
 	if resized {
 		v.lastWidth = currentWidth
 		v.lastHeight = currentHeight
+		_, _, maxCells := terminalGridSize()
+		if v.shouldRecalculateCells(maxCells) {
+			v.recalculateCells(maxCells)
+		}
+		v.screenRendered = false
+		v.renderedLines = 0
 		v.needsFullRender.Store(true)
 	}
+
+	// Recalc grid dimensions every render (handles terminal resize)
+	v.calcGridDimensions()
 
 	fullRender := v.needsFullRender.Load()
 	if fullRender {
@@ -413,8 +532,6 @@ func (v *Visualizer) Render() {
 		v.renderDiff()
 	}
 
-	// Update tracking state after rendering
-	v.updateLastCellStatus()
 	v.updateLastLogLines()
 }
 
@@ -440,8 +557,7 @@ func (v *Visualizer) renderFull() {
 		for col := 0; col < v.cols; col++ {
 			idx := uint32(row*v.cols + col)
 			if idx >= totalCells {
-				frame.WriteString(" ")
-				continue
+				break
 			}
 			status := BlockStatus(v.cellStatus[idx].Load())
 			v.renderBlock(&frame, status)
@@ -462,6 +578,13 @@ func (v *Visualizer) renderFull() {
 	v.renderedLines = renderedLines
 
 	v.writeFrame(frame.String())
+
+	// Update tracking state with what we actually displayed
+	displayedStatus := make([]BlockStatus, totalCells)
+	for idx := uint32(0); idx < totalCells; idx++ {
+		displayedStatus[idx] = BlockStatus(v.cellStatus[idx].Load())
+	}
+	v.lastCellStatus = displayedStatus
 }
 
 // renderDiff performs incremental updates - only changed cells.
@@ -476,9 +599,14 @@ func (v *Visualizer) renderDiff() {
 		return
 	}
 
+	// Track what we're actually displaying to avoid race condition
+	displayedStatus := make([]BlockStatus, totalCells)
+
 	// Update only changed cells
 	for idx := uint32(0); idx < totalCells; idx++ {
 		currentStatus := BlockStatus(v.cellStatus[idx].Load())
+		displayedStatus[idx] = currentStatus
+
 		if currentStatus != v.lastCellStatus[idx] {
 			row, col := v.cellPosition(idx)
 			v.renderCellAt(&frame, row, col, currentStatus)
@@ -497,18 +625,9 @@ func (v *Visualizer) renderDiff() {
 	}
 
 	v.writeFrame(frame.String())
-}
 
-// updateLastCellStatus syncs lastCellStatus with current cellStatus.
-func (v *Visualizer) updateLastCellStatus() {
-	totalCells := v.visualCellCount
-	if uint32(len(v.lastCellStatus)) < totalCells {
-		// Resize happened, reallocate
-		v.lastCellStatus = make([]BlockStatus, totalCells)
-	}
-	for idx := uint32(0); idx < totalCells; idx++ {
-		v.lastCellStatus[idx] = BlockStatus(v.cellStatus[idx].Load())
-	}
+	// Update tracking state with what we actually displayed
+	v.lastCellStatus = displayedStatus
 }
 
 // updateLastLogLines syncs lastLogLines with current log buffer.
@@ -557,14 +676,26 @@ func (v *Visualizer) renderLogsDiff(frame *strings.Builder, current []string) {
 
 // renderLegend draws the color legend at the top
 func (v *Visualizer) renderLegend(frame *strings.Builder) {
-	frame.WriteString(ColorDim + "Legend: " + ColorReset)
-	frame.WriteString(ColorDim + PendingChar + ColorReset + " Pending ")
-	frame.WriteString(ColorBlink + ColorDim + PendingChar + ColorReset + " Processing ")
-	frame.WriteString(ColorGrey + BlockChar + ColorReset + " Zero ")
-	frame.WriteString(ColorBlue + BlockChar + ColorReset + " Compressed ")
-	frame.WriteString(ColorOrange + BlockChar + ColorReset + " Raw ")
-	frame.WriteString(ColorGreen + BlockChar + ColorReset + " Skipped\n\n")
+	width := getTerminalWidth()
+	full := ColorDim + "Legend: " + ColorReset +
+		ColorDim + PendingChar + ColorReset + " Pending " +
+		ColorBlink + ColorDim + PendingChar + ColorReset + " Processing " +
+		ColorGrey + BlockChar + ColorReset + " Zero " +
+		ColorBlue + BlockChar + ColorReset + " Compressed " +
+		ColorOrange + BlockChar + ColorReset + " Raw " +
+		ColorGreen + BlockChar + ColorReset + " Skipped"
+	if fitsTerminalWidth(full, width) {
+		frame.WriteString(full)
+		frame.WriteString("\033[K\n\n")
+		return
+	}
 
+	compact := ColorDim + "Legend: " + ColorReset +
+		ColorDim + PendingChar + ColorReset + " Pending " +
+		ColorBlink + ColorDim + PendingChar + ColorReset + " Active " +
+		ColorGreen + BlockChar + ColorReset + " Done"
+	frame.WriteString(compact)
+	frame.WriteString("\033[K\n\n")
 }
 
 // renderStats draws the compact stats line.
@@ -584,18 +715,44 @@ func (v *Visualizer) statsLine() string {
 		pctDone = 100.0 * float64(done) / float64(v.realBlockCount)
 	}
 
-	current := v.currentBlock.Load()
+	width := getTerminalWidth()
 	mbps, eta := v.recentSpeedAndETA()
 	line := fmt.Sprintf(ColorGrey+"Progress: %s%5.1f%%%s block %s%d%s/%d %s%0.2f MB/s%s ETA: %s%s%s",
 		ColorBrightGreen, pctDone, ColorGrey,
-		ColorWhite, current, ColorGrey,
+		ColorWhite, done, ColorGrey,
 		v.realBlockCount,
 		ColorBlue, mbps, ColorGrey,
 		ColorOrange, eta, ColorGrey)
 	if v.blocksPerCell > 1 {
 		line += fmt.Sprintf(" Each cell: %d blocks", v.blocksPerCell)
 	}
-	return line + ColorReset
+	line += ColorReset
+	if fitsTerminalWidth(line, width) {
+		return line
+	}
+
+	compact := fmt.Sprintf(ColorGrey+"Progress: %s%5.1f%%%s %s%d%s/%d ETA: %s%s%s",
+		ColorBrightGreen, pctDone, ColorGrey,
+		ColorWhite, done, ColorGrey,
+		v.realBlockCount,
+		ColorOrange, eta, ColorGrey)
+	if v.blocksPerCell > 1 {
+		compact += fmt.Sprintf(" Cell: %d", v.blocksPerCell)
+	}
+	compact += ColorReset
+	if fitsTerminalWidth(compact, width) {
+		return compact
+	}
+
+	short := fmt.Sprintf(ColorGrey+"%s%5.1f%%%s %s%d%s/%d ETA %s%s%s",
+		ColorBrightGreen, pctDone, ColorGrey,
+		ColorWhite, done, ColorGrey,
+		v.realBlockCount,
+		ColorOrange, eta, ColorGrey)
+	if v.blocksPerCell > 1 {
+		short += fmt.Sprintf(" C: %d", v.blocksPerCell)
+	}
+	return short + ColorReset
 }
 
 func (v *Visualizer) recentSpeedAndETA() (float64, string) {
@@ -655,34 +812,22 @@ func formatDuration(d time.Duration) string {
 // renderLogs draws recent log messages in the log area at the bottom.
 func (v *Visualizer) renderLogs(frame *strings.Builder) {
 	lines := GetRecentLogs(v.logLines)
-	if len(lines) == 0 {
-		// Fill remaining lines with blank cleared lines
-		for i := 0; i < v.logLines; i++ {
-			frame.WriteString("\033[K\n")
-		}
-		return
-	}
-
-	// Show newest logs first (most recent at bottom, but we print top-to-bottom)
-	// Trim to fit
 	display := lines
 	if len(display) > v.logLines {
 		display = display[len(display)-v.logLines:]
 	}
 
-	for _, line := range display {
-		// Log messages already end with \n from their format string;
-		// strip it since we add our own newline below.
-		trimmed := strings.TrimRight(line, "\n\r")
-		frame.WriteString(ColorDim)
-		frame.WriteString(trimmed)
-		frame.WriteString(ColorReset)
-		frame.WriteString("\033[K\n")
-	}
-
-	// Fill any remaining lines
-	for i := len(display); i < v.logLines; i++ {
-		frame.WriteString("\033[K\n")
+	for row := 0; row < v.logLines; row++ {
+		if row < len(display) {
+			trimmed := strings.TrimRight(display[row], "\n\r")
+			frame.WriteString(ColorDim)
+			frame.WriteString(trimmed)
+			frame.WriteString(ColorReset)
+		}
+		frame.WriteString("\033[K")
+		if row < v.logLines-1 {
+			frame.WriteString("\n")
+		}
 	}
 }
 

@@ -24,12 +24,14 @@ is actively making progress.
 
 ## Layout
 
-The terminal is split **90% visual / 10% text logs**:
+The terminal reserves **5 lines for text logs** at the bottom and leaves one
+guard line unused to prevent terminal scroll. The rest is used for the visual
+section: legend, block grid, spacer, and stats.
 
 ```
 ┌─ Legend: □ Pending □ Processing ■ Zero ■ Compressed ■ Raw ■ Skipped  ─┐
 │                                                                        │
-│ □□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□  │  ~90%
+│ □□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□  │
 │ □□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□  │  visual
 │ □□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□  │  blocks
 │ ■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■□□□□□□□□□□□□□□□□□□□□□□□  │
@@ -38,21 +40,21 @@ The terminal is split **90% visual / 10% text logs**:
 │                                                                        │
 │ Progress:  45.2% block 3047/8192 82.40 MB/s ETA: 4m12s Each cell: 7 blocks │
 ├────────────────────────────────────────────────────────────────────────┤
-│ 13:33:49 [client] startClient()                                        │  ~10%
-│ 13:33:49 [client] source size: 52428800 bytes, blockNum: 49           │  text
+│ 13:33:49 [client] startClient()                                        │  5
+│ 13:33:49 [client] source size: 52428800 bytes, blockNum: 49           │  log
 │ 13:33:49 [client] starting 1 transfer workers                          │  logs
 │ 13:33:49 [client] DONE, waiting for the workers                        │
 └────────────────────────────────────────────────────────────────────────┘
 ```
 
-### Visual section (~90% of terminal height)
+### Visual section
 
 1. **Legend** — colour samples with labels (1 line)
 2. **Block grid** — rows of coloured squares filling available width
 3. **Blank spacer** — one empty line before the stats
 4. **Stats line** — compact `Progress: XX.X% block current/total speed ETA: value [Each cell: N blocks]` (1 line)
 
-### Log section (~10% of terminal height)
+### Log section (5 terminal lines)
 
 Before transfer starts, the last N log messages (up to 200 buffered) are
 displayed below the grid in dim text so connection/setup problems are visible.
@@ -81,8 +83,8 @@ ETA is bright orange.
 - **`82.40 MB/s`** — recent throughput, calculated from the last 100
   completed block samples and the active block size
 - **`4m12s`** — ETA from the same last-100-block speed window
-- **`Each cell: 7 blocks`** — shown only when visual cells aggregate multiple
-  real transfer blocks
+- **`Each cell: 7 blocks`** — shown when visual cells aggregate multiple
+  real transfer blocks; narrow terminals may show this as `Cell: 7` or `C: 7`
 
 ## Architecture — Visual vs Physical Blocks
 
@@ -155,7 +157,7 @@ height. Falls back to `GetConsoleScreenBufferInfo` on older Windows.
 ## Terminal Resize Handling
 
 - `calcGridDimensions()` runs **every `Render()`** call
-- Only `cols`, `rows`, and `logLines` adapt — the cell status array
+- `cols` and `rows` adapt while `logLines` stays fixed at 5 — the cell status array
   (`visualCellCount` / `blocksPerCell`) and `currentBlock` are **fixed
   at construction**
 - If the terminal shrinks below the grid, trailing cells are clipped

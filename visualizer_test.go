@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -133,6 +134,7 @@ func TestVisualizerRecentSpeedUsesSampleWindow(t *testing.T) {
 }
 
 func TestVisualizerStatsLineColorGroupsAggregated(t *testing.T) {
+	withTerminalProbe(t, 140, 24)
 	oldBlockSize := atomic.LoadUint32(&blockSize)
 	atomic.StoreUint32(&blockSize, uint32(1.42*mb1))
 	defer atomic.StoreUint32(&blockSize, oldBlockSize)
@@ -171,6 +173,220 @@ func TestVisualizerStatsLineOmitsEachCellForOneToOneGrid(t *testing.T) {
 	}
 }
 
+func TestTerminalSizePrefersLiveProbeOverStaleEnv(t *testing.T) {
+	t.Setenv("COLUMNS", "160")
+	t.Setenv("LINES", "50")
+	withTerminalProbe(t, 42, 13)
+
+	if got := getTerminalWidth(); got != 42 {
+		t.Fatalf("terminal width = %d, want live probe value 42", got)
+	}
+	if got := getTerminalHeight(); got != 13 {
+		t.Fatalf("terminal height = %d, want live probe value 13", got)
+	}
+}
+
+func TestTerminalSizeFallsBackToEnvWhenProbeUnavailable(t *testing.T) {
+	t.Setenv("COLUMNS", "77")
+	t.Setenv("LINES", "22")
+	withTerminalProbe(t, 0, 0)
+
+	if got := getTerminalWidth(); got != 77 {
+		t.Fatalf("terminal width = %d, want env fallback 77", got)
+	}
+	if got := getTerminalHeight(); got != 22 {
+		t.Fatalf("terminal height = %d, want env fallback 22", got)
+	}
+}
+
+func TestVisualizerSmallTerminalUsesSingleLineLegendAndStats(t *testing.T) {
+	t.Setenv("COLUMNS", "160")
+	t.Setenv("LINES", "50")
+	withTerminalProbe(t, 40, 12)
+
+	v := newVisualizer(1000, 200, 5)
+	var frame strings.Builder
+	v.renderLegend(&frame)
+
+	legend := stripANSI(strings.Split(frame.String(), "\n")[0])
+	if visibleLen(legend) >= 40 {
+		t.Fatalf("compact legend length = %d, want < 40: %q", visibleLen(legend), legend)
+	}
+	if strings.Contains(legend, "Compressed") || strings.Contains(legend, "Skipped") {
+		t.Fatalf("compact legend should not use wide labels: %q", legend)
+	}
+
+	stats := stripANSI(v.statsLine())
+	if visibleLen(stats) >= 40 {
+		t.Fatalf("compact stats length = %d, want < 40: %q", visibleLen(stats), stats)
+	}
+	if !strings.Contains(stats, "Cell: 5") && !strings.Contains(stats, "C: 5") {
+		t.Fatalf("compact stats should include cell size: %q", stats)
+	}
+	if strings.Contains(stats, "MB/s") {
+		t.Fatalf("compact stats should not include speed text: %q", stats)
+	}
+}
+
+func TestVisualizerStatsLineCompactsWhenFullLineWouldWrap(t *testing.T) {
+	withTerminalProbe(t, 80, 24)
+
+	v := newVisualizer(75406, 1301, 58)
+	v.completedBlocks.Store(1235)
+
+	stats := stripANSI(v.statsLine())
+	if visibleLen(stats) >= 80 {
+		t.Fatalf("stats length = %d, want < 80: %q", visibleLen(stats), stats)
+	}
+	if strings.Contains(stats, "MB/s") {
+		t.Fatalf("stats should omit speed when full line would wrap: %q", stats)
+	}
+	if !strings.Contains(stats, "Cell: 58") && !strings.Contains(stats, "C: 58") {
+		t.Fatalf("stats should keep cell size when full line would wrap: %q", stats)
+	}
+}
+
+func TestVisualizerStatsLineOmitsCellSuffixesForOneToOneCompactGrid(t *testing.T) {
+	withTerminalProbe(t, 40, 12)
+
+	v := newVisualizer(1000, 1000, 1)
+
+	stats := stripANSI(v.statsLine())
+	if strings.Contains(stats, "Each cell:") || strings.Contains(stats, "Cell:") || strings.Contains(stats, "C:") {
+		t.Fatalf("1:1 compact stats should omit cell suffix: %q", stats)
+	}
+}
+
+func TestVisualizerSmallTerminalRenderKeepsGridAtRowThree(t *testing.T) {
+	withTerminalProbe(t, 40, 12)
+	var buf bytes.Buffer
+
+	v := newVisualizer(1000, 200, 5)
+	v.output = &buf
+	v.Render()
+	out := buf.String()
+
+	if strings.Contains(out, "Processing") || strings.Contains(out, "Compressed") || strings.Contains(out, "Skipped") {
+		t.Fatalf("small render emitted wide legend labels: %q", out)
+	}
+	if strings.Contains(out, "MB/s") {
+		t.Fatalf("small render emitted wide stats speed label: %q", out)
+	}
+	if !strings.Contains(out, "Cell: 5") && !strings.Contains(out, "C: 5") {
+		t.Fatalf("small render omitted compact cell size: %q", out)
+	}
+	if strings.Contains(out, cursorPos(2, 1)+ColorDim+PendingChar) {
+		t.Fatalf("grid appears to start on row 2: %q", out)
+	}
+	if v.cols >= getTerminalWidth() {
+		t.Fatalf("grid columns = %d, want less than terminal width %d", v.cols, getTerminalWidth())
+	}
+}
+
+func TestVisualizerUsesFixedFiveLineLogArea(t *testing.T) {
+	tests := []struct {
+		name     string
+		width    int
+		height   int
+		wantRows int
+	}{
+		{name: "minimum", width: 40, height: 12, wantRows: 2},
+		{name: "default", width: 80, height: 24, wantRows: 14},
+		{name: "large", width: 120, height: 40, wantRows: 30},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			withTerminalProbe(t, tt.width, tt.height)
+			v := newVisualizer(100000, 100000, 1)
+
+			if got := v.logLines; got != visualLogLines {
+				t.Fatalf("logLines = %d, want %d", got, visualLogLines)
+			}
+			if got := v.rows; got != tt.wantRows {
+				t.Fatalf("rows = %d, want %d", got, tt.wantRows)
+			}
+			if got := v.statsRow(); got != 3+tt.wantRows+1 {
+				t.Fatalf("statsRow = %d, want %d", got, 3+tt.wantRows+1)
+			}
+			if got := v.logAreaStartRow(); got != v.statsRow()+1 {
+				t.Fatalf("logAreaStartRow = %d, want statsRow + 1", got)
+			}
+		})
+	}
+}
+
+func TestVisualizerFullRenderDoesNotEndWithNewline(t *testing.T) {
+	withTerminalProbe(t, 40, 12)
+	var buf bytes.Buffer
+
+	v := newVisualizer(1000, 200, 5)
+	v.output = &buf
+	v.Render()
+
+	if strings.HasSuffix(buf.String(), "\n") {
+		t.Fatalf("full render should not end with newline to avoid terminal scroll: %q", buf.String())
+	}
+}
+
+func TestVisualizerResizeRecalculatesCellsAndPreservesStatus(t *testing.T) {
+	t.Setenv("COLUMNS", "40")
+	t.Setenv("LINES", "12")
+	var buf bytes.Buffer
+
+	v := newVisualizer(1000, 200, 5)
+	v.output = &buf
+	v.UpdateBlockStatus(10, StatusCompressed)
+	v.UpdateBlockStatus(11, StatusRaw)
+
+	t.Setenv("COLUMNS", "100")
+	t.Setenv("LINES", "30")
+	v.Render()
+
+	if got := v.blocksPerCell; got != 1 {
+		t.Fatalf("blocksPerCell after resize = %d, want 1", got)
+	}
+	if got := v.visualCellCount; got != 1000 {
+		t.Fatalf("visualCellCount after resize = %d, want 1000", got)
+	}
+	if got := BlockStatus(v.cellStatus[10].Load()); got != StatusCompressed {
+		t.Fatalf("cell 10 status after resize = %v, want compressed", got)
+	}
+	if got := BlockStatus(v.cellStatus[11].Load()); got != StatusRaw {
+		t.Fatalf("cell 11 status after resize = %v, want raw", got)
+	}
+}
+
+func TestVisualizerResizeToNarrowClearsScreenAndCompacts(t *testing.T) {
+	var buf bytes.Buffer
+	withMutableTerminalProbe(t, 120, 30)
+
+	v := newVisualizer(75406, 2000, 38)
+	v.output = &buf
+	v.Render()
+
+	setMutableTerminalProbe(40, 12)
+	buf.Reset()
+	v.Render()
+	out := buf.String()
+
+	if !strings.HasPrefix(out, "\033[2J\033[H") {
+		t.Fatalf("resize render prefix = %q, want full clear", out[:shortLen(out, 8)])
+	}
+	if strings.Contains(out, "Processing") || strings.Contains(out, "Compressed") || strings.Contains(out, "Skipped") {
+		t.Fatalf("narrow resize emitted wide legend labels: %q", out)
+	}
+	if strings.Contains(out, "MB/s") {
+		t.Fatalf("narrow resize emitted wide stats speed label: %q", out)
+	}
+	if !strings.Contains(out, "Cell:") && !strings.Contains(out, "C:") {
+		t.Fatalf("narrow resize omitted compact cell size: %q", out)
+	}
+	if v.cols >= getTerminalWidth() {
+		t.Fatalf("grid columns = %d, want less than terminal width %d", v.cols, getTerminalWidth())
+	}
+}
+
 func TestVisualizerRenderClearsScreenOnlyOnFirstRender(t *testing.T) {
 	t.Setenv("COLUMNS", "40")
 	t.Setenv("LINES", "12")
@@ -206,8 +422,8 @@ func TestVisualizerRenderClearsScreenOnlyOnFirstRender(t *testing.T) {
 		t.Fatalf("second render missing line clear sequence: %q", second)
 	}
 	// Diff render should update cell 1 (which changed to StatusCompressed)
-	// Cell at (row=0, col=1) maps to screen position (row=3, col=3)
-	if !strings.Contains(second, "\033[3;3H") {
+	// Cell at (row=0, col=1) maps to screen position (row=3, col=2)
+	if !strings.Contains(second, "\033[3;2H") {
 		t.Fatalf("second render missing cursor positioning for changed cell: %q", second)
 	}
 }
@@ -296,6 +512,44 @@ func shortLen(s string, n int) int {
 		return len(s)
 	}
 	return n
+}
+
+func stripANSI(s string) string {
+	return regexp.MustCompile(`\x1b\[[0-9;]*[A-Za-z]`).ReplaceAllString(s, "")
+}
+
+func withTerminalProbe(t *testing.T, width, height int) {
+	t.Helper()
+	oldWidthProbe := terminalWidthProbe
+	oldHeightProbe := terminalHeightProbe
+	terminalWidthProbe = func() int { return width }
+	terminalHeightProbe = func() int { return height }
+	t.Cleanup(func() {
+		terminalWidthProbe = oldWidthProbe
+		terminalHeightProbe = oldHeightProbe
+	})
+}
+
+var mutableProbeWidth int
+var mutableProbeHeight int
+
+func withMutableTerminalProbe(t *testing.T, width, height int) {
+	t.Helper()
+	oldWidthProbe := terminalWidthProbe
+	oldHeightProbe := terminalHeightProbe
+	mutableProbeWidth = width
+	mutableProbeHeight = height
+	terminalWidthProbe = func() int { return mutableProbeWidth }
+	terminalHeightProbe = func() int { return mutableProbeHeight }
+	t.Cleanup(func() {
+		terminalWidthProbe = oldWidthProbe
+		terminalHeightProbe = oldHeightProbe
+	})
+}
+
+func setMutableTerminalProbe(width, height int) {
+	mutableProbeWidth = width
+	mutableProbeHeight = height
 }
 
 func (s BlockStatus) String() string {
