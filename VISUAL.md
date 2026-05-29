@@ -15,7 +15,7 @@ glance what happened to that block:
 | `□`     | Blink dim  | `\033[5m\033[2m` | Currently being processed (blinks) |
 | `■`     | Grey       | `\033[90m`      | Zero block — payload omitted from network (sparse) |
 | `■`     | Blue       | `\033[94m`      | Transferred with zstd compression |
-| `■`     | Orange     | `\033[91m`      | Transferred without compression |
+| `■`     | Orange     | `\033[38;5;208m` | Transferred without compression |
 | `■`     | Green      | `\033[32m`      | Skipped — block already identical at destination |
 
 Only **one cell** blinks at a time — the cell the worker is currently
@@ -52,7 +52,7 @@ section: legend, block grid, spacer, and stats.
 1. **Legend** — colour samples with labels (1 line)
 2. **Block grid** — rows of coloured squares filling available width
 3. **Blank spacer** — one empty line before the stats
-4. **Stats line** — compact `Progress: XX.X% block current/total speed ETA: value [Each cell: N blocks]` (1 line)
+4. **Stats line** — compact `Progress: XX.X% block completed/total speed ETA: value [Each cell: N blocks]` (1 line)
 
 ### Log section (5 terminal lines)
 
@@ -72,13 +72,12 @@ The stats line shows a compact single-line summary:
 Progress:  45.2% block 3047/8192 82.40 MB/s ETA: 4m12s Each cell: 7 blocks
 ```
 
-Labels are dim/grey, the percentage is bright green, the current block is
-bright white, the total block count is dim/grey, speed is bright blue, and
-ETA is bright orange.
+Labels are dim/grey, the percentage is bright green, completed blocks are
+bright white, the total block count is dim/grey, speed is bright blue, and ETA
+is bright orange.
 
 - **`45.2%`** — percentage of real transfer blocks completed
-- **`3047`** — real block index of the most recently started processing
-  block (tracked atomically via `currentBlock` in the Visualizer struct)
+- **`3047`** — real blocks completed
 - **`8192`** — total real transfer blocks
 - **`82.40 MB/s`** — recent throughput, calculated from the last 100
   completed block samples and the active block size
@@ -99,7 +98,9 @@ blocksPerCell   — how many real blocks each cell represents (e.g. 7)
 ### Block aggregation formula
 
 ```
-maxCells = (terminalWidth - 2) × (terminalHeight × 0.9 - overhead)
+gridCols = terminalWidth - 1
+gridRows = terminalHeight - 5 log lines - 4 visual overhead lines - 1 scroll guard line
+maxCells = gridCols × gridRows
 
 if realBlockCount > maxCells:
     blocksPerCell = ceil(realBlockCount / maxCells)
@@ -119,11 +120,11 @@ This ensures:
 
 | real blocks | Terminal (W×H) | maxCells | bpc | visualCells | rows |
 |-------------|----------------|----------|-----|-------------|------|
-| 50          | 80×24          | 858      | 1   | 50          | 1    |
-| 5,000       | 80×24          | 858      | 6   | 834         | 11   |
-| 10,000      | 80×24          | 858      | 12  | 834         | 11   |
-| 10,000,000  | 80×24          | 858      | 11656 | 858       | 11   |
-| 10,000      | 200×50         | 6960     | 2   | 5000        | 26   |
+| 50          | 80×24          | 1106     | 1   | 50          | 1    |
+| 5,000       | 80×24          | 1106     | 5   | 1000        | 13   |
+| 10,000      | 80×24          | 1106     | 10  | 1000        | 13   |
+| 10,000,000  | 80×24          | 1106     | 9042 | 1106      | 14   |
+| 10,000      | 200×50         | 7960     | 2   | 5000        | 26   |
 
 ## Block States
 
@@ -157,19 +158,18 @@ height. Falls back to `GetConsoleScreenBufferInfo` on older Windows.
 ## Terminal Resize Handling
 
 - `calcGridDimensions()` runs **every `Render()`** call
-- `cols` and `rows` adapt while `logLines` stays fixed at 5 — the cell status array
-  (`visualCellCount` / `blocksPerCell`) and `currentBlock` are **fixed
-  at construction**
-- If the terminal shrinks below the grid, trailing cells are clipped
-  (data preserved, just not visible). If it grows, more cells become
-  visible.
+- `cols` and `rows` adapt while `logLines` stays fixed at 5
+- `visualCellCount` and `blocksPerCell` are recalculated on significant
+  terminal-capacity changes so the grid continues to cover the screen well
+- Per-block completion state is preserved across resize and remapped into
+  the new visual cells
 - The first render uses `\033[2J\033[H` to clear the screen and move home.
-  Later renders use only `\033[H` plus per-line `\033[K` clears to avoid
-  visible full-screen blinking.
+  Resize renders also use a full clear to remove stale wrapped rows. Normal
+  later renders use cursor positioning plus per-line `\033[K` clears.
 
 ## Performance — Non-Blocking Render
 
-The render must never block the transfer worker goroutines. Four
+The render must never block the transfer worker goroutines. Five
 mechanisms ensure this:
 
 1. **Async rendering** — `RenderIfNeeded()` launches `go v.Render()`
@@ -186,7 +186,7 @@ mechanisms ensure this:
 4. **Time-bounded refresh** — every non-pending status update requests a
    render, including `StatusProcessing` and skipped blocks. The first
    transfer update renders immediately; later updates are coalesced to at
-   most one render every 500ms while work is active. A single in-flight
+   most one render every 100ms while work is active. A single in-flight
    render loop prevents unbounded `go v.Render()` buildup.
 
 5. **Final render** — `RenderFinal()` is synchronous (no more work
