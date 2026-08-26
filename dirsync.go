@@ -54,14 +54,20 @@ func NewSyncSession() *SyncSession {
 // sequential IDs); AddFile asserts it matches the next available slot, so a
 // caller that skips or reorders entries fails loudly instead of silently
 // desynchronizing the ID space from the table.
-func (s *SyncSession) AddFile(fe *FileEntry) uint32 {
+// AddFile registers fe, which must be the next dense ID (walkSource
+// guarantees this in the real pipeline; only a bug there, not any external
+// input, could violate it). Returns an error rather than panicking: a
+// panic in a server/transfer data path is a liveness hazard (it can bring
+// down the whole process instead of just failing this one transfer), and
+// every other error in this file is returned, not panicked.
+func (s *SyncSession) AddFile(fe *FileEntry) (uint32, error) {
 	s.filesMu.Lock()
 	defer s.filesMu.Unlock()
 	if int(fe.ID) != len(s.files) {
-		panic(fmt.Sprintf("SyncSession.AddFile: FileID %d does not match next slot %d", fe.ID, len(s.files)))
+		return 0, fmt.Errorf("SyncSession.AddFile: FileID %d does not match next slot %d", fe.ID, len(s.files))
 	}
 	s.files = append(s.files, fe)
-	return fe.ID
+	return fe.ID, nil
 }
 
 // FileByID returns the entry for id, or nil if id is out of range.
@@ -377,7 +383,7 @@ func startDirClient(srcRoot, serverAddress string, blockSizeCap uint32, noCompre
 	walkDone := make(chan struct{})
 	go func() {
 		defer close(walkDone)
-		walkErr = walkSource(srcRoot, nil, fileChan, func(relPath, reason string) {
+		walkErr = walkSource(srcRoot, nil, capBS, fileChan, func(relPath, reason string) {
 			Log("skip %s: %s\n", relPath, reason)
 		})
 	}()
@@ -386,11 +392,21 @@ func startDirClient(srcRoot, serverAddress string, blockSizeCap uint32, noCompre
 	// IS what assigns it there (walkSource's IDs are dense in emission
 	// order, matching AddFile's contract), then fans it out to the tree
 	// reader and the announce queue.
+	var fanOutErr error
 	go func() {
 		defer close(treeFileChan)
 		defer close(announceChan)
 		for fe := range fileChan {
-			sess.AddFile(fe)
+			if _, err := sess.AddFile(fe); err != nil {
+				// A bug in walkSource's ID assignment, not anything a
+				// remote peer or malformed input could trigger -- still
+				// handled as a controlled failure of this transfer (checked
+				// below, once announceChan's resulting close unblocks
+				// announceErrCh) rather than a panic that would take down
+				// the whole process.
+				fanOutErr = err
+				return
+			}
 			if fe.Kind == KindSkipped {
 				sess.MarkFileSkipped()
 			}
@@ -449,6 +465,13 @@ func startDirClient(srcRoot, serverAddress string, blockSizeCap uint32, noCompre
 
 	if err := <-announceErrCh; err != nil {
 		return sess, fmt.Errorf("announcing tree: %w", err)
+	}
+	// Safe to read here without synchronization beyond what already
+	// happened above: announceChan only closes (unblocking announceErrCh)
+	// AFTER the fan-out goroutine's assignment to fanOutErr, on the same
+	// goroutine, in program order -- so this read happens-after that write.
+	if fanOutErr != nil {
+		return sess, fmt.Errorf("registering walked entry: %w", fanOutErr)
 	}
 
 	fileCount := uint32(sess.FileCount())

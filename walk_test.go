@@ -23,7 +23,7 @@ func drainWalk(t *testing.T, root string, excl []string) ([]*FileEntry, []string
 		mu.Unlock()
 	}
 	errCh := make(chan error, 1)
-	go func() { errCh <- walkSource(root, excl, out, onSkip) }()
+	go func() { errCh <- walkSource(root, excl, 0, out, onSkip) }()
 	var entries []*FileEntry
 	for fe := range out {
 		entries = append(entries, fe)
@@ -248,6 +248,35 @@ func TestWalkTreeFileMetadataCaptured(t *testing.T) {
 	}
 }
 
+// TestWalkTreeRespectsBlockSizeCap is a regression test for B1: walkSource
+// used to compute every file's block size from the package-global
+// blockSize directly, ignoring the blockSizeCap argument entirely -- so a
+// caller-supplied cap silently had no effect on actual per-file block
+// sizes (only on the TreeReader byte budget, which used blockSizeCap
+// correctly all along). Kept well below the package global's own default
+// (10 MB) so this can't pass by coincidence.
+func TestWalkTreeRespectsBlockSizeCap(t *testing.T) {
+	root := t.TempDir()
+	mustWriteFile(t, filepath.Join(root, "f.bin"), string(make([]byte, 200000))) // 200KB
+	const blockCap = 8192
+	out := make(chan *FileEntry, 8)
+	errCh := make(chan error, 1)
+	go func() { errCh <- walkSource(root, nil, blockCap, out, nil) }()
+	var entries []*FileEntry
+	for fe := range out {
+		entries = append(entries, fe)
+	}
+	if err := <-errCh; err != nil {
+		t.Fatalf("walkSource: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("got %d entries, want 1", len(entries))
+	}
+	if entries[0].BlockSize != blockCap {
+		t.Errorf("BlockSize = %d, want exactly %d (the cap, for a 200KB file that exceeds it)", entries[0].BlockSize, blockCap)
+	}
+}
+
 func TestWalkTreeEmptyFileHasZeroBlocks(t *testing.T) {
 	root := t.TempDir()
 	mustWriteFile(t, filepath.Join(root, "empty.txt"), "")
@@ -395,7 +424,7 @@ func TestWalkTreeErrorInSubdirContinues(t *testing.T) {
 
 func TestWalkTreeNonexistentRoot(t *testing.T) {
 	out := make(chan *FileEntry, 1)
-	err := walkSource(filepath.Join(t.TempDir(), "does-not-exist"), nil, out, nil)
+	err := walkSource(filepath.Join(t.TempDir(), "does-not-exist"), nil, 0, out, nil)
 	if err == nil {
 		t.Fatal("expected an error for a nonexistent root")
 	}
@@ -407,7 +436,7 @@ func TestWalkTreeNonexistentRoot(t *testing.T) {
 func TestWalkTreeRootIsAFile(t *testing.T) {
 	path := writeTempFile(t, []byte("not a directory"))
 	out := make(chan *FileEntry, 1)
-	err := walkSource(path, nil, out, nil)
+	err := walkSource(path, nil, 0, out, nil)
 	if err == nil {
 		t.Fatal("expected an error when root is a regular file")
 	}

@@ -1208,3 +1208,40 @@ func TestE2EDirSourceFileDisappearsAfterWalkStillCompletes(t *testing.T) {
 	// above, is that the failure was correctly isolated to this one file
 	// and did not affect 0-pad.bin or 2-good.txt, or hang the transfer.
 }
+
+// TestE2EDirBlockSizeCapEndToEnd is the end-to-end counterpart to
+// TestWalkTreeRespectsBlockSizeCap: confirms startDirClient's own capBS
+// resolution actually reaches the walk (not just the byte budget) through
+// the real client entry point, not just walkSource directly.
+func TestE2EDirBlockSizeCapEndToEnd(t *testing.T) {
+	resetEngineGlobals()
+	src := t.TempDir()
+	mustWriteFile(t, filepath.Join(src, "f.bin"), string(randomBytes(200000, 902)))
+
+	dst := t.TempDir()
+	port := freeTCPPort(t)
+	addr := "127.0.0.1:" + port
+	srvErrCh := make(chan error, 1)
+	go func() { srvErrCh <- startDirServer(dst, "127.0.0.1", port, 1, true) }()
+	waitForListener(t, addr)
+
+	const blockCap = 8192
+	sess, err := startDirClient(src, addr, blockCap, true, 1)
+	if err != nil {
+		t.Fatalf("startDirClient: %v", err)
+	}
+	if err := <-srvErrCh; err != nil {
+		t.Fatalf("startDirServer: %v", err)
+	}
+	if sess.FailedCount() != 0 {
+		t.Fatalf("%d failed file(s)", sess.FailedCount())
+	}
+	fe := sess.FileByID(0)
+	if fe == nil {
+		t.Fatal("FileID 0 not found")
+	}
+	if fe.BlockSize != blockCap {
+		t.Errorf("BlockSize = %d, want exactly %d (the cap passed to startDirClient)", fe.BlockSize, blockCap)
+	}
+	assertTreesEqual(t, src, dst)
+}

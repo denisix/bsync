@@ -217,11 +217,62 @@ func TestDirHandleConnRejectsBlockSizeMismatch(t *testing.T) {
 	expectHandlerError(t, errCh, "block size changed")
 }
 
+// --- B2: wire-frame validation / allocation-size sanity caps ---
+
+func TestDirHandleConnRejectsOversizedAnnounceDataSize(t *testing.T) {
+	st := newTestDirServerState(t, 1)
+	client, errCh := runDirHandleConn(t, st)
+	// Claims far more than dirAnnounceMaxDataSize -- must be rejected from
+	// the header alone, before handleAnnounce ever tries to
+	// make([]byte, msg.DataSize) and read that many bytes off the wire (no
+	// trailer is actually sent here, proving the rejection happens first).
+	writeDirMsg(t, client, &Msg{Op: uint8(OpAnnounce), DataSize: dirAnnounceMaxDataSize + 1})
+	expectHandlerError(t, errCh, "exceeds sanity limit")
+}
+
+func TestDirHandleConnRejectsZeroDataSizeAnnounce(t *testing.T) {
+	st := newTestDirServerState(t, 1)
+	client, errCh := runDirHandleConn(t, st)
+	writeDirMsg(t, client, &Msg{Op: uint8(OpAnnounce), DataSize: 0})
+	expectHandlerError(t, errCh, "DataSize must be nonzero")
+}
+
+func TestDirHandleConnRejectsOversizedBlockSizeOnFileOpen(t *testing.T) {
+	st := newTestDirServerState(t, 1)
+	if err := st.ft.Announce(AnnounceRec{FileID: 1, Kind: KindFile, Path: "f.txt", FileSize: 4096}); err != nil {
+		t.Fatal(err)
+	}
+	client, errCh := runDirHandleConn(t, st)
+	writeDirMsg(t, client, &Msg{Op: uint8(OpFileOpen), FileID: 1, BlockSize: dirBlockSizeMax + 1})
+	expectHandlerError(t, errCh, "exceeds sanity limit")
+}
+
+func TestDirHandleConnRejectsZeroBlockSizeOnFileOpen(t *testing.T) {
+	st := newTestDirServerState(t, 1)
+	if err := st.ft.Announce(AnnounceRec{FileID: 1, Kind: KindFile, Path: "f.txt", FileSize: 4096}); err != nil {
+		t.Fatal(err)
+	}
+	client, errCh := runDirHandleConn(t, st)
+	writeDirMsg(t, client, &Msg{Op: uint8(OpFileOpen), FileID: 1, BlockSize: 0})
+	expectHandlerError(t, errCh, "BlockSize must be nonzero")
+}
+
+func TestDirHandleConnRejectsUnexpectedFlagsOnFileClose(t *testing.T) {
+	st := newTestDirServerState(t, 1)
+	client, errCh := runDirHandleConn(t, st)
+	writeDirMsg(t, client, &Msg{Op: uint8(OpFileClose), FileID: 1, Flags: FlagCompressed})
+	expectHandlerError(t, errCh, "invalid file-close/file-done message flags")
+}
+
 func TestDirHandleConnRejectsUnexpectedOp(t *testing.T) {
 	st := newTestDirServerState(t, 1)
 	client, errCh := runDirHandleConn(t, st)
 	writeDirMsg(t, client, &Msg{Op: 250}) // not any defined opcode
-	expectHandlerError(t, errCh, "unexpected op")
+	// Now caught by validateDirClientFrame (B2) before the switch is even
+	// reached, hence "unexpected directory client op" rather than the
+	// switch's own "unexpected op" default case -- same rejection,
+	// earlier and with an explicit sanity/shape check first.
+	expectHandlerError(t, errCh, "unexpected directory client op")
 }
 
 func TestDirHandleConnAnnounceRejectsPathTraversalOverTheWire(t *testing.T) {
@@ -502,10 +553,11 @@ func TestDirHandleConnRejectsOversizedPayload(t *testing.T) {
 		t.Fatal(err)
 	}
 	// DataSize claims far more than BlockSize+encryptOverhead could ever
-	// legitimately be -- handleBlockData must reject this before even
-	// trying to read that many bytes off the wire.
+	// legitimately be -- now caught by validateDirClientFrame (B2) before
+	// the frame is even dispatched to handleBlockData, rather than by
+	// handleBlockData's own (now-redundant, still-correct) check.
 	writeDirMsg(t, client, &Msg{Op: uint8(OpBlockData), FileID: 1, BlockIdx: 0, BlockSize: 8, FileSize: 8, DataSize: 1 << 20})
-	expectHandlerError(t, errCh, "too large")
+	expectHandlerError(t, errCh, "exceeds BlockSize+overhead")
 }
 
 func TestDirHandleConnRejectsBlockIndexBeyondFileSize(t *testing.T) {

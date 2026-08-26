@@ -199,8 +199,18 @@ func excluded(relPath string, patterns []string) bool {
 // walkSource returns a non-nil error only for a problem with the walk as a
 // whole: root doesn't exist, root isn't a directory, or an unexpected
 // lower-level failure.
-func walkSource(root string, excl []string, out chan<- *FileEntry, onSkip func(relPath, reason string)) error {
+//
+// blockSizeCap bounds treeBlockSize's per-file block size, exactly as the
+// caller intends (typically startDirClient's own resolved capBS, itself
+// derived from -b); 0 means "use the package-global blockSize", matching
+// the same zero-means-default convention startDirClient already uses for
+// blockSizeCap itself, so existing callers passing 0 see no behavior
+// change.
+func walkSource(root string, excl []string, blockSizeCap uint32, out chan<- *FileEntry, onSkip func(relPath, reason string)) error {
 	defer close(out)
+	if blockSizeCap == 0 {
+		blockSizeCap = blockSize
+	}
 
 	rootInfo, err := os.Lstat(root)
 	if err != nil {
@@ -318,7 +328,7 @@ func walkSource(root string, excl []string, out chan<- *FileEntry, onSkip func(r
 				return nil
 			}
 			size := uint64(info.Size())
-			bs := treeBlockSize(size, blockSize)
+			bs := treeBlockSize(size, blockSizeCap)
 			var blocks uint32
 			if size > 0 {
 				blocks = uint32((size + uint64(bs) - 1) / uint64(bs))

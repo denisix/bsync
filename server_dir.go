@@ -691,19 +691,30 @@ func (ft *fileTable) FirstFinalizeErr() error {
 // other the way the legacy single-file path's globals require an explicit
 // reset between runs to avoid.
 type dirServerState struct {
+	// activeConns and totalBytes are the struct's 64-bit atomics and must
+	// stay first: sync/atomic only guarantees 8-byte alignment for the
+	// FIRST word of an allocated struct on 32-bit platforms (ARM, x86-32,
+	// 32-bit MIPS) -- a *fileTable pointer (4 bytes on those platforms)
+	// preceding an int64/uint64 field would misalign it, and
+	// atomic.AddInt64/LoadUint64 on a misaligned word can panic there. This
+	// project currently only ships amd64/windows-amd64 builds, so this was
+	// latent rather than observed, but correct regardless of today's build
+	// targets.
+	activeConns int64  // atomic
+	totalBytes  uint64 // atomic
+
 	ft *fileTable
 
-	activeConns  int64 // atomic
 	treeDoneSeen int32 // atomic
 
-	// fileCount/totalBytes/announceEndSeen are set by OpAnnounceEnd and read
-	// by OpTreeDone's cross-check. In practice both opcodes arrive on the
-	// same (control) connection, but the wire protocol does not itself
-	// enforce that — soft binding means no connection's identity is
-	// authoritative, so nothing here should rely on connection affinity for
-	// correctness. Kept atomic accordingly, matching treeDoneSeen above.
+	// fileCount/announceEndSeen are set by OpAnnounceEnd and read by
+	// OpTreeDone's cross-check (totalBytes above too). In practice both
+	// opcodes arrive on the same (control) connection, but the wire
+	// protocol does not itself enforce that — soft binding means no
+	// connection's identity is authoritative, so nothing here should rely
+	// on connection affinity for correctness. Kept atomic accordingly,
+	// matching treeDoneSeen above.
 	fileCount       uint32 // atomic
-	totalBytes      uint64 // atomic
 	announceEndSeen int32  // atomic; 0/1
 }
 
@@ -936,8 +947,14 @@ func dirHandleConn(conn net.Conn, st *dirServerState, doneChan chan struct{}) er
 		if msg.MagicHead != magicBytes {
 			return fmt.Errorf("invalid request magic")
 		}
-		if msg.Reserved != zeroReserved {
-			return fmt.Errorf("invalid request: reserved bytes must be zero")
+		// Covers Reserved (as the old inline check here did) plus every
+		// other directory-mode opcode's shape: unexpected flags, and sanity
+		// caps on wire-driven allocation sizes (DataSize/BlockSize) that
+		// this loop previously trusted unconditionally before handing them
+		// to handleAnnounce's make([]byte, msg.DataSize) or
+		// negotiateBlockSize's unconditional first-use acceptance.
+		if err := validateDirClientFrame(msg); err != nil {
+			return fmt.Errorf("invalid request: %w", err)
 		}
 
 		switch Op(msg.Op) {
@@ -1119,9 +1136,17 @@ func handleBlockCheck(conn net.Conn, magicBytes [magicLen]byte, sess *dirSession
 	}
 	hashMsg := &Msg{MagicHead: magicBytes, Op: uint8(OpHash), FileID: msg.FileID, BlockIdx: msg.BlockIdx, BlockSize: msg.BlockSize, FileSize: df.size, DataSize: uint32(len(hash))}
 	if err := sendMsg(conn, hashMsg); err != nil {
+		// A write failure here (e.g. a dropped connection) self-heals: the
+		// caller's next read will hit the connection's own read deadline
+		// and the client redials, exactly as any other connection loss
+		// does. But silently swallowing it (bare "return nil", no log)
+		// previously converted a clean, immediately-diagnosable error into
+		// an up-to-5-minute silent stall from the operator's point of view.
+		Log("directory server: send hash for file %d block %d: %v\n", msg.FileID, msg.BlockIdx, err)
 		return nil
 	}
 	if err := connWrite(conn, hash); err != nil {
+		Log("directory server: send hash digest for file %d block %d: %v\n", msg.FileID, msg.BlockIdx, err)
 		return nil
 	}
 

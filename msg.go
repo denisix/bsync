@@ -141,6 +141,98 @@ func validateClientFrame(msg *Msg) error {
 	}
 }
 
+const (
+	// dirAnnounceMaxDataSize sanity-bounds an OpAnnounce trailer's claimed
+	// DataSize before handleAnnounce allocates a buffer for it: the batcher
+	// caps a real batch at announceBatchSize (200) records, and even a
+	// worst-case record (the maximum 0xFFFF-byte path encodeAnnounceBatch
+	// allows) is a few tens of KB, so a legitimate batch never gets close
+	// to this; it exists to stop a corrupted or hostile DataSize (up to
+	// 4 GiB, being a uint32) from causing a multi-gigabyte allocation.
+	dirAnnounceMaxDataSize = 64 << 20 // 64 MiB
+	// dirBlockSizeMax sanity-bounds BlockSize on every directory-mode
+	// opcode that carries one. Generous relative to any real -b value
+	// (10 MiB default, users occasionally go much higher for huge files)
+	// so it never rejects a legitimate transfer; it exists only to stop a
+	// corrupted or hostile BlockSize (also a uint32, up to 4 GiB) from
+	// sizing a destination-side read/write buffer absurdly large.
+	dirBlockSizeMax = 1 << 30 // 1 GiB
+)
+
+// validateDirClientFrame validates a message received by the directory-mode
+// destination server from the directory-mode client, covering the opcode
+// set validateClientFrame (the legacy single-file validator) does not:
+// OpAnnounce, OpAnnounceEnd, OpFileOpen, OpBlockCheck, OpBlockZero,
+// OpBlockData, OpFileClose, OpFileDone, OpTreeDone. Same "reject rather
+// than repair" posture as validateClientFrame, plus explicit sanity caps on
+// wire-driven allocation sizes (DataSize, BlockSize) that dirHandleConn
+// previously trusted unconditionally.
+func validateDirClientFrame(msg *Msg) error {
+	if msg.Reserved != zeroReserved {
+		return fmt.Errorf("invalid message: reserved bytes must be zero")
+	}
+	blockSizeOp := func(name string) error {
+		if msg.DataSize != 0 || msg.Flags != 0 {
+			return fmt.Errorf("invalid %s message flags", name)
+		}
+		if msg.BlockSize == 0 {
+			return fmt.Errorf("invalid %s message: BlockSize must be nonzero", name)
+		}
+		if msg.BlockSize > dirBlockSizeMax {
+			return fmt.Errorf("invalid %s message: BlockSize %d exceeds sanity limit %d", name, msg.BlockSize, dirBlockSizeMax)
+		}
+		return nil
+	}
+	switch Op(msg.Op) {
+	case OpAnnounce:
+		if msg.Flags != 0 {
+			return fmt.Errorf("invalid announce message flags")
+		}
+		if msg.DataSize == 0 {
+			return fmt.Errorf("invalid announce message: DataSize must be nonzero")
+		}
+		if msg.DataSize > dirAnnounceMaxDataSize {
+			return fmt.Errorf("invalid announce message: DataSize %d exceeds sanity limit %d", msg.DataSize, dirAnnounceMaxDataSize)
+		}
+		return nil
+	case OpAnnounceEnd, OpTreeDone:
+		if msg.DataSize != 0 || msg.Flags != 0 {
+			return fmt.Errorf("invalid announce-end/tree-done message flags")
+		}
+		return nil
+	case OpFileOpen:
+		return blockSizeOp("file-open")
+	case OpBlockCheck:
+		return blockSizeOp("checksum request")
+	case OpBlockZero:
+		return blockSizeOp("zero-write")
+	case OpBlockData:
+		if msg.DataSize == 0 {
+			return fmt.Errorf("invalid data message: DataSize must be nonzero")
+		}
+		if msg.Flags&^FlagCompressed != 0 {
+			return fmt.Errorf("invalid data message flags")
+		}
+		if msg.BlockSize == 0 {
+			return fmt.Errorf("invalid data message: BlockSize must be nonzero")
+		}
+		if msg.BlockSize > dirBlockSizeMax {
+			return fmt.Errorf("invalid data message: BlockSize %d exceeds sanity limit %d", msg.BlockSize, dirBlockSizeMax)
+		}
+		if uint64(msg.DataSize) > uint64(msg.BlockSize)+uint64(encryptOverhead) {
+			return fmt.Errorf("invalid data message: DataSize %d exceeds BlockSize+overhead", msg.DataSize)
+		}
+		return nil
+	case OpFileClose, OpFileDone:
+		if msg.DataSize != 0 || msg.Flags != 0 {
+			return fmt.Errorf("invalid file-close/file-done message flags")
+		}
+		return nil
+	default:
+		return fmt.Errorf("unexpected directory client op %d", msg.Op)
+	}
+}
+
 // validateDownloadRequest validates a message received by the download
 // server (the source) from the download client (the destination). Every
 // download request, whether the initial metadata probe or an ordinary block

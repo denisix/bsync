@@ -14,11 +14,11 @@ func TestSyncSessionAddFileAndLookup(t *testing.T) {
 	fe0 := &FileEntry{ID: 0, RelPath: "a.txt", Kind: KindFile}
 	fe1 := &FileEntry{ID: 1, RelPath: "b.txt", Kind: KindFile}
 
-	if got := s.AddFile(fe0); got != 0 {
-		t.Errorf("AddFile(fe0) = %d, want 0", got)
+	if got, err := s.AddFile(fe0); got != 0 || err != nil {
+		t.Errorf("AddFile(fe0) = (%d, %v), want (0, nil)", got, err)
 	}
-	if got := s.AddFile(fe1); got != 1 {
-		t.Errorf("AddFile(fe1) = %d, want 1", got)
+	if got, err := s.AddFile(fe1); got != 1 || err != nil {
+		t.Errorf("AddFile(fe1) = (%d, %v), want (1, nil)", got, err)
 	}
 	if s.FileCount() != 2 {
 		t.Errorf("FileCount = %d, want 2", s.FileCount())
@@ -34,17 +34,24 @@ func TestSyncSessionAddFileAndLookup(t *testing.T) {
 	}
 }
 
-func TestSyncSessionAddFileWrongIDPanics(t *testing.T) {
+// TestSyncSessionAddFileWrongIDReturnsError is a regression test for B3:
+// AddFile used to panic on an ID/slot mismatch -- a panic in a
+// server/transfer data path is a liveness hazard, able to take down the
+// whole process over what should just fail this one transfer. It now
+// returns an error instead, matching every other error in this file.
+func TestSyncSessionAddFileWrongIDReturnsError(t *testing.T) {
 	s := NewSyncSession()
-	s.AddFile(&FileEntry{ID: 0})
-	defer func() {
-		if r := recover(); r == nil {
-			t.Fatal("AddFile with a skipped ID did not panic")
-		}
-	}()
-	// Next expected slot is 1; ID 5 must panic rather than silently
-	// desynchronizing the ID space from the file table.
-	s.AddFile(&FileEntry{ID: 5})
+	if _, err := s.AddFile(&FileEntry{ID: 0}); err != nil {
+		t.Fatalf("AddFile(ID 0): %v", err)
+	}
+	// Next expected slot is 1; ID 5 must return an error, not panic, and
+	// must not silently desynchronize the ID space from the file table.
+	if _, err := s.AddFile(&FileEntry{ID: 5}); err == nil {
+		t.Fatal("AddFile with a skipped ID unexpectedly succeeded")
+	}
+	if s.FileCount() != 1 {
+		t.Errorf("FileCount = %d, want 1 -- the rejected entry must not have been appended", s.FileCount())
+	}
 }
 
 func TestSyncSessionWalkDone(t *testing.T) {
