@@ -179,7 +179,16 @@ func copyBinaryToRemote(sshTarget, sshPort string) (string, error) {
 	return remotePath, nil
 }
 
-func startRemoteSSH(targetPath, port string, blockSize, skipIdx uint32, quiet bool, noCompress bool) (*exec.Cmd, error) {
+// startRemoteSSH launches the destination side of an upload transfer,
+// either locally (no host in targetPath) or over ssh. dirMode forwards -R
+// so the spawned process runs startDirServer even against a destination
+// path that doesn't exist yet (directory auto-detection via os.Stat can't
+// help there — the whole point of a fresh destination). workers forwards
+// -w; unlike blockSize/skipIdx/quiet/noCompress, this was never forwarded
+// at all before directory mode needed it to size startDirServer's fd
+// budget and worker-facing connection handling correctly, not just the
+// legacy path's OrderedWriter reorder window.
+func startRemoteSSH(targetPath, port string, blockSize, skipIdx uint32, quiet bool, noCompress bool, dirMode bool, workers int) (*exec.Cmd, error) {
 	// split sshTarget "user@host:/remote/path" -> "user@host" and "/remote/path"
 	user, host, sshPort, file := parseSSHTarget(targetPath)
 
@@ -194,12 +203,15 @@ func startRemoteSSH(targetPath, port string, blockSize, skipIdx uint32, quiet bo
 		}
 
 		// Create command with absolute path to bsync
-		args := []string{execPath, "-f", file, "-p", port, "-b", strconv.FormatUint(uint64(blockSize), 10), "-s", strconv.FormatUint(uint64(skipIdx), 10)}
+		args := []string{execPath, "-f", file, "-p", port, "-b", strconv.FormatUint(uint64(blockSize), 10), "-s", strconv.FormatUint(uint64(skipIdx), 10), "-w", strconv.Itoa(workers)}
 		if quiet {
 			args = append(args, "-q")
 		}
 		if noCompress {
 			args = append(args, "-n")
+		}
+		if dirMode {
+			args = append(args, "-R")
 		}
 		// Pass encryption key if enabled
 		if IsEncryptionEnabled() {
@@ -251,6 +263,7 @@ func startRemoteSSH(targetPath, port string, blockSize, skipIdx uint32, quiet bo
 		"-p", port,
 		"-b", strconv.FormatUint(uint64(blockSize), 10),
 		"-s", strconv.FormatUint(uint64(skipIdx), 10),
+		"-w", strconv.Itoa(workers),
 		"-P", // suppress server-side progress (client shows its own)
 	}
 
@@ -260,6 +273,10 @@ func startRemoteSSH(targetPath, port string, blockSize, skipIdx uint32, quiet bo
 
 	if noCompress {
 		remoteArgs = append(remoteArgs, "-n")
+	}
+
+	if dirMode {
+		remoteArgs = append(remoteArgs, "-R")
 	}
 
 	// Pass encryption key if enabled

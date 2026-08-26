@@ -31,7 +31,7 @@ func runDirTransfer(t *testing.T, srcRoot string, workers int, noCompress bool) 
 	}()
 	waitForListener(t, addr)
 
-	sess, err := startDirClient(srcRoot, addr, 0, noCompress, workers)
+	sess, err := startDirClient(srcRoot, addr, 0, noCompress, workers, nil)
 	if err != nil {
 		t.Fatalf("startDirClient: %v", err)
 	}
@@ -279,7 +279,7 @@ func TestE2EDirIdempotentSecondRun(t *testing.T) {
 		before[rel] = info.ModTime()
 	}
 
-	sess2, err := startDirClient(src, addr, 0, false, 2)
+	sess2, err := startDirClient(src, addr, 0, false, 2, nil)
 	if err != nil {
 		t.Fatalf("second startDirClient: %v", err)
 	}
@@ -323,7 +323,7 @@ func TestE2EDirDestinationRootCreatedIfMissing(t *testing.T) {
 	go func() { srvErrCh <- startDirServer(dstRoot, "127.0.0.1", port, 1, true) }()
 	waitForListener(t, addr)
 
-	sess, err := startDirClient(src, addr, 0, false, 1)
+	sess, err := startDirClient(src, addr, 0, false, 1, nil)
 	if err != nil {
 		t.Fatalf("startDirClient: %v", err)
 	}
@@ -481,7 +481,7 @@ func TestE2EDirSurvivesMidTransferConnectionDrops(t *testing.T) {
 	// budget on the very first block before any redial could pay off.
 	proxyAddr, _ := startFaultyProxy(t, realAddr, 1, 2, 200)
 
-	sess, err := startDirClient(src, proxyAddr, 0, true, 1)
+	sess, err := startDirClient(src, proxyAddr, 0, true, 1, nil)
 	if err != nil {
 		t.Fatalf("startDirClient did not recover from repeated connection drops: %v", err)
 	}
@@ -500,7 +500,7 @@ func TestStartDirClientRejectsZeroWorkers(t *testing.T) {
 	resetEngineGlobals()
 	src := t.TempDir()
 	mustWriteFile(t, filepath.Join(src, "f.txt"), "x")
-	if _, err := startDirClient(src, "127.0.0.1:1", 0, false, 0); err == nil {
+	if _, err := startDirClient(src, "127.0.0.1:1", 0, false, 0, nil); err == nil {
 		t.Fatal("startDirClient with workers=0 unexpectedly succeeded")
 	}
 }
@@ -513,7 +513,7 @@ func TestStartDirClientFailsFastOnConnectionRefused(t *testing.T) {
 	// hang for the full dialTimeout.
 	port := freeTCPPort(t)
 	start := time.Now()
-	_, err := startDirClient(src, "127.0.0.1:"+port, 0, false, 1)
+	_, err := startDirClient(src, "127.0.0.1:"+port, 0, false, 1, nil)
 	if err == nil {
 		t.Fatal("startDirClient against a closed port unexpectedly succeeded")
 	}
@@ -526,7 +526,7 @@ func TestStartDirClientRejectsUnresolvableAddress(t *testing.T) {
 	resetEngineGlobals()
 	src := t.TempDir()
 	mustWriteFile(t, filepath.Join(src, "f.txt"), "x")
-	if _, err := startDirClient(src, "this-host-does-not-resolve.invalid:9999", 0, false, 1); err == nil {
+	if _, err := startDirClient(src, "this-host-does-not-resolve.invalid:9999", 0, false, 1, nil); err == nil {
 		t.Fatal("startDirClient with an unresolvable address unexpectedly succeeded")
 	}
 }
@@ -657,7 +657,7 @@ func TestE2EDirPartiallyModifiedDestination(t *testing.T) {
 	go func() { srvErrCh <- startDirServer(dst, "127.0.0.1", port, 2, true) }()
 	waitForListener(t, addr)
 
-	sess2, err := startDirClient(src, addr, 0, true, 2)
+	sess2, err := startDirClient(src, addr, 0, true, 2, nil)
 	if err != nil {
 		t.Fatalf("second startDirClient: %v", err)
 	}
@@ -696,7 +696,7 @@ func TestE2EDirDestinationLongerThanSourceIsTruncated(t *testing.T) {
 	go func() { srvErrCh <- startDirServer(dst, "127.0.0.1", port, 1, true) }()
 	waitForListener(t, addr)
 
-	sess, err := startDirClient(src, addr, 0, true, 1)
+	sess, err := startDirClient(src, addr, 0, true, 1, nil)
 	if err != nil {
 		t.Fatalf("startDirClient: %v", err)
 	}
@@ -725,7 +725,7 @@ func TestE2EDirDestinationShorterIsExtended(t *testing.T) {
 	go func() { srvErrCh <- startDirServer(dst, "127.0.0.1", port, 1, true) }()
 	waitForListener(t, addr)
 
-	sess, err := startDirClient(src, addr, 0, true, 1)
+	sess, err := startDirClient(src, addr, 0, true, 1, nil)
 	if err != nil {
 		t.Fatalf("startDirClient: %v", err)
 	}
@@ -763,7 +763,7 @@ func TestE2EDirEncrypted(t *testing.T) {
 	go func() { srvErrCh <- startDirServer(dst, "127.0.0.1", port, 2, true) }()
 	waitForListener(t, addr)
 
-	sess, err := startDirClient(src, addr, 0, false, 2)
+	sess, err := startDirClient(src, addr, 0, false, 2, nil)
 	if err != nil {
 		t.Fatalf("startDirClient: %v", err)
 	}
@@ -830,7 +830,7 @@ func TestE2EDirIdempotentSecondRunSendsFarFewerBytes(t *testing.T) {
 		waitForListener(t, realAddr)
 		proxyAddr, proxy := startFaultyProxy(t, realAddr, 0, 0, 0) // pure counting passthrough
 
-		sess, err := startDirClient(src, proxyAddr, 0, true, 2)
+		sess, err := startDirClient(src, proxyAddr, 0, true, 2, nil)
 		if err != nil {
 			t.Fatalf("startDirClient: %v", err)
 		}
@@ -905,7 +905,7 @@ func TestE2EDirUnreadableSourceFileIsSkippedNotFailed(t *testing.T) {
 	go func() { srvErrCh <- startDirServer(dst, "127.0.0.1", port, 2, true) }()
 	waitForListener(t, addr)
 
-	sess, err := startDirClient(src, addr, 0, false, 2)
+	sess, err := startDirClient(src, addr, 0, false, 2, nil)
 	if err != nil {
 		t.Fatalf("startDirClient: %v", err)
 	}
@@ -959,7 +959,7 @@ func TestE2EDirDestinationPathIsADirectory(t *testing.T) {
 	var clientErr error
 	go func() {
 		defer close(done)
-		sess, clientErr = startDirClient(src, addr, 0, true, 2)
+		sess, clientErr = startDirClient(src, addr, 0, true, 2, nil)
 	}()
 	select {
 	case <-done:
@@ -1009,7 +1009,7 @@ func TestE2EDirReadOnlyDestinationRoot(t *testing.T) {
 	go func() { srvErrCh <- startDirServer(dstRoot, "127.0.0.1", port, 1, true) }()
 	waitForListener(t, addr)
 
-	sess, err := startDirClient(src, addr, 0, true, 1)
+	sess, err := startDirClient(src, addr, 0, true, 1, nil)
 	if err != nil {
 		t.Fatalf("startDirClient: %v", err)
 	}
@@ -1065,7 +1065,7 @@ func TestE2EDirLargeTreeDoesNotDeadlock(t *testing.T) {
 	var clientErr error
 	go func() {
 		defer close(clientDone)
-		sess, clientErr = startDirClient(src, addr, 0, true, 4)
+		sess, clientErr = startDirClient(src, addr, 0, true, 4, nil)
 	}()
 	select {
 	case <-clientDone:
@@ -1147,7 +1147,7 @@ func TestE2EDirSourceFileDisappearsAfterWalkStillCompletes(t *testing.T) {
 	var clientErr error
 	go func() {
 		defer close(clientDone)
-		sess, clientErr = startDirClient(src, proxyAddr, 0, true, 1)
+		sess, clientErr = startDirClient(src, proxyAddr, 0, true, 1, nil)
 	}()
 
 	// The walk (stat-only) is done essentially instantly; TreeReader is
@@ -1226,7 +1226,7 @@ func TestE2EDirBlockSizeCapEndToEnd(t *testing.T) {
 	waitForListener(t, addr)
 
 	const blockCap = 8192
-	sess, err := startDirClient(src, addr, blockCap, true, 1)
+	sess, err := startDirClient(src, addr, blockCap, true, 1, nil)
 	if err != nil {
 		t.Fatalf("startDirClient: %v", err)
 	}
@@ -1244,4 +1244,48 @@ func TestE2EDirBlockSizeCapEndToEnd(t *testing.T) {
 		t.Errorf("BlockSize = %d, want exactly %d (the cap passed to startDirClient)", fe.BlockSize, blockCap)
 	}
 	assertTreesEqual(t, src, dst)
+}
+
+// TestE2EDirExcludeEndToEnd confirms startDirClient's excl parameter
+// actually reaches walkSource through the real client entry point (the
+// matcher itself, excluded(), is already covered directly by
+// TestWalkTreeExcluded).
+func TestE2EDirExcludeEndToEnd(t *testing.T) {
+	resetEngineGlobals()
+	src := t.TempDir()
+	mustWriteFile(t, filepath.Join(src, "keep.txt"), "keep me")
+	mustWriteFile(t, filepath.Join(src, "skip.log"), "exclude me")
+	mustMkdirAll(t, filepath.Join(src, "sub"))
+	mustWriteFile(t, filepath.Join(src, "sub", "also.log"), "exclude me too")
+
+	dst := t.TempDir()
+	port := freeTCPPort(t)
+	addr := "127.0.0.1:" + port
+	srvErrCh := make(chan error, 1)
+	go func() { srvErrCh <- startDirServer(dst, "127.0.0.1", port, 1, true) }()
+	waitForListener(t, addr)
+
+	sess, err := startDirClient(src, addr, 0, true, 1, []string{"*.log"})
+	if err != nil {
+		t.Fatalf("startDirClient: %v", err)
+	}
+	if err := <-srvErrCh; err != nil {
+		t.Fatalf("startDirServer: %v", err)
+	}
+	if sess.FailedCount() != 0 {
+		t.Fatalf("%d failed file(s)", sess.FailedCount())
+	}
+
+	got, err := os.ReadFile(filepath.Join(dst, "keep.txt"))
+	if err != nil {
+		t.Fatalf("keep.txt missing at destination: %v", err)
+	}
+	if string(got) != "keep me" {
+		t.Errorf("keep.txt content mismatch")
+	}
+	for _, excluded := range []string{"skip.log", filepath.Join("sub", "also.log")} {
+		if _, err := os.Stat(filepath.Join(dst, excluded)); err == nil {
+			t.Errorf("%s should have been excluded but exists at the destination", excluded)
+		}
+	}
 }

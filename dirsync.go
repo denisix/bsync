@@ -504,12 +504,14 @@ func (r *dirProgressRenderer) run() {
 }
 
 // startDirClient walks srcRoot, announces it to serverAddress, and
-// transfers every differing block over workers parallel connections. The
+// transfers every differing block over workers parallel connections. excl
+// is a list of glob patterns (matched by walkSource/excluded against each
+// entry's relative path) to skip entirely; nil/empty excludes nothing. The
 // returned SyncSession's FailedCount/FailedError report per-file failures
 // that did not abort the transfer; the returned error is non-nil only for a
 // failure of the transfer as a whole (the walk itself, or the control
 // connection).
-func startDirClient(srcRoot, serverAddress string, blockSizeCap uint32, noCompress bool, workers int) (*SyncSession, error) {
+func startDirClient(srcRoot, serverAddress string, blockSizeCap uint32, noCompress bool, workers int, excl []string) (*SyncSession, error) {
 	if workers < 1 {
 		return nil, fmt.Errorf("worker count must be at least 1")
 	}
@@ -549,7 +551,7 @@ func startDirClient(srcRoot, serverAddress string, blockSizeCap uint32, noCompre
 	walkDone := make(chan struct{})
 	go func() {
 		defer close(walkDone)
-		walkErr = walkSource(srcRoot, nil, capBS, fileChan, func(relPath, reason string) {
+		walkErr = walkSource(srcRoot, excl, capBS, fileChan, func(relPath, reason string) {
 			Log("skip %s: %s\n", relPath, reason)
 		})
 	}()

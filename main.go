@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"strconv"
+	"strings"
 	"sync/atomic"
 )
 
@@ -63,6 +64,8 @@ func main() {
 	var listAllDrives bool
 	var visual bool
 	var suppressProgressFlag bool
+	var forceDirMode bool
+	var excludeFlag string
 
 	flag.BoolVar(&listAllDrives, "a", false, "list available drives and partitions")
 	flag.StringVar(&device, "f", "/dev/zero", "specify file or device, i.e. '/dev/vda'")
@@ -85,6 +88,8 @@ func main() {
 	var autoTune bool
 	flag.BoolVar(&autoTune, "auto", false, "auto-tune parameters for optimal HDD performance")
 	flag.BoolVar(&visual, "v", false, "enable visual block-by-block progress display")
+	flag.BoolVar(&forceDirMode, "R", false, "force recursive directory-tree mode (auto-detected from -f when it's already a directory)")
+	flag.StringVar(&excludeFlag, "exclude", "", "comma-separated glob patterns to skip in directory mode (matched against each entry's full relative path and its base name)")
 
 	flag.Parse() // after declaring flags we need to call it
 
@@ -113,6 +118,46 @@ func main() {
 	}
 	if prefetchDepth < 0 {
 		Err("Prefetch depth cannot be negative\n")
+	}
+
+	// Directory-tree mode: -R forces it; otherwise auto-detected from -f
+	// already being a directory. os.Stat (not Lstat) so a symlinked source
+	// root is followed. On the destination side of a push to a path that
+	// doesn't exist yet, Stat can't help -- that's exactly why the client
+	// side (which DOES know: its own -f must exist) forwards -R to the
+	// remote/local server process explicitly (see ssh.go's startRemoteSSH),
+	// rather than every invocation re-deriving it independently.
+	dirMode := forceDirMode
+	if !dirMode {
+		if st, statErr := os.Stat(device); statErr == nil && st.IsDir() {
+			dirMode = true
+		}
+	}
+	if dirMode {
+		// Directory mode is upload/push only, always block-level (no -s
+		// shortcut), has its own always-on progress line (not the -v grid,
+		// which assumes a single flat block-index space one file wide),
+		// and doesn't support HDD auto-tuning (auto-tune profiles a single
+		// file's access pattern, which doesn't generalize across a tree of
+		// arbitrarily different files).
+		if reverse {
+			Err("directory mode does not support -d (download); only upload/push is supported\n")
+		}
+		if skipIdx != 0 {
+			Err("directory mode does not support -s (every file is resumed automatically and independently)\n")
+		}
+		if autoTune {
+			Err("directory mode does not support -auto\n")
+		}
+		if visual {
+			Err("directory mode does not support -v (visual block-grid display); its own progress line is always shown instead\n")
+		}
+	}
+	var excludePatterns []string
+	for _, pat := range strings.Split(excludeFlag, ",") {
+		if pat = strings.TrimSpace(pat); pat != "" {
+			excludePatterns = append(excludePatterns, pat)
+		}
 	}
 
 	// Handle encryption
@@ -274,6 +319,50 @@ func main() {
 				sshCmd.Wait()
 				Log("DONE, exiting\n")
 			}
+		} else if dirMode {
+			// CLIENT: directory-tree source (upload/push)
+			SetLog(logPrefix, "[client]", quiet)
+			Log("starting client, tree transfer: %s -> %s\n", device, remoteAddr)
+
+			var sshCmd *exec.Cmd
+			if sshTarget != "" {
+				Log("launching remote server via SSH: %s\n", sshTarget)
+				var err error
+				sshCmd, err = startRemoteSSH(sshTarget, port, blockSize, uint32(skipIdx), quiet, noCompress, true, int(workers))
+				if err != nil {
+					Err("Error: SSH launch failed: %s\n", err)
+					return
+				}
+				defer sshCmd.Wait()
+			}
+
+			sess, err := startDirClient(device, remoteAddr, blockSize, noCompress, int(workers), excludePatterns)
+			if err != nil {
+				if sshCmd != nil {
+					sshCmd.Process.Kill()
+					sshCmd.Wait()
+				}
+				Err("directory sync failed: %s\n", err.Error())
+				return
+			}
+			if sess.FailedCount() > 0 {
+				Log("synced with %d failed file(s); see earlier log lines for details\n", sess.FailedCount())
+			} else {
+				Log("directory sync complete: %d files, %s\n", sess.FileCount(), formatBytesShort(sess.TotalBytes()))
+			}
+
+			if sshCmd != nil {
+				Log("waiting for remote process to finish\n")
+				sshCmd.Wait()
+				Log("DONE, exiting\n")
+			}
+			// Exit-code contract: 0 = clean, 1 = anything wrong, including a
+			// partial per-file failure that did not abort the transfer as a
+			// whole (matching Err()'s exit code for every other failure
+			// path in this file).
+			if sess.FailedCount() > 0 {
+				os.Exit(1)
+			}
 		} else {
 			// CLIENT: source file (original upload mode)
 			SetLog(logPrefix, "[client]", quiet)
@@ -284,7 +373,7 @@ func main() {
 			if sshTarget != "" {
 				Log("launching remote server via SSH: %s\n", sshTarget)
 				var err error
-				sshCmd, err = startRemoteSSH(sshTarget, port, blockSize, uint32(skipIdx), quiet, noCompress)
+				sshCmd, err = startRemoteSSH(sshTarget, port, blockSize, uint32(skipIdx), quiet, noCompress, false, int(workers))
 				if err != nil {
 					Err("Error: SSH launch failed: %s\n", err)
 					return
@@ -348,6 +437,13 @@ func main() {
 
 			if err := startServerUpload(file, bindIp, port, fileSize, checksumCache, int(workers), noCompress); err != nil {
 				Err("download source failed: %s\n", err)
+			}
+		} else if dirMode {
+			// SERVER: directory-tree destination
+			SetLog(logPrefix, "[server]", quiet)
+			Log("starting server, tree destination: remote -> %s\n", device)
+			if err := startDirServer(device, bindIp, port, int(workers), quiet); err != nil {
+				Err("directory destination failed: %s\n", err.Error())
 			}
 		} else {
 			// SERVER: destination file (original download mode)
