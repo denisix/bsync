@@ -25,6 +25,28 @@ type PrecomputedBlock struct {
 	Compressed    []byte // Compressed data (if beneficial)
 	UseCompressed bool   // Whether to use compressed version
 	IsZero        bool
+
+	// Tree-mode fields; zero values preserve today's single-file semantics
+	// exactly, so the single-file path (precomputeChecksumsParallel) never
+	// sets them. A stream mixing blocks from different files has no single
+	// global answer for FileSize/BlockSize the way single-file mode's
+	// package globals provide, so each block carries its own.
+	FileID    uint32
+	FileSize  uint64
+	BlockSize uint32
+	Last      bool   // true for a file's final block
+	release   func() // returns Data's underlying buffer to its pool/budget; nil if Data is nil or unpooled
+}
+
+// Release returns Data's underlying buffer, if any. Safe to call even when
+// release is nil (nothing to do) or Data was never set (compressed-away or
+// zero blocks). The transfer worker that actually sends this block must
+// call it exactly once, after it's done needing Data — never earlier, and
+// never twice.
+func (pb *PrecomputedBlock) Release() {
+	if pb.release != nil {
+		pb.release()
+	}
 }
 
 // compute FNV1a checksum
@@ -162,6 +184,99 @@ func precomputeChecksumsParallel(reader *SequentialReader, cache *ChecksumCache,
 	go func() {
 		wg.Wait()
 		close(precompressedChan)
+	}()
+}
+
+// precomputeTreeBlocks is precomputeChecksumsParallel's directory-tree
+// sibling: it drains one TreeReader (spanning every file in a tree, not
+// just one) and produces PrecomputedBlock values with FileID, FileSize,
+// BlockSize, and Last populated. sess supplies each block's per-file
+// FileSize/BlockSize via FileByID (a mixed stream has no single global
+// answer for either); for a block whose raw buffer is kept rather than
+// compressed away, sess's absence isn't fatal (FileSize/BlockSize just stay
+// zero), but the release closure is always threaded through regardless, so
+// the eventual transfer worker — not this function — decides when the
+// buffer (and, in tree mode, its byte-budget reservation) is actually freed.
+//
+// Unlike precomputeChecksumsParallel, out is NOT closed at a file boundary
+// — only once, when every hashing worker has drained the TreeReader dry
+// (its channel closes after the last file in the tree finishes).
+func precomputeTreeBlocks(tr *TreeReader, sess *SyncSession, out chan<- PrecomputedBlock, workers int, noCompress bool) {
+	Log("checksums: start computing (tree mode) with %d parallel workers..\n", workers)
+
+	var wg sync.WaitGroup
+
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for block := range tr.Blocks() {
+				var fileSize uint64
+				var fileBlockSize uint32
+				if sess != nil {
+					if fe := sess.FileByID(block.FileID); fe != nil {
+						fileSize = fe.Size
+						fileBlockSize = fe.BlockSize
+					}
+				}
+
+				var hash []byte
+				var isZero bool
+				var compressed []byte
+				var useCompressed bool
+				var originalData []byte
+				var release func()
+
+				if isZeroBlock(block.Data) {
+					hash = zeroBlockHash
+					isZero = true
+					if block.release != nil {
+						block.release()
+					}
+				} else {
+					hash = checksum(block.Data)
+					isZero = false
+
+					if noCompress {
+						// -n: never compress; keep the raw block to send.
+						originalData = block.Data
+						release = block.release
+					} else if comp, err := compressData(block.Data); err == nil && len(comp) < len(block.Data) {
+						compressed = comp
+						useCompressed = true
+						// The compressed copy is sent instead; the raw
+						// buffer has no further use.
+						originalData = nil
+						if block.release != nil {
+							block.release()
+						}
+					} else {
+						originalData = block.Data
+						release = block.release
+					}
+				}
+
+				out <- PrecomputedBlock{
+					BlockIdx:      block.BlockIdx,
+					Hash:          hash,
+					Data:          originalData,
+					Compressed:    compressed,
+					UseCompressed: useCompressed,
+					IsZero:        isZero,
+					FileID:        block.FileID,
+					FileSize:      fileSize,
+					BlockSize:     fileBlockSize,
+					Last:          block.Last,
+					release:       release,
+				}
+			}
+		}()
+	}
+
+	// Close channel when all workers done
+	go func() {
+		wg.Wait()
+		close(out)
 	}()
 }
 
