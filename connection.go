@@ -38,6 +38,16 @@ func connWrite(conn net.Conn, data []byte) error {
 	for {
 		conn.SetWriteDeadline(time.Now().Add(ioTimeout))
 		if c, err = conn.Write(data[start:]); err != nil {
+			if start > 0 {
+				// Earlier bytes of this same frame were already written by a
+				// prior iteration of this loop, on the same conn, before
+				// this call failed. If conn is an AutoReconnectTCP, a write
+				// error silently redials it, so those earlier bytes are now
+				// stranded on a connection that no longer exists — the
+				// frame cannot be completed by resuming; the caller must
+				// resend it whole, from the start, on the fresh connection.
+				return fmt.Errorf("write: frame partially sent (%d/%d bytes) before error, cannot resume: %w", start, len(data), err)
+			}
 			return err
 		}
 		start += c
@@ -54,6 +64,27 @@ func connWrite(conn net.Conn, data []byte) error {
 type AutoReconnectTCP struct {
 	addr *net.TCPAddr
 	conn *net.TCPConn
+
+	// frameBroken records that the most recent Write wrote some bytes
+	// (n > 0) and then failed, so a redial happened mid-frame. It is purely
+	// diagnostic today — every current caller already resends a frame whole
+	// from the start on retry rather than trying to resume it, which is safe
+	// by construction — but it documents the invariant explicitly for any
+	// future caller (e.g. request pipelining) that might be tempted to trust
+	// a partial byte count across a reconnect.
+	frameBroken bool
+}
+
+// FrameBroken reports whether the last Write left a partial frame stranded
+// on a connection that has since been closed and redialed.
+func (a *AutoReconnectTCP) FrameBroken() bool {
+	return a.frameBroken
+}
+
+// ClearFrameBroken acknowledges a stranded frame once the caller has
+// discarded it and is about to resend it whole on the fresh connection.
+func (a *AutoReconnectTCP) ClearFrameBroken() {
+	a.frameBroken = false
 }
 
 func NewAutoReconnectTCP(addr *net.TCPAddr) *AutoReconnectTCP {
@@ -110,8 +141,15 @@ func (a *AutoReconnectTCP) Write(b []byte) (int, error) {
 	// Deadline is managed by connWrite (the canonical write path); don't double-set here.
 	n, err := a.conn.Write(b)
 	if err != nil {
+		if n > 0 {
+			a.frameBroken = true
+		}
 		a.handleErr(err)
-		return 0, err
+		// Return the true byte count, not 0: io.Writer callers are entitled
+		// to trust n on a partial write, and lying about it (this used to
+		// always return 0 here) breaks that contract even though no current
+		// caller in this codebase happens to rely on it.
+		return n, err
 	}
 	return n, nil
 }

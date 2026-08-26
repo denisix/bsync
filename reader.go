@@ -55,21 +55,32 @@ type SequentialReader struct {
 	blockSize    uint32
 	lastBlockNum uint32
 	skipIdx      uint32
+	empty        bool // fileSize == 0: Start() emits nothing
 	blockChan    chan BlockData
 	wg           sync.WaitGroup
 }
 
-// NewSequentialReader creates a new sequential reader
+// NewSequentialReader creates a new sequential reader.
+//
+// fileSize == 0 is handled explicitly: (fileSize-1)/blockSize would otherwise
+// underflow the uint64 subtraction before truncating to uint32, producing a
+// huge lastBlockNum and a multi-billion-iteration loop in Start(). Existing
+// callers already guard against this at the call site, but the constructor
+// is made safe on its own so future callers (e.g. a per-file reader in
+// directory-tree mode) don't have to remember to.
 func NewSequentialReader(file *os.File, blockSize uint32, fileSize uint64, skipIdx uint32, bufferAhead int) *SequentialReader {
-	lastBlock := uint32((fileSize - 1) / uint64(blockSize))
-
-	return &SequentialReader{
-		file:         file,
-		blockSize:    blockSize,
-		lastBlockNum: lastBlock,
-		skipIdx:      skipIdx,
-		blockChan:    make(chan BlockData, bufferAhead),
+	sr := &SequentialReader{
+		file:      file,
+		blockSize: blockSize,
+		skipIdx:   skipIdx,
+		blockChan: make(chan BlockData, bufferAhead),
 	}
+	if fileSize == 0 {
+		sr.empty = true
+		return sr
+	}
+	sr.lastBlockNum = uint32((fileSize - 1) / uint64(blockSize))
+	return sr
 }
 
 // Start begins reading blocks in the background
@@ -78,6 +89,10 @@ func (sr *SequentialReader) Start() {
 	go func() {
 		defer sr.wg.Done()
 		defer close(sr.blockChan)
+
+		if sr.empty {
+			return
+		}
 
 		for blockIdx := sr.skipIdx; blockIdx <= sr.lastBlockNum; blockIdx++ {
 			// Read each block directly into its own buffer. The buffer is handed

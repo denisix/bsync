@@ -160,6 +160,15 @@ func startClient(file *os.File, serverAddress string, skipIdx uint32, fileSize u
 						break
 					}
 				}
+				// block.Data (when non-nil) is a readerBufPool buffer that
+				// precomputeChecksumsParallel handed off instead of
+				// releasing itself, because it's the buffer actually sent
+				// over the wire above. Every retry above reused the same
+				// buffer, so it's safe to release exactly once here, whether
+				// the block ultimately succeeded or exhausted its retries.
+				if block.Data != nil {
+					putReaderBuf(block.Data)
+				}
 				if lastErr != nil {
 					Log("block %d: failed after %d retries: %v\n", block.BlockIdx, maxRetries, lastErr)
 					select {

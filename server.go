@@ -2,7 +2,6 @@ package main
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"encoding/binary"
 	"fmt"
@@ -19,16 +18,25 @@ var (
 	doneReceived  int32
 	shutdownTimer *time.Timer
 
+	// shutdownResetChan lets connection-handler goroutines request a
+	// shutdownTimer reset without touching the Timer directly.
+	// time.Timer.Reset called concurrently from multiple goroutines on a
+	// possibly-already-fired timer is documented-unsafe; only startServer's
+	// own select loop goroutine ever calls shutdownTimer.Reset, and every
+	// other goroutine sends the desired duration here instead.
+	shutdownResetChan chan time.Duration
+
 	// Server-side progress stats
 	suppressProgress   bool // set via -P flag when launched as remote server via -t
 	suppressProgressMu sync.RWMutex
 	srvOnce            sync.Once
 	srvT0              time.Time
-	srvLastBlockNum    uint32 // written once via atomic.StoreUint32, then read-only
-	srvFileSize        uint64
-	srvBytesNet        uint64 // atomic - compressed/raw bytes received over network
-	srvBytesOrig       uint64 // atomic - original bytes written (for ratio)
-	srvDiffs           int32  // atomic - blocks actually written
+	// 64-bit: a uint32 block count overflows at 4G blocks (~16TB at -b 4K).
+	srvLastBlockNum uint64 // written once via atomic.StoreUint64, then read-only
+	srvFileSize     uint64
+	srvBytesNet     uint64 // atomic - compressed/raw bytes received over network
+	srvBytesOrig    uint64 // atomic - original bytes written (for ratio)
+	srvDiffs        int64  // atomic - blocks actually written
 
 	// Visualization
 	srvVisualizer *Visualizer
@@ -40,13 +48,29 @@ func setSuppressProgress(enabled bool) {
 	suppressProgressMu.Unlock()
 }
 
+// requestShutdownReset asks startServer's select loop to reset shutdownTimer
+// to d. Safe to call from any goroutine. The send is non-blocking: a full
+// channel just means a reset is already pending, so dropping this one is
+// harmless. A nil channel (serverHandleReq invoked directly, e.g. in tests,
+// without startServer ever running) is a silent no-op, matching the previous
+// `if shutdownTimer != nil` guard's behavior.
+func requestShutdownReset(d time.Duration) {
+	if shutdownResetChan == nil {
+		return
+	}
+	select {
+	case shutdownResetChan <- d:
+	default:
+	}
+}
+
 func suppressProgressEnabled() bool {
 	suppressProgressMu.RLock()
 	defer suppressProgressMu.RUnlock()
 	return suppressProgress
 }
 
-func serverPrintStats(blockIdx uint32, indicator string, netBytes uint32) {
+func serverPrintStats(blockIdx uint32, indicator string, netBytes uint32, origBytes uint32) {
 	if suppressProgressEnabled() {
 		return
 	}
@@ -56,11 +80,15 @@ func serverPrintStats(blockIdx uint32, indicator string, netBytes uint32) {
 	}
 	if netBytes > 0 {
 		atomic.AddUint64(&srvBytesNet, uint64(netBytes))
-		atomic.AddUint64(&srvBytesOrig, uint64(atomic.LoadUint32(&blockSize)))
-		atomic.AddInt32(&srvDiffs, 1)
+		// origBytes is the actual decoded/expected size of this block (the
+		// last block of a file is typically shorter than blockSize), not the
+		// global block size — using the global here made the reported
+		// compression ratio wrong for any non-block-size-multiple file.
+		atomic.AddUint64(&srvBytesOrig, uint64(origBytes))
+		atomic.AddInt64(&srvDiffs, 1)
 	}
 
-	last := atomic.LoadUint32(&srvLastBlockNum)
+	last := atomic.LoadUint64(&srvLastBlockNum)
 	if last == 0 {
 		return
 	}
@@ -87,7 +115,7 @@ func serverPrintStats(blockIdx uint32, indicator string, netBytes uint32) {
 	if eta < 0 {
 		eta = 0
 	}
-	if blockIdx >= last {
+	if uint64(blockIdx) >= last {
 		eta = 0
 	}
 
@@ -98,7 +126,7 @@ func serverPrintStats(blockIdx uint32, indicator string, netBytes uint32) {
 	if totalOrig > 0 {
 		ratio = 100.0 * float64(totalNet) / float64(totalOrig)
 	}
-	diffs := atomic.LoadInt32(&srvDiffs)
+	diffs := atomic.LoadInt64(&srvDiffs)
 
 	Log("recv block %d/%d (%0.2f%%) [%s] size=%d ratio=%0.2f %0.2f MB/s ETA=%d %s diffs=%d\r",
 		blockIdx, last, percent, indicator, srvFileSize, ratio, mbs, eta, etaUnit, diffs)
@@ -210,9 +238,7 @@ func serverHandleReq(conn net.Conn, file *os.File, _ *ChecksumCache, ow *Ordered
 				srvVisualizer.RenderFinal()
 			}
 			atomic.StoreInt32(&doneReceived, 1)
-			if shutdownTimer != nil {
-				shutdownTimer.Reset(shutdownLingerPeriod)
-			}
+			requestShutdownReset(shutdownLingerPeriod)
 			return nil
 		}
 
@@ -224,7 +250,7 @@ func serverHandleReq(conn net.Conn, file *os.File, _ *ChecksumCache, ow *Ordered
 		truncateIfRegularFile(file, msg.FileSize)
 		srvOnce.Do(func() {
 			srvFileSize = msg.FileSize
-			atomic.StoreUint32(&srvLastBlockNum, lastBlockNum)
+			atomic.StoreUint64(&srvLastBlockNum, uint64(lastBlockNum))
 			srvT0 = time.Now()
 			// Initialize visualizer with total block count
 			if visualEnabled() {
@@ -249,7 +275,7 @@ func serverHandleReq(conn net.Conn, file *os.File, _ *ChecksumCache, ow *Ordered
 			if err := writeDestBlock(ow, file, msg.BlockIdx, getZeroBuf(int(expectedSize)), offset); err != nil {
 				return fmt.Errorf("write zero block %d: %w", msg.BlockIdx, err)
 			}
-			serverPrintStats(msg.BlockIdx, ".", 0)
+			serverPrintStats(msg.BlockIdx, ".", 0, expectedSize)
 			if srvVisualizer != nil {
 				srvVisualizer.UpdateBlockStatus(msg.BlockIdx, StatusZero)
 			}
@@ -280,7 +306,7 @@ func serverHandleReq(conn net.Conn, file *os.File, _ *ChecksumCache, ow *Ordered
 			}
 			request := *msg
 			pendingWrite = &request
-			serverPrintStats(msg.BlockIdx, "-", 0)
+			serverPrintStats(msg.BlockIdx, "-", 0, expectedSize)
 			continue
 		}
 
@@ -323,7 +349,7 @@ func serverHandleReq(conn net.Conn, file *os.File, _ *ChecksumCache, ow *Ordered
 			if msg.Compressed {
 				indicator = "c"
 			}
-			serverPrintStats(msg.BlockIdx, indicator, msg.DataSize)
+			serverPrintStats(msg.BlockIdx, indicator, msg.DataSize, expectedSize)
 			if srvVisualizer != nil {
 				if msg.Compressed {
 					srvVisualizer.UpdateBlockStatus(msg.BlockIdx, StatusCompressed)
@@ -370,6 +396,7 @@ func startServer(file *os.File, bindIp, port string, checksumCache *ChecksumCach
 	// Shutdown timer: started when DONE received
 	shutdownTimer = time.NewTimer(shutdownLingerPeriod)
 	shutdownTimer.Stop() // Don't start until DONE received
+	shutdownResetChan = make(chan time.Duration, 8)
 
 	connChan := make(chan net.Conn)
 	errChan := make(chan error)
@@ -425,10 +452,10 @@ func startServer(file *os.File, bindIp, port string, checksumCache *ChecksumCach
 				if atomic.LoadInt32(&doneReceived) == 1 {
 					if remaining <= 0 {
 						Log("All connections finished after DONE, exiting\n")
-						shutdownTimer.Reset(shutdownGracePeriod)
+						requestShutdownReset(shutdownGracePeriod)
 					} else {
 						Log("Graceful shutdown: %d connections still active, waiting...\n", remaining)
-						shutdownTimer.Reset(shutdownLingerPeriod)
+						requestShutdownReset(shutdownLingerPeriod)
 					}
 					return
 				}
@@ -453,6 +480,11 @@ func startServer(file *os.File, bindIp, port string, checksumCache *ChecksumCach
 				Log("Server idle timeout, exiting\n")
 				return nil
 			}
+
+		case d := <-shutdownResetChan:
+			// Only this goroutine ever calls shutdownTimer.Reset; other
+			// goroutines request a reset via requestShutdownReset instead.
+			shutdownTimer.Reset(d)
 
 		case <-shutdownTimer.C:
 			active := atomic.LoadInt64(&activeConns)
@@ -685,11 +717,21 @@ func serverHandleUpload(conn net.Conn, file *os.File, fileSize uint64, checksumC
 		}
 		n := len(data)
 
-		// Get precomputed hash
-		hash := checksumCache.WaitFor(msg.BlockIdx)
+		// Get precomputed hash (currently unused beyond synchronizing with the
+		// background precompute pass; see the zero-block check below for why
+		// its value must not be trusted for zero-ness).
+		_ = checksumCache.WaitFor(msg.BlockIdx)
 
-		// Check if block is zero - send only Msg, NO data (sparse file optimization)
-		if bytes.Equal(hash, zeroBlockHash) {
+		// Check if block is zero - send only Msg, NO data (sparse file optimization).
+		//
+		// Deciding this from the hash (bytes.Equal(hash, zeroBlockHash)) is
+		// unsafe: zeroBlockHash is 16 zero bytes, and ChecksumCache.WaitFor
+		// also returns 16 zero bytes for an out-of-range or not-yet-computed
+		// index (checksum.go's noPrecompute/out-of-bounds path). An unknown
+		// hash would then be misreported as a zero block, and the client
+		// would zero-fill the destination with data that was never verified.
+		// Deciding straight from the just-read bytes has no such ambiguity.
+		if isZeroBlock(data) {
 			respMsg, err1 := pack(&Msg{
 				MagicHead:  magicBytes,
 				BlockIdx:   msg.BlockIdx,

@@ -62,6 +62,7 @@ func main() {
 	var compLevel string
 	var listAllDrives bool
 	var visual bool
+	var suppressProgressFlag bool
 
 	flag.BoolVar(&listAllDrives, "a", false, "list available drives and partitions")
 	flag.StringVar(&device, "f", "/dev/zero", "specify file or device, i.e. '/dev/vda'")
@@ -79,7 +80,7 @@ func main() {
 	flag.BoolVar(&reverse, "d", false, "download mode: transfer from server to client")
 	flag.BoolVar(&encrypt, "e", false, "enable SSH-mode encryption (auto-generates key)")
 	flag.StringVar(&encKeyReceived, "K", "", "encryption key (internal use)")
-	flag.BoolVar(&suppressProgress, "P", false, "suppress server progress output (set automatically when launched via -t)")
+	flag.BoolVar(&suppressProgressFlag, "P", false, "suppress server progress output (set automatically when launched via -t)")
 	flag.IntVar(&prefetchDepth, "prefetch", 0, "prefetch depth (default: workers*4)")
 	var autoTune bool
 	flag.BoolVar(&autoTune, "auto", false, "auto-tune parameters for optimal HDD performance")
@@ -97,6 +98,11 @@ func main() {
 
 	// Set visual mode
 	setVisual(visual)
+
+	// suppressProgress is mutex-guarded (server.go); flag.BoolVar can't write
+	// through that guard, so parse into a local and set it properly here,
+	// before any goroutine that might read it starts.
+	setSuppressProgress(suppressProgressFlag)
 
 	if bSize == 0 || uint64(bSize) > uint64(^uint32(0)) {
 		Err("Block size must be between 1 and %d bytes\n", ^uint32(0))

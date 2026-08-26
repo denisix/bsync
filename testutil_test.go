@@ -33,12 +33,13 @@ func freeTCPPort(t *testing.T) string {
 func resetEngineGlobals() {
 	atomic.StoreInt32(&doneReceived, 0)
 	atomic.StoreInt64(&activeConns, 0)
-	atomic.StoreUint32(&srvLastBlockNum, 0)
+	atomic.StoreUint64(&srvLastBlockNum, 0)
 	atomic.StoreUint64(&srvBytesNet, 0)
 	atomic.StoreUint64(&srvBytesOrig, 0)
-	atomic.StoreInt32(&srvDiffs, 0)
+	atomic.StoreInt64(&srvDiffs, 0)
 	srvOnce = sync.Once{}
 	shutdownTimer = nil
+	shutdownResetChan = nil
 	setSuppressProgress(true)
 	setQuiet(true)
 	setVisual(false)

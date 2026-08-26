@@ -7,7 +7,11 @@ import (
 )
 
 const magicLen = 17
-const magicHead = "blockSync-ver0.02"
+
+// magicHead is a var, not a const, so tests can construct/compare against a
+// foreign or older magic value (e.g. to exercise a version-mismatch path)
+// without a second build.
+var magicHead = "blockSync-ver0.02"
 
 type Msg struct {
 	MagicHead  [magicLen]byte

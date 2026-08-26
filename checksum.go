@@ -105,23 +105,36 @@ func precomputeChecksumsParallel(reader *SequentialReader, cache *ChecksumCache,
 				var useCompressed bool
 				var originalData []byte
 
+				// block.Data is a buffer checked out of readerBufPool
+				// (reader.go). It must be returned via putReaderBuf exactly
+				// once: either here, immediately, when this goroutine has no
+				// further use for it, or later by the transfer worker (see
+				// client.go) once it has finished sending it as
+				// PrecomputedBlock.Data. Previously nothing ever returned it
+				// in either case, so every block cost a fresh 10MB
+				// allocation + mlock + MADV_HUGEPAGE instead of a pool
+				// checkout.
 				if isZeroBlock(block.Data) {
 					hash = zeroBlockHash
 					isZero = true
+					putReaderBuf(block.Data)
 				} else {
 					hash = checksum(block.Data)
 					isZero = false
 
 					if noCompress {
 						// -n: never compress; keep the raw block to send.
+						// Released by the transfer worker after it sends it.
 						compressed = nil
 						useCompressed = false
 						originalData = block.Data
 					} else if comp, err := compressData(block.Data); err == nil && len(comp) < len(block.Data) {
 						compressed = comp
 						useCompressed = true
-						// Don't need original data if using compressed - save memory
+						// The compressed copy is sent instead; the raw
+						// buffer has no further use.
 						originalData = nil
+						putReaderBuf(block.Data)
 					} else {
 						compressed = nil
 						useCompressed = false
