@@ -135,6 +135,8 @@ func serverPrintStats(blockIdx uint32, indicator string, netBytes uint32, origBy
 func sendBlockAck(conn net.Conn, blockIdx, currentBlockSize uint32, fileSize uint64) error {
 	ack, err := pack(&Msg{
 		MagicHead: stringToFixedSizeArray(magicHead),
+		Op:        uint8(OpAck),
+		FileID:    0,
 		BlockIdx:  blockIdx,
 		BlockSize: currentBlockSize,
 		FileSize:  fileSize,
@@ -211,7 +213,7 @@ func serverHandleReq(conn net.Conn, file *os.File, _ *ChecksumCache, ow *Ordered
 		if msg.BlockSize == 0 {
 			return fmt.Errorf("invalid zero block size")
 		}
-		if err := validateUploadMessage(msg); err != nil {
+		if err := validateClientFrame(msg); err != nil {
 			return err
 		}
 
@@ -231,7 +233,7 @@ func serverHandleReq(conn net.Conn, file *os.File, _ *ChecksumCache, ow *Ordered
 
 		// Handle DONE before any block processing. The DONE message carries
 		// the final source size, including zero for an empty source.
-		if msg.Done {
+		if Op(msg.Op) == OpFileDone {
 			truncateIfRegularFile(file, msg.FileSize)
 			Log("\ntransfer DONE message received, starting graceful shutdown\n")
 			if srvVisualizer != nil {
@@ -262,7 +264,8 @@ func serverHandleReq(conn net.Conn, file *os.File, _ *ChecksumCache, ow *Ordered
 		if uint64(msg.DataSize) > uint64(currentBlockSize)+uint64(encryptOverhead) {
 			return fmt.Errorf("payload for block %d is too large", msg.BlockIdx)
 		}
-		isWrite := msg.Zero || msg.DataSize > 0
+		msgOp := Op(msg.Op)
+		isWrite := msgOp == OpBlockZero || msgOp == OpBlockData
 		if isWrite {
 			if pendingWrite == nil || msg.BlockIdx != pendingWrite.BlockIdx ||
 				msg.BlockSize != pendingWrite.BlockSize || msg.FileSize != pendingWrite.FileSize {
@@ -270,8 +273,8 @@ func serverHandleReq(conn net.Conn, file *os.File, _ *ChecksumCache, ow *Ordered
 			}
 		}
 
-		// Handle zero blocks (Zero=true, DataSize=0) - no data sent
-		if msg.Zero && msg.DataSize == 0 {
+		// Handle zero blocks - no data sent
+		if msgOp == OpBlockZero {
 			if err := writeDestBlock(ow, file, msg.BlockIdx, getZeroBuf(int(expectedSize)), offset); err != nil {
 				return fmt.Errorf("write zero block %d: %w", msg.BlockIdx, err)
 			}
@@ -286,7 +289,7 @@ func serverHandleReq(conn net.Conn, file *os.File, _ *ChecksumCache, ow *Ordered
 			continue
 		}
 
-		if msg.DataSize == 0 {
+		if msgOp == OpBlockCheck {
 			n, err := file.ReadAt(filebuf[:expectedSize], offset)
 			if err != nil && err != io.EOF {
 				return fmt.Errorf("read destination block %d: %w", msg.BlockIdx, err)
@@ -301,6 +304,25 @@ func serverHandleReq(conn net.Conn, file *os.File, _ *ChecksumCache, ow *Ordered
 			} else {
 				hash = checksum(filebuf[:expectedSize])
 			}
+			// Framed as a proper OpHash message (header + payload) rather
+			// than bare bytes: it lets the client tell a hash apart from a
+			// truncated/desynced stream, and reserves DataSize/Flags for a
+			// future "destination doesn't exist yet" response.
+			hashMsg, err := pack(&Msg{
+				MagicHead: magicBytes,
+				Op:        uint8(OpHash),
+				FileID:    0,
+				BlockIdx:  msg.BlockIdx,
+				BlockSize: currentBlockSize,
+				FileSize:  msg.FileSize,
+				DataSize:  uint32(len(hash)),
+			})
+			if err != nil {
+				return fmt.Errorf("pack hash: %w", err)
+			}
+			if err := connWrite(conn, hashMsg); err != nil {
+				return nil
+			}
 			if err := connWrite(conn, hash[:]); err != nil {
 				return nil
 			}
@@ -310,7 +332,7 @@ func serverHandleReq(conn net.Conn, file *os.File, _ *ChecksumCache, ow *Ordered
 			continue
 		}
 
-		if msg.DataSize > 0 {
+		if msgOp == OpBlockData {
 			if srvVisualizer != nil {
 				srvVisualizer.UpdateBlockStatus(msg.BlockIdx, StatusProcessing)
 			}
@@ -320,8 +342,9 @@ func serverHandleReq(conn net.Conn, file *os.File, _ *ChecksumCache, ow *Ordered
 				return nil
 			}
 
+			compressed := msg.Flags&FlagCompressed != 0
 			var payload []byte
-			if msg.Compressed {
+			if compressed {
 				decompressed, err := decompressData(filebuf[:msg.DataSize])
 				if err != nil {
 					return fmt.Errorf("decompress block %d: %w", msg.BlockIdx, err)
@@ -346,12 +369,12 @@ func serverHandleReq(conn net.Conn, file *os.File, _ *ChecksumCache, ow *Ordered
 				return fmt.Errorf("write block %d: %w", msg.BlockIdx, err)
 			}
 			indicator := "w"
-			if msg.Compressed {
+			if compressed {
 				indicator = "c"
 			}
 			serverPrintStats(msg.BlockIdx, indicator, msg.DataSize, expectedSize)
 			if srvVisualizer != nil {
-				if msg.Compressed {
+				if compressed {
 					srvVisualizer.UpdateBlockStatus(msg.BlockIdx, StatusCompressed)
 				} else {
 					srvVisualizer.UpdateBlockStatus(msg.BlockIdx, StatusRaw)
@@ -649,14 +672,13 @@ func serverHandleUpload(conn net.Conn, file *os.File, fileSize uint64, checksumC
 		// If this is the first request, send file metadata
 		if msg.BlockIdx == 0 && msg.FileSize == 0 {
 			metaMsg, err1 := pack(&Msg{
-				MagicHead:  magicBytes,
-				BlockIdx:   0,
-				BlockSize:  blockSize,
-				FileSize:   fileSize,
-				DataSize:   0,
-				Compressed: false,
-				Zero:       false,
-				Done:       false,
+				MagicHead: magicBytes,
+				Op:        uint8(OpDownData),
+				FileID:    0,
+				BlockIdx:  0,
+				BlockSize: blockSize,
+				FileSize:  fileSize,
+				DataSize:  0,
 			})
 			if err1 != nil {
 				return fmt.Errorf("pack metadata: %w", err1)
@@ -677,14 +699,13 @@ func serverHandleUpload(conn net.Conn, file *os.File, fileSize uint64, checksumC
 		if fileSize == 0 || msg.BlockIdx > lastBlockNum {
 			// Send done message
 			doneMsg, err1 := pack(&Msg{
-				MagicHead:  magicBytes,
-				BlockIdx:   msg.BlockIdx,
-				BlockSize:  blockSize,
-				FileSize:   fileSize,
-				DataSize:   0,
-				Compressed: false,
-				Zero:       false,
-				Done:       true,
+				MagicHead: magicBytes,
+				Op:        uint8(OpDownDone),
+				FileID:    0,
+				BlockIdx:  msg.BlockIdx,
+				BlockSize: blockSize,
+				FileSize:  fileSize,
+				DataSize:  0,
 			})
 			if err1 != nil {
 				return fmt.Errorf("pack download done: %w", err1)
@@ -733,14 +754,14 @@ func serverHandleUpload(conn net.Conn, file *os.File, fileSize uint64, checksumC
 		// Deciding straight from the just-read bytes has no such ambiguity.
 		if isZeroBlock(data) {
 			respMsg, err1 := pack(&Msg{
-				MagicHead:  magicBytes,
-				BlockIdx:   msg.BlockIdx,
-				BlockSize:  blockSize,
-				FileSize:   fileSize,
-				DataSize:   0, // NO data payload
-				Compressed: false,
-				Zero:       true,
-				Done:       false,
+				MagicHead: magicBytes,
+				Op:        uint8(OpDownData),
+				Flags:     FlagZero,
+				FileID:    0,
+				BlockIdx:  msg.BlockIdx,
+				BlockSize: blockSize,
+				FileSize:  fileSize,
+				DataSize:  0, // NO data payload
 			})
 			if err1 != nil {
 				return fmt.Errorf("pack zero response: %w", err1)
@@ -765,14 +786,14 @@ func serverHandleUpload(conn net.Conn, file *os.File, fileSize uint64, checksumC
 		if !noCompress && uint32(len(compBuf)) < uint32(n) {
 			// Send compressed (compressData also encrypts when -e is set)
 			msg, err1 := pack(&Msg{
-				MagicHead:  magicBytes,
-				BlockIdx:   msg.BlockIdx,
-				BlockSize:  blockSize,
-				FileSize:   fileSize,
-				DataSize:   uint32(len(compBuf)),
-				Compressed: true,
-				Zero:       false,
-				Done:       false,
+				MagicHead: magicBytes,
+				Op:        uint8(OpDownData),
+				Flags:     FlagCompressed,
+				FileID:    0,
+				BlockIdx:  msg.BlockIdx,
+				BlockSize: blockSize,
+				FileSize:  fileSize,
+				DataSize:  uint32(len(compBuf)),
 			})
 			if err1 != nil {
 				return fmt.Errorf("pack compressed response: %w", err1)
@@ -800,14 +821,13 @@ func serverHandleUpload(conn net.Conn, file *os.File, fileSize uint64, checksumC
 				pooledPayload = payload
 			}
 			msg, err1 := pack(&Msg{
-				MagicHead:  magicBytes,
-				BlockIdx:   msg.BlockIdx,
-				BlockSize:  blockSize,
-				FileSize:   fileSize,
-				DataSize:   uint32(len(payload)),
-				Compressed: false,
-				Zero:       false,
-				Done:       false,
+				MagicHead: magicBytes,
+				Op:        uint8(OpDownData),
+				FileID:    0,
+				BlockIdx:  msg.BlockIdx,
+				BlockSize: blockSize,
+				FileSize:  fileSize,
+				DataSize:  uint32(len(payload)),
 			})
 			if err1 != nil {
 				if pooledPayload != nil {

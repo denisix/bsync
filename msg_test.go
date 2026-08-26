@@ -22,22 +22,26 @@ func TestPackedSizeConstant(t *testing.T) {
 	if len(data) != want {
 		t.Errorf("packed size = %d, want %d", len(data), want)
 	}
-	// magic(17)+blockIdx(4)+blockSize(4)+fileSize(8)+dataSize(4)+3 flags = 40
-	if want != 40 {
-		t.Errorf("binary.Size(Msg) = %d, want 40", want)
+	// magic(17)+op(1)+flags(1)+reserved(5)+fileID(4)+blockIdx(4)+blockSize(4)+fileSize(8)+dataSize(4) = 48
+	if want != 48 {
+		t.Errorf("binary.Size(Msg) = %d, want 48", want)
+	}
+	if want != msgSize {
+		t.Errorf("binary.Size(Msg) = %d, want msgSize = %d", want, msgSize)
 	}
 }
 
 func TestPackUnpackMaxValues(t *testing.T) {
 	orig := &Msg{
-		MagicHead:  stringToFixedSizeArray(magicHead),
-		BlockIdx:   ^uint32(0),
-		BlockSize:  ^uint32(0),
-		FileSize:   ^uint64(0),
-		DataSize:   ^uint32(0),
-		Compressed: true,
-		Zero:       true,
-		Done:       true,
+		MagicHead: stringToFixedSizeArray(magicHead),
+		Op:        ^uint8(0),
+		Flags:     ^uint8(0),
+		Reserved:  [5]byte{0xFF, 0xFF, 0xFF, 0xFF, 0xFF},
+		FileID:    ^uint32(0),
+		BlockIdx:  ^uint32(0),
+		BlockSize: ^uint32(0),
+		FileSize:  ^uint64(0),
+		DataSize:  ^uint32(0),
 	}
 	data, err := pack(orig)
 	if err != nil {
@@ -90,22 +94,43 @@ func TestBlockPayloadSizeBoundaries(t *testing.T) {
 }
 
 func TestValidateProtocolMessageStates(t *testing.T) {
-	validUpload := []*Msg{{}, {Done: true}, {Zero: true}, {DataSize: 1}, {DataSize: 1, Compressed: true}}
+	validUpload := []*Msg{
+		{Op: uint8(OpFileDone)},
+		{Op: uint8(OpBlockZero)},
+		{Op: uint8(OpBlockCheck)},
+		{Op: uint8(OpBlockData), DataSize: 1},
+		{Op: uint8(OpBlockData), DataSize: 1, Flags: FlagCompressed},
+	}
 	for _, msg := range validUpload {
-		if err := validateUploadMessage(msg); err != nil {
+		if err := validateClientFrame(msg); err != nil {
 			t.Errorf("valid upload message %+v rejected: %v", msg, err)
 		}
 	}
-	invalidUpload := []*Msg{{Done: true, DataSize: 1}, {Zero: true, Compressed: true}, {Zero: true, DataSize: 1}, {Compressed: true}}
+	invalidUpload := []*Msg{
+		{Op: uint8(OpFileDone), DataSize: 1},             // DONE must not carry a payload
+		{Op: uint8(OpBlockZero), Flags: FlagCompressed},  // zero write can't also be compressed
+		{Op: uint8(OpBlockZero), DataSize: 1},            // zero write can't carry a payload
+		{Op: uint8(OpBlockCheck), Flags: FlagCompressed}, // checksum request can't carry flags
+		{Op: uint8(OpBlockData)},                         // data write needs DataSize > 0
+		{Op: uint8(OpAck)},                               // a server-only op sent by the client
+		{Op: uint8(OpBlockCheck), Reserved: [5]byte{9}},  // Reserved must be all-zero
+	}
 	for _, msg := range invalidUpload {
-		if err := validateUploadMessage(msg); err == nil {
+		if err := validateClientFrame(msg); err == nil {
 			t.Errorf("invalid upload message %+v accepted", msg)
 		}
 	}
-	if err := validateDownloadRequest(&Msg{}); err != nil {
+
+	if err := validateDownloadRequest(&Msg{Op: uint8(OpDownReq)}); err != nil {
 		t.Fatalf("valid download request rejected: %v", err)
 	}
-	for _, msg := range []*Msg{{Done: true}, {Zero: true}, {Compressed: true}, {DataSize: 1}} {
+	invalidDownload := []*Msg{
+		{Op: uint8(OpFileDone)},                       // wrong op for the download direction
+		{Op: uint8(OpDownReq), Flags: FlagCompressed}, // request can't carry flags
+		{Op: uint8(OpDownReq), DataSize: 1},           // request can't carry a payload
+		{Op: uint8(OpDownReq), Reserved: [5]byte{1}},  // Reserved must be all-zero
+	}
+	for _, msg := range invalidDownload {
 		if err := validateDownloadRequest(msg); err == nil {
 			t.Errorf("invalid download request %+v accepted", msg)
 		}

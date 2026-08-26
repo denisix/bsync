@@ -193,14 +193,13 @@ func startClient(file *os.File, serverAddress string, skipIdx uint32, fileSize u
 	conn := NewAutoReconnectTCP(saddr)
 	defer conn.Close()
 	msg, err1 := pack(&Msg{
-		MagicHead:  magicBytes,
-		BlockIdx:   0,
-		BlockSize:  blockSize,
-		FileSize:   fileSize,
-		DataSize:   0,
-		Compressed: false,
-		Zero:       false,
-		Done:       true,
+		MagicHead: magicBytes,
+		Op:        uint8(OpFileDone),
+		FileID:    0,
+		BlockIdx:  0,
+		BlockSize: blockSize,
+		FileSize:  fileSize,
+		DataSize:  0,
 	})
 	if err1 != nil {
 		return fmt.Errorf("pack done: %w", err1)
@@ -229,8 +228,8 @@ func waitForBlockAck(conn io.Reader, blockIdx uint32) error {
 	if err != nil {
 		return err
 	}
-	if ack.MagicHead != stringToFixedSizeArray(magicHead) || ack.BlockIdx != blockIdx ||
-		ack.Done || ack.Zero || ack.Compressed || ack.DataSize != 0 {
+	if Op(ack.Op) != OpAck || ack.MagicHead != stringToFixedSizeArray(magicHead) ||
+		ack.FileID != 0 || ack.BlockIdx != blockIdx || ack.Flags != 0 || ack.DataSize != 0 {
 		return fmt.Errorf("invalid acknowledgement for block %d", blockIdx)
 	}
 	return nil
@@ -243,14 +242,13 @@ func processPrecomputedBlock(conn *AutoReconnectTCP, block PrecomputedBlock, blo
 
 	// Send request to server
 	msg, err1 := pack(&Msg{
-		MagicHead:  magicBytes,
-		BlockIdx:   block.BlockIdx,
-		BlockSize:  blockSize,
-		FileSize:   fileSize,
-		DataSize:   0,
-		Compressed: false,
-		Zero:       false,
-		Done:       false,
+		MagicHead: magicBytes,
+		Op:        uint8(OpBlockCheck),
+		FileID:    0,
+		BlockIdx:  block.BlockIdx,
+		BlockSize: blockSize,
+		FileSize:  fileSize,
+		DataSize:  0,
 	})
 	if err1 != nil {
 		return fmt.Errorf("pack: %w", err1)
@@ -260,8 +258,22 @@ func processPrecomputedBlock(conn *AutoReconnectTCP, block PrecomputedBlock, blo
 		return fmt.Errorf("send header: %w", err)
 	}
 
-	// Get server hash
-	serverHash := make([]byte, len(block.Hash))
+	// Get server hash. Framed as a proper OpHash message (header + payload)
+	// rather than bare bytes, so a rejected/malformed exchange surfaces as a
+	// decodable error instead of desynchronizing the stream.
+	hashHdrBuf := make([]byte, binary.Size(Msg{}))
+	if _, err := io.ReadFull(conn, hashHdrBuf); err != nil {
+		return fmt.Errorf("read hash header: %w", err)
+	}
+	hashHdr, err := unpack(hashHdrBuf)
+	if err != nil {
+		return fmt.Errorf("unpack hash header: %w", err)
+	}
+	if Op(hashHdr.Op) != OpHash || hashHdr.MagicHead != magicBytes || hashHdr.FileID != 0 ||
+		hashHdr.BlockIdx != block.BlockIdx || hashHdr.Flags != 0 || int(hashHdr.DataSize) != len(block.Hash) {
+		return fmt.Errorf("invalid hash response for block %d", block.BlockIdx)
+	}
+	serverHash := make([]byte, hashHdr.DataSize)
 	if _, err := io.ReadFull(conn, serverHash); err != nil {
 		return fmt.Errorf("read hash: %w", err)
 	}
@@ -279,14 +291,13 @@ func processPrecomputedBlock(conn *AutoReconnectTCP, block PrecomputedBlock, blo
 	// Handle zero blocks - send only Msg, NO data (sparse file optimization)
 	if block.IsZero {
 		msg2, err1 := pack(&Msg{
-			MagicHead:  magicBytes,
-			BlockIdx:   block.BlockIdx,
-			BlockSize:  blockSize,
-			FileSize:   fileSize,
-			DataSize:   0,
-			Compressed: false,
-			Zero:       true,
-			Done:       false,
+			MagicHead: magicBytes,
+			Op:        uint8(OpBlockZero),
+			FileID:    0,
+			BlockIdx:  block.BlockIdx,
+			BlockSize: blockSize,
+			FileSize:  fileSize,
+			DataSize:  0,
 		})
 		if err1 != nil {
 			return fmt.Errorf("pack zero: %w", err1)
@@ -327,15 +338,19 @@ func processPrecomputedBlock(conn *AutoReconnectTCP, block PrecomputedBlock, blo
 		return fmt.Errorf("no data for block %d", block.BlockIdx)
 	}
 
+	var dataFlags uint8
+	if compressedFlag {
+		dataFlags |= FlagCompressed
+	}
 	msg2, err1 := pack(&Msg{
-		MagicHead:  magicBytes,
-		BlockIdx:   block.BlockIdx,
-		BlockSize:  blockSize,
-		FileSize:   fileSize,
-		DataSize:   uint32(len(dataToSend)),
-		Compressed: compressedFlag,
-		Zero:       false,
-		Done:       false,
+		MagicHead: magicBytes,
+		Op:        uint8(OpBlockData),
+		Flags:     dataFlags,
+		FileID:    0,
+		BlockIdx:  block.BlockIdx,
+		BlockSize: blockSize,
+		FileSize:  fileSize,
+		DataSize:  uint32(len(dataToSend)),
 	})
 	if err1 != nil {
 		return fmt.Errorf("pack data: %w", err1)
@@ -389,14 +404,13 @@ func startClientDownload(file *os.File, serverAddress string, skipIdx uint32, bl
 	// Send download request to server
 	magicBytes := stringToFixedSizeArray(magicHead)
 	msg, err1 := pack(&Msg{
-		MagicHead:  magicBytes,
-		BlockIdx:   0,
-		BlockSize:  blockSize,
-		FileSize:   0,
-		DataSize:   0,
-		Compressed: false,
-		Zero:       false,
-		Done:       false,
+		MagicHead: magicBytes,
+		Op:        uint8(OpDownReq),
+		FileID:    0,
+		BlockIdx:  0,
+		BlockSize: blockSize,
+		FileSize:  0,
+		DataSize:  0,
 	})
 	if err1 != nil {
 		return fmt.Errorf("pack download request: %w", err1)
@@ -417,8 +431,8 @@ func startClientDownload(file *os.File, serverAddress string, skipIdx uint32, bl
 	if err3 != nil {
 		return fmt.Errorf("unpack metadata: %w", err3)
 	}
-	if metaMsg.MagicHead != magicBytes || metaMsg.BlockSize == 0 ||
-		metaMsg.DataSize != 0 || metaMsg.Compressed || metaMsg.Zero || metaMsg.Done {
+	if Op(metaMsg.Op) != OpDownData || metaMsg.MagicHead != magicBytes || metaMsg.FileID != 0 ||
+		metaMsg.BlockSize == 0 || metaMsg.DataSize != 0 || metaMsg.Flags != 0 {
 		return fmt.Errorf("invalid metadata from server")
 	}
 
@@ -454,14 +468,13 @@ func startClientDownload(file *os.File, serverAddress string, skipIdx uint32, bl
 		}
 		// Request block from server
 		msg, err1 := pack(&Msg{
-			MagicHead:  magicBytes,
-			BlockIdx:   blockIdx,
-			BlockSize:  blockSize,
-			FileSize:   fileSize,
-			DataSize:   0,
-			Compressed: false,
-			Zero:       false,
-			Done:       false,
+			MagicHead: magicBytes,
+			Op:        uint8(OpDownReq),
+			FileID:    0,
+			BlockIdx:  blockIdx,
+			BlockSize: blockSize,
+			FileSize:  fileSize,
+			DataSize:  0,
 		})
 		if err1 != nil {
 			return fmt.Errorf("pack block request: %w", err1)
@@ -482,14 +495,17 @@ func startClientDownload(file *os.File, serverAddress string, skipIdx uint32, bl
 			return fmt.Errorf("unpack block response: %w", err4)
 		}
 
-		if blockMsg.Done {
+		if Op(blockMsg.Op) == OpDownDone {
 			return fmt.Errorf("premature completion while awaiting block %d", blockIdx)
 		}
-		if blockMsg.MagicHead != magicBytes || blockMsg.BlockIdx != blockIdx ||
+		blockZero := blockMsg.Flags&FlagZero != 0
+		blockCompressed := blockMsg.Flags&FlagCompressed != 0
+		if Op(blockMsg.Op) != OpDownData || blockMsg.MagicHead != magicBytes || blockMsg.FileID != 0 ||
+			blockMsg.BlockIdx != blockIdx ||
 			blockMsg.BlockSize != blockSize || blockMsg.FileSize != fileSize ||
 			blockMsg.DataSize > uint32(len(filebuf)) ||
-			(blockMsg.Zero && (blockMsg.DataSize != 0 || blockMsg.Compressed)) ||
-			(!blockMsg.Zero && blockMsg.DataSize == 0) {
+			(blockZero && (blockMsg.DataSize != 0 || blockCompressed)) ||
+			(!blockZero && blockMsg.DataSize == 0) {
 			return fmt.Errorf("invalid block response for block %d", blockIdx)
 		}
 
@@ -498,7 +514,7 @@ func startClientDownload(file *os.File, serverAddress string, skipIdx uint32, bl
 
 		// A zero notification must clear old destination data; an existing range
 		// cannot be assumed to be a sparse hole.
-		if blockMsg.Zero && blockMsg.DataSize == 0 {
+		if blockZero && blockMsg.DataSize == 0 {
 			n, err := file.WriteAt(getZeroBuf(int(expectedSize)), offset)
 			if err != nil {
 				return fmt.Errorf("write zero block %d: %w", blockIdx, err)
@@ -518,7 +534,7 @@ func startClientDownload(file *os.File, serverAddress string, skipIdx uint32, bl
 				return fmt.Errorf("read block %d data: %w", blockIdx, err1)
 			}
 
-			if blockMsg.Compressed {
+			if blockCompressed {
 				decompressed, err := decompressData(filebuf[:blockMsg.DataSize])
 				if err != nil {
 					return fmt.Errorf("decompress block %d: %w", blockIdx, err)

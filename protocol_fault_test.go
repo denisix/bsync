@@ -65,7 +65,7 @@ func sendDownloadMetadata(conn net.Conn, fileSize uint64, blockSize uint32) erro
 	if _, err := readTestMsg(conn); err != nil {
 		return err
 	}
-	data, err := pack(&Msg{MagicHead: stringToFixedSizeArray(magicHead), BlockSize: blockSize, FileSize: fileSize})
+	data, err := pack(&Msg{MagicHead: stringToFixedSizeArray(magicHead), Op: uint8(OpDownData), BlockSize: blockSize, FileSize: fileSize})
 	if err != nil {
 		return err
 	}
@@ -84,7 +84,7 @@ func TestFaultDownloadRejectsPrematureCompletion(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		done, _ := pack(&Msg{MagicHead: stringToFixedSizeArray(magicHead), BlockIdx: req.BlockIdx, BlockSize: bs, FileSize: uint64(bs * 2), Done: true})
+		done, _ := pack(&Msg{MagicHead: stringToFixedSizeArray(magicHead), Op: uint8(OpDownDone), BlockIdx: req.BlockIdx, BlockSize: bs, FileSize: uint64(bs * 2)})
 		_, err = conn.Write(done)
 		return err
 	})
@@ -103,17 +103,17 @@ func TestFaultDownloadRejectsMalformedResponses(t *testing.T) {
 	const bs = uint32(4096)
 	cases := map[string]func(net.Conn) error{
 		"zero-with-payload": func(conn net.Conn) error {
-			msg, _ := pack(&Msg{MagicHead: stringToFixedSizeArray(magicHead), BlockSize: bs, FileSize: uint64(bs), DataSize: 1, Zero: true})
+			msg, _ := pack(&Msg{MagicHead: stringToFixedSizeArray(magicHead), Op: uint8(OpDownData), Flags: FlagZero, BlockSize: bs, FileSize: uint64(bs), DataSize: 1})
 			_, err := conn.Write(msg)
 			return err
 		},
 		"payload-missing": func(conn net.Conn) error {
-			msg, _ := pack(&Msg{MagicHead: stringToFixedSizeArray(magicHead), BlockSize: bs, FileSize: uint64(bs)})
+			msg, _ := pack(&Msg{MagicHead: stringToFixedSizeArray(magicHead), Op: uint8(OpDownData), BlockSize: bs, FileSize: uint64(bs)})
 			_, err := conn.Write(msg)
 			return err
 		},
 		"truncated-payload": func(conn net.Conn) error {
-			msg, _ := pack(&Msg{MagicHead: stringToFixedSizeArray(magicHead), BlockSize: bs, FileSize: uint64(bs), DataSize: bs})
+			msg, _ := pack(&Msg{MagicHead: stringToFixedSizeArray(magicHead), Op: uint8(OpDownData), BlockSize: bs, FileSize: uint64(bs), DataSize: bs})
 			if _, err := conn.Write(msg); err != nil {
 				return err
 			}
@@ -157,7 +157,7 @@ func TestFaultDownloadReportsDestinationWriteFailure(t *testing.T) {
 		if _, err := readTestMsg(conn); err != nil {
 			return err
 		}
-		msg, _ := pack(&Msg{MagicHead: stringToFixedSizeArray(magicHead), BlockSize: bs, FileSize: uint64(bs), DataSize: bs})
+		msg, _ := pack(&Msg{MagicHead: stringToFixedSizeArray(magicHead), Op: uint8(OpDownData), BlockSize: bs, FileSize: uint64(bs), DataSize: bs})
 		if _, err := conn.Write(msg); err != nil {
 			return err
 		}
@@ -177,9 +177,12 @@ func TestFaultDownloadReportsDestinationWriteFailure(t *testing.T) {
 func TestFaultServerRejectsContradictoryUploadMessages(t *testing.T) {
 	const bs = uint32(4096)
 	for name, bad := range map[string]*Msg{
-		"done-payload":      {BlockSize: bs, FileSize: uint64(bs), Done: true, DataSize: 1},
-		"zero-payload":      {BlockSize: bs, FileSize: uint64(bs), Zero: true, DataSize: 1},
-		"checksum-compress": {BlockSize: bs, FileSize: uint64(bs), Compressed: true},
+		// DONE must not carry a payload.
+		"done-payload": {Op: uint8(OpFileDone), BlockSize: bs, FileSize: uint64(bs), DataSize: 1},
+		// A zero-block write can't also carry a payload.
+		"zero-payload": {Op: uint8(OpBlockZero), BlockSize: bs, FileSize: uint64(bs), DataSize: 1},
+		// A checksum request (no payload) can't carry the compressed flag.
+		"checksum-compress": {Op: uint8(OpBlockCheck), BlockSize: bs, FileSize: uint64(bs), Flags: FlagCompressed},
 	} {
 		t.Run(name, func(t *testing.T) {
 			resetEngineGlobals()
@@ -219,7 +222,8 @@ func TestFaultServerRejectsInvalidDownloadRequest(t *testing.T) {
 	server, client := net.Pipe()
 	errCh := make(chan error, 1)
 	go func() { errCh <- serverHandleUpload(server, src, uint64(bs), NewChecksumCache(0), 1, false) }()
-	writeTestMsg(t, client, &Msg{MagicHead: stringToFixedSizeArray(magicHead), BlockSize: bs, DataSize: 1})
+	// A well-formed OpDownReq must never carry a payload.
+	writeTestMsg(t, client, &Msg{MagicHead: stringToFixedSizeArray(magicHead), Op: uint8(OpDownReq), BlockSize: bs, DataSize: 1})
 	client.Close()
 	if err := <-errCh; err == nil {
 		t.Fatal("invalid download request unexpectedly succeeded")
@@ -230,11 +234,11 @@ func TestFaultServerRejectsUnsolicitedOrChangedUploadWrite(t *testing.T) {
 	const bs = uint32(4096)
 	for name, messages := range map[string][]*Msg{
 		"unsolicited": {
-			{BlockIdx: 0, BlockSize: bs, FileSize: uint64(bs), DataSize: bs},
+			{Op: uint8(OpBlockData), BlockIdx: 0, BlockSize: bs, FileSize: uint64(bs), DataSize: bs},
 		},
 		"changed-metadata": {
-			{BlockIdx: 0, BlockSize: bs, FileSize: uint64(bs)},
-			{BlockIdx: 0, BlockSize: bs, FileSize: uint64(bs) * 2, DataSize: bs},
+			{Op: uint8(OpBlockCheck), BlockIdx: 0, BlockSize: bs, FileSize: uint64(bs)},
+			{Op: uint8(OpBlockData), BlockIdx: 0, BlockSize: bs, FileSize: uint64(bs) * 2, DataSize: bs},
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -254,7 +258,13 @@ func TestFaultServerRejectsUnsolicitedOrChangedUploadWrite(t *testing.T) {
 				if msg.DataSize > 0 {
 					_, _ = client.Write(bytes.Repeat([]byte{0x72}, int(msg.DataSize)))
 				} else {
-					hash := make([]byte, 16)
+					// A checksum request now gets a framed OpHash reply
+					// (header + payload), not bare bytes; drain both.
+					hashHdr, err := readTestMsg(client)
+					if err != nil {
+						t.Fatal(err)
+					}
+					hash := make([]byte, hashHdr.DataSize)
 					if _, err := io.ReadFull(client, hash); err != nil {
 						t.Fatal(err)
 					}
@@ -298,10 +308,15 @@ func TestFaultUploadRetriesAfterLostAcknowledgement(t *testing.T) {
 				errCh <- err
 				return
 			}
-			if req.Done {
+			if Op(req.Op) == OpFileDone {
 				errCh <- fmt.Errorf("unexpected DONE before retry")
 				return
 			}
+			// Framed OpHash reply: header, then the 16-byte digest. All
+			// zero bytes forces a mismatch against the block's real FNV
+			// hash, so the client proceeds to send the payload.
+			hashMsg, _ := pack(&Msg{MagicHead: stringToFixedSizeArray(magicHead), Op: uint8(OpHash), BlockIdx: req.BlockIdx, BlockSize: req.BlockSize, FileSize: req.FileSize, DataSize: 16})
+			conn.Write(hashMsg)
 			conn.Write(make([]byte, 16))
 			payloadHeader, err := readTestMsg(conn)
 			if err != nil {
@@ -318,7 +333,7 @@ func TestFaultUploadRetriesAfterLostAcknowledgement(t *testing.T) {
 				continue
 			}
 			received <- payload
-			ack, _ := pack(&Msg{MagicHead: stringToFixedSizeArray(magicHead), BlockIdx: 0, BlockSize: bs, FileSize: uint64(bs)})
+			ack, _ := pack(&Msg{MagicHead: stringToFixedSizeArray(magicHead), Op: uint8(OpAck), BlockIdx: 0, BlockSize: bs, FileSize: uint64(bs)})
 			conn.Write(ack)
 			conn.Close()
 		}
@@ -329,7 +344,7 @@ func TestFaultUploadRetriesAfterLostAcknowledgement(t *testing.T) {
 		}
 		defer conn.Close()
 		done, err := readTestMsg(conn)
-		if err != nil || !done.Done {
+		if err != nil || Op(done.Op) != OpFileDone {
 			errCh <- fmt.Errorf("missing DONE: %v", err)
 			return
 		}

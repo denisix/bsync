@@ -198,66 +198,70 @@ func TestPackUnpack(t *testing.T) {
 		{
 			name: "basic message",
 			msg: Msg{
-				MagicHead:  magicBytes,
-				BlockIdx:   1,
-				BlockSize:  10485760,
-				FileSize:   104857600,
-				DataSize:   1048576,
-				Compressed: false,
-				Zero:       false,
-				Done:       false,
+				MagicHead: magicBytes,
+				Op:        uint8(OpBlockCheck),
+				FileID:    0,
+				BlockIdx:  1,
+				BlockSize: 10485760,
+				FileSize:  104857600,
+				DataSize:  1048576,
 			},
 		},
 		{
 			name: "compressed message",
 			msg: Msg{
-				MagicHead:  magicBytes,
-				BlockIdx:   5,
-				BlockSize:  5242880,
-				FileSize:   52428800,
-				DataSize:   1000000,
-				Compressed: true,
-				Zero:       false,
-				Done:       false,
+				MagicHead: magicBytes,
+				Op:        uint8(OpBlockData),
+				Flags:     FlagCompressed,
+				FileID:    0,
+				BlockIdx:  5,
+				BlockSize: 5242880,
+				FileSize:  52428800,
+				DataSize:  1000000,
 			},
 		},
 		{
 			name: "zero block",
 			msg: Msg{
-				MagicHead:  magicBytes,
-				BlockIdx:   10,
-				BlockSize:  10485760,
-				FileSize:   104857600,
-				DataSize:   10485760,
-				Compressed: false,
-				Zero:       true,
-				Done:       false,
+				MagicHead: magicBytes,
+				Op:        uint8(OpBlockZero),
+				FileID:    0,
+				BlockIdx:  10,
+				BlockSize: 10485760,
+				FileSize:  104857600,
+				DataSize:  0,
 			},
 		},
 		{
 			name: "DONE message",
 			msg: Msg{
-				MagicHead:  magicBytes,
-				BlockIdx:   0,
-				BlockSize:  10485760,
-				FileSize:   0,
-				DataSize:   0,
-				Compressed: false,
-				Zero:       false,
-				Done:       true,
+				MagicHead: magicBytes,
+				Op:        uint8(OpFileDone),
+				FileID:    0,
+				BlockIdx:  0,
+				BlockSize: 10485760,
+				FileSize:  0,
+				DataSize:  0,
 			},
 		},
 		{
-			name: "all flags true",
+			// Exercises every new field simultaneously: a nonzero FileID (the
+			// directory-tree field, unused by single-file mode but must
+			// still round-trip byte-for-byte), every defined flag bit set at
+			// once, and a nonzero Reserved pattern. pack/unpack are pure
+			// binary codecs and must preserve whatever bytes are given them,
+			// even combinations validateClientFrame would reject.
+			name: "all fields, all flags, nonzero reserved",
 			msg: Msg{
-				MagicHead:  magicBytes,
-				BlockIdx:   999,
-				BlockSize:  512,
-				FileSize:   1024000,
-				DataSize:   256,
-				Compressed: true,
-				Zero:       true,
-				Done:       true,
+				MagicHead: magicBytes,
+				Op:        0xAB,
+				Flags:     FlagCompressed | FlagZero | FlagNoDest | FlagCreated | FlagDelete,
+				Reserved:  [5]byte{1, 2, 3, 4, 5},
+				FileID:    42,
+				BlockIdx:  999,
+				BlockSize: 512,
+				FileSize:  1024000,
+				DataSize:  256,
 			},
 		},
 	}
@@ -271,10 +275,14 @@ func TestPackUnpack(t *testing.T) {
 			}
 
 			// Verify packed size
-			// MagicHead: 17 bytes + BlockIdx: 4 + BlockSize: 4 + FileSize: 8 + DataSize: 4 + flags: 3 = 40 bytes
-			expectedSize := 17 + 4 + 4 + 8 + 4 + 1 + 1 + 1 // 40 bytes
+			// MagicHead: 17 + Op: 1 + Flags: 1 + Reserved: 5 + FileID: 4 +
+			// BlockIdx: 4 + BlockSize: 4 + FileSize: 8 + DataSize: 4 = 48 bytes
+			expectedSize := 17 + 1 + 1 + 5 + 4 + 4 + 4 + 8 + 4 // 48 bytes
 			if len(data) != expectedSize {
 				t.Errorf("pack() size = %d, want %d", len(data), expectedSize)
+			}
+			if expectedSize != msgSize {
+				t.Errorf("expectedSize = %d, want msgSize = %d", expectedSize, msgSize)
 			}
 
 			// Unpack
@@ -284,14 +292,7 @@ func TestPackUnpack(t *testing.T) {
 			}
 
 			// Compare
-			if unpacked.MagicHead != tt.msg.MagicHead ||
-				unpacked.BlockIdx != tt.msg.BlockIdx ||
-				unpacked.BlockSize != tt.msg.BlockSize ||
-				unpacked.FileSize != tt.msg.FileSize ||
-				unpacked.DataSize != tt.msg.DataSize ||
-				unpacked.Compressed != tt.msg.Compressed ||
-				unpacked.Zero != tt.msg.Zero ||
-				unpacked.Done != tt.msg.Done {
+			if *unpacked != tt.msg {
 				t.Errorf("round-trip mismatch: got %+v, want %+v", unpacked, tt.msg)
 			}
 		})
