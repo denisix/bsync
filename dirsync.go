@@ -38,6 +38,24 @@ type SyncSession struct {
 	bytesNet   atomic.Uint64
 	diffs      atomic.Uint64
 
+	// totalBytesKnown/totalBlocksKnown are running sums over every KindFile
+	// entry AddFile has seen so far (updated there, O(1) per call) — a
+	// growing, partial total until WalkDone, exactly like FileCount/
+	// TotalBytes's existing "partial while walking" semantics, just no
+	// longer requiring an O(files) rescan on every read (TotalBytes used to
+	// scan s.files itself; see its comment below).
+	//
+	// bytesScanned is the sum of every block's actual byte length that has
+	// been read+checksummed so far, REGARDLESS of whether it differed from
+	// the destination (unlike bytesOrig/bytesNet above, which only count
+	// CHANGED blocks) — this is what an overall "how far through the tree
+	// are we" progress metric needs: on a mostly-unchanged re-run, almost
+	// every block is skipped after a cheap checksum compare, and a metric
+	// based on bytesNet alone would sit at ~0 for the whole run.
+	totalBytesKnown  atomic.Uint64
+	totalBlocksKnown atomic.Uint64
+	bytesScanned     atomic.Uint64
+
 	filesDone    atomic.Uint32
 	filesSkipped atomic.Uint32
 
@@ -51,15 +69,12 @@ func NewSyncSession() *SyncSession {
 
 // AddFile appends fe to the session's file table and returns its FileID.
 // fe.ID must already be set by the caller (walkSource assigns dense,
-// sequential IDs); AddFile asserts it matches the next available slot, so a
-// caller that skips or reorders entries fails loudly instead of silently
-// desynchronizing the ID space from the table.
-// AddFile registers fe, which must be the next dense ID (walkSource
-// guarantees this in the real pipeline; only a bug there, not any external
-// input, could violate it). Returns an error rather than panicking: a
-// panic in a server/transfer data path is a liveness hazard (it can bring
-// down the whole process instead of just failing this one transfer), and
-// every other error in this file is returned, not panicked.
+// sequential IDs, guaranteed in the real pipeline; only a bug there, not
+// any external input, could violate it); AddFile checks it matches the
+// next available slot. Returns an error rather than panicking: a panic in
+// a server/transfer data path is a liveness hazard (it can bring down the
+// whole process instead of just failing this one transfer), and every
+// other error in this file is returned, not panicked.
 func (s *SyncSession) AddFile(fe *FileEntry) (uint32, error) {
 	s.filesMu.Lock()
 	defer s.filesMu.Unlock()
@@ -67,6 +82,10 @@ func (s *SyncSession) AddFile(fe *FileEntry) (uint32, error) {
 		return 0, fmt.Errorf("SyncSession.AddFile: FileID %d does not match next slot %d", fe.ID, len(s.files))
 	}
 	s.files = append(s.files, fe)
+	if fe.Kind == KindFile {
+		s.totalBytesKnown.Add(fe.Size)
+		s.totalBlocksKnown.Add(uint64(fe.Blocks))
+	}
 	return fe.ID, nil
 }
 
@@ -90,17 +109,19 @@ func (s *SyncSession) FileCount() int {
 }
 
 // TotalBytes sums the Size of every KindFile entry known so far. Grows
-// alongside FileCount as the walk discovers more entries.
+// alongside FileCount as the walk discovers more entries. O(1): backed by
+// totalBytesKnown, a running total AddFile maintains as entries arrive,
+// rather than rescanning s.files on every call (a real cost on a
+// large/still-growing tree if this were read on every tick of a progress
+// renderer, which is exactly what it's now used for).
 func (s *SyncSession) TotalBytes() uint64 {
-	s.filesMu.RLock()
-	defer s.filesMu.RUnlock()
-	var total uint64
-	for _, fe := range s.files {
-		if fe.Kind == KindFile {
-			total += fe.Size
-		}
-	}
-	return total
+	return s.totalBytesKnown.Load()
+}
+
+// TotalBlocks sums the Blocks of every KindFile entry known so far, the
+// block-count counterpart to TotalBytes. Also O(1).
+func (s *SyncSession) TotalBlocks() uint64 {
+	return s.totalBlocksKnown.Load()
 }
 
 // MarkWalkDone records that the walk has finished discovering files; the
@@ -149,11 +170,14 @@ func (s *SyncSession) FailedCount() int {
 	return n
 }
 
-// AddBlockProgress records one block's outcome. netBytes/origBytes are the
-// compressed/raw byte counts (0 for a skipped/unchanged block), and changed
-// reports whether the block actually differed and was transferred.
-func (s *SyncSession) AddBlockProgress(changed bool, netBytes, origBytes uint64) {
+// AddBlockProgress records one block's outcome. blockLen is the block's
+// actual byte length (its contribution to bytesScanned regardless of
+// outcome); netBytes/origBytes are the compressed/raw byte counts (0 for a
+// skipped/unchanged block), and changed reports whether the block actually
+// differed and was transferred.
+func (s *SyncSession) AddBlockProgress(changed bool, blockLen, netBytes, origBytes uint64) {
 	s.blocksDone.Add(1)
+	s.bytesScanned.Add(blockLen)
 	if changed {
 		s.diffs.Add(1)
 		s.bytesNet.Add(netBytes)
@@ -337,6 +361,148 @@ func (dt *dirTransferState) forceFileDone(fileID uint32, blocksEmitted uint32) {
 	}
 }
 
+// formatBytesShort renders n bytes as a short human-readable size (e.g.
+// "3.2 GB", "512.4 MB", "870.0 KB", "42 B") for the directory-tree progress
+// line. Not shared with visualizer.go's stats line, which deliberately
+// always reports a fixed "MB/s" unit for its throughput figure -- this one
+// needs an adaptive unit for TOTAL size, which ranges from a few bytes to
+// many terabytes across real trees.
+func formatBytesShort(n uint64) string {
+	const (
+		kb = 1 << 10
+		mb = 1 << 20
+		gb = 1 << 30
+		tb = 1 << 40
+	)
+	switch {
+	case n >= tb:
+		return fmt.Sprintf("%.2f TB", float64(n)/tb)
+	case n >= gb:
+		return fmt.Sprintf("%.2f GB", float64(n)/gb)
+	case n >= mb:
+		return fmt.Sprintf("%.1f MB", float64(n)/mb)
+	case n >= kb:
+		return fmt.Sprintf("%.1f KB", float64(n)/kb)
+	default:
+		return fmt.Sprintf("%d B", n)
+	}
+}
+
+// dirProgressRenderer periodically prints an overall progress/ETA summary
+// line for a directory-tree transfer -- directory mode is otherwise
+// completely silent from start to finish. Deliberately a single persistent
+// TEXT line, not a redesign of visualizer.go's per-block grid: the grid
+// needs a fixed total block count up front, which isn't known until the
+// walk finishes (dead air on a large tree before the first render), and a
+// tree has per-file block-index spaces that don't map onto the grid's flat
+// index space anyway. Output goes through Log(), so it automatically gets
+// the same quiet/-v routing every other status line in this codebase
+// already has (see log.go's Log — -v routes it into the (currently
+// unrendered, for directory mode) visual log ring buffer instead of
+// stdout, which is why directory mode rejects -v at the CLI layer rather
+// than silently swallowing this line there).
+type dirProgressRenderer struct {
+	sess *SyncSession
+	stop chan struct{}
+	done chan struct{}
+}
+
+// startDirProgressRenderer starts rendering immediately and returns a
+// handle whose Stop renders one final line and waits for the goroutine to
+// exit. Safe to use even before the walk has produced any entries (renders
+// "files 0/0~ ...", matching the design's own "~ while the walk is
+// incomplete" notation).
+func startDirProgressRenderer(sess *SyncSession) *dirProgressRenderer {
+	r := &dirProgressRenderer{sess: sess, stop: make(chan struct{}), done: make(chan struct{})}
+	go r.run()
+	return r
+}
+
+func (r *dirProgressRenderer) Stop() {
+	close(r.stop)
+	<-r.done
+}
+
+// dirProgressSample is one bytesScanned reading at a point in time, used to
+// derive a smoothed recent throughput instead of an instantaneous (jittery)
+// per-tick rate.
+type dirProgressSample struct {
+	bytes uint64
+	at    time.Time
+}
+
+const dirProgressTick = time.Second
+const dirProgressWindow = 5 // ticks averaged for the displayed MB/s and ETA
+
+// dirProgressLine computes the exact progress/ETA summary line text from a
+// sample window (oldest to newest, already trimmed to at most
+// dirProgressWindow entries) and the session's current totals. Pure and
+// deterministic given its inputs — no clock or global state read directly —
+// so it's directly unit-testable without needing to capture stdout or fake
+// time.Now(); dirProgressRenderer.run is a thin timing/sampling/IO wrapper
+// around it.
+func dirProgressLine(window []dirProgressSample, total uint64, filesDone, fileCount uint32, walkDone bool) string {
+	mbps := 0.0
+	eta := "--"
+	if len(window) >= 2 {
+		oldest := window[0]
+		newest := window[len(window)-1]
+		elapsed := newest.at.Sub(oldest.at).Seconds()
+		if elapsed > 0 && newest.bytes >= oldest.bytes {
+			bytesPerSec := float64(newest.bytes-oldest.bytes) / elapsed
+			mbps = bytesPerSec / mb1
+			switch {
+			case bytesPerSec > 0 && total > newest.bytes:
+				eta = formatDuration(time.Duration(float64(total-newest.bytes)/bytesPerSec) * time.Second)
+			case total > 0 && newest.bytes >= total:
+				eta = "0s"
+			}
+		}
+	}
+
+	walkTilde := ""
+	if !walkDone {
+		walkTilde = "~"
+	}
+	scanned := uint64(0)
+	if len(window) > 0 {
+		scanned = window[len(window)-1].bytes
+	}
+	return fmt.Sprintf("files %d/%d%s · %s/%s · %.1f MB/s · ETA ~%s",
+		filesDone, fileCount, walkTilde, formatBytesShort(scanned), formatBytesShort(total), mbps, eta)
+}
+
+func (r *dirProgressRenderer) run() {
+	defer close(r.done)
+	ticker := time.NewTicker(dirProgressTick)
+	defer ticker.Stop()
+
+	var window []dirProgressSample
+	render := func() {
+		window = append(window, dirProgressSample{bytes: r.sess.bytesScanned.Load(), at: time.Now()})
+		if len(window) > dirProgressWindow {
+			window = window[len(window)-dirProgressWindow:]
+		}
+		line := dirProgressLine(window, r.sess.totalBytesKnown.Load(), r.sess.filesDone.Load(), uint32(r.sess.FileCount()), r.sess.WalkDone())
+		// line is passed as an argument, never as the format string itself:
+		// it's runtime-computed text (a formatted byte size could in
+		// principle contain a stray '%' in some future unit), and Log's
+		// first parameter is a Printf-style format string.
+		Log("%s\r", line)
+	}
+
+	for {
+		select {
+		case <-ticker.C:
+			render()
+		case <-r.stop:
+			render()
+			Log("\n") // leave the final in-place-updated line intact
+			return
+		}
+	}
+}
+
 // startDirClient walks srcRoot, announces it to serverAddress, and
 // transfers every differing block over workers parallel connections. The
 // returned SyncSession's FailedCount/FailedError report per-file failures
@@ -449,6 +615,14 @@ func startDirClient(srcRoot, serverAddress string, blockSizeCap uint32, noCompre
 			runDirTransferWorker(saddr, dt, precompChan)
 		}()
 	}
+	// Declared BEFORE the wg.Wait() defer below so it runs AFTER it (defers
+	// are LIFO): the progress line keeps updating while workers are still
+	// active and only renders its final state, then stops, once they've
+	// all actually finished (or the function is returning early for any
+	// other reason -- Stop still renders once and exits cleanly either
+	// way).
+	progress := startDirProgressRenderer(sess)
+	defer progress.Stop()
 	// Guarantees the reader/precompute/worker chain always drains via the
 	// natural channel-close cascade (walkSource closes its output on any
 	// return, error or not) on EVERY exit path below, including the early
@@ -592,7 +766,8 @@ func runDirTransferWorker(saddr *net.TCPAddr, dt *dirTransferState, precompChan 
 			Log("file %d block %d: failed after %d retries: %v\n", pb.FileID, pb.BlockIdx, maxRetries, lastErr)
 			dt.sess.failFile(pb.FileID, fmt.Errorf("block %d: %w", pb.BlockIdx, lastErr))
 		} else {
-			dt.sess.AddBlockProgress(outcome.changed, uint64(outcome.netBytes), uint64(outcome.origBytes))
+			blockLen := uint64(blockPayloadSize(pb.FileSize, pb.BlockSize, pb.BlockIdx))
+			dt.sess.AddBlockProgress(outcome.changed, blockLen, uint64(outcome.netBytes), uint64(outcome.origBytes))
 		}
 		// Every block that leaves this loop, succeeded or not, counts
 		// toward the file being "resolved" -- see the comment above for

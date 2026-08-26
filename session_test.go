@@ -93,9 +93,9 @@ func TestSyncSessionFailFileFirstWriteWins(t *testing.T) {
 
 func TestSyncSessionBlockProgress(t *testing.T) {
 	s := NewSyncSession()
-	s.AddBlockProgress(false, 0, 0) // unchanged block: counted, but no bytes
-	s.AddBlockProgress(true, 100, 400)
-	s.AddBlockProgress(true, 50, 400)
+	s.AddBlockProgress(false, 4096, 0, 0) // unchanged block: counted, incl. in bytesScanned, but no net/orig bytes
+	s.AddBlockProgress(true, 100, 100, 400)
+	s.AddBlockProgress(true, 50, 50, 400)
 
 	if got := s.blocksDone.Load(); got != 3 {
 		t.Errorf("blocksDone = %d, want 3", got)
@@ -108,6 +108,12 @@ func TestSyncSessionBlockProgress(t *testing.T) {
 	}
 	if got := s.bytesOrig.Load(); got != 800 {
 		t.Errorf("bytesOrig = %d, want 800", got)
+	}
+	// bytesScanned (Phase C): every block's actual length counts, changed
+	// or not -- the unchanged 4096-byte block must be included even though
+	// it contributed nothing to bytesNet/bytesOrig above.
+	if got := s.bytesScanned.Load(); got != 4096+100+50 {
+		t.Errorf("bytesScanned = %d, want %d", got, 4096+100+50)
 	}
 }
 
@@ -145,7 +151,7 @@ func TestSyncSessionCountersConcurrent(t *testing.T) {
 				// instead, which is the realistic multi-worker access
 				// pattern (many transfer workers, one shared session).
 				_ = fe
-				s.AddBlockProgress(i%2 == 0, uint64(i), uint64(i*2))
+				s.AddBlockProgress(i%2 == 0, uint64(i+1), uint64(i), uint64(i*2))
 				if i%7 == 0 {
 					s.failFile(id, errors.New("boom"))
 				}

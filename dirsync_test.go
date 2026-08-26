@@ -2,6 +2,7 @@ package main
 
 import (
 	"net"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -244,4 +245,140 @@ func TestDirTransferStateForceFileDoneThenNormalCompletionSendsExactlyOnce(t *te
 	}
 	waitForFileDoneCount(t, log, 0, 1, 2*time.Second)
 	assertFileDoneCountStays(t, log, 0, 1)
+}
+
+// --- Phase C: progress/ETA line ---
+
+func TestFormatBytesShort(t *testing.T) {
+	cases := []struct {
+		n    uint64
+		want string
+	}{
+		{0, "0 B"},
+		{42, "42 B"},
+		{1023, "1023 B"},
+		{1024, "1.0 KB"},
+		{1536, "1.5 KB"},
+		{1 << 20, "1.0 MB"},
+		{3*(1<<20) + (1 << 19), "3.5 MB"},
+		{1 << 30, "1.00 GB"},
+		{1 << 40, "1.00 TB"},
+	}
+	for _, tt := range cases {
+		if got := formatBytesShort(tt.n); got != tt.want {
+			t.Errorf("formatBytesShort(%d) = %q, want %q", tt.n, got, tt.want)
+		}
+	}
+}
+
+// dirProgressLine is pure (no clock/global reads), so these use fixed
+// timestamps for fully deterministic assertions rather than sleeping on a
+// real ticker.
+
+func TestDirProgressLineNoRateWithFewerThanTwoSamples(t *testing.T) {
+	base := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+	line := dirProgressLine([]dirProgressSample{{bytes: 100, at: base}}, 1000, 1, 4, false)
+	if !strings.Contains(line, "0.0 MB/s") {
+		t.Errorf("line = %q, want a 0.0 MB/s rate with only one sample", line)
+	}
+	if !strings.Contains(line, "ETA ~--") {
+		t.Errorf("line = %q, want ETA ~-- with only one sample", line)
+	}
+	if !strings.Contains(line, "files 1/4~") {
+		t.Errorf("line = %q, want \"files 1/4~\" (walk not done)", line)
+	}
+}
+
+func TestDirProgressLineComputesRateAndETA(t *testing.T) {
+	base := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+	// 10 MB scanned over 5 seconds = 2 MB/s; 40 MB remaining of a 50 MB
+	// total at that rate = 20s.
+	window := []dirProgressSample{
+		{bytes: 0, at: base},
+		{bytes: 10 << 20, at: base.Add(5 * time.Second)},
+	}
+	line := dirProgressLine(window, 50<<20, 2, 10, true)
+	if !strings.Contains(line, "2.0 MB/s") {
+		t.Errorf("line = %q, want \"2.0 MB/s\"", line)
+	}
+	if !strings.Contains(line, "ETA ~20s") {
+		t.Errorf("line = %q, want \"ETA ~20s\"", line)
+	}
+	if !strings.Contains(line, "files 2/10 ") {
+		t.Errorf("line = %q, want \"files 2/10 \" (no ~, walk is done)", line)
+	}
+	if !strings.Contains(line, "10.0 MB/50.0 MB") {
+		t.Errorf("line = %q, want the scanned/total sizes", line)
+	}
+}
+
+func TestDirProgressLineNoProgressBetweenSamplesShowsNoETA(t *testing.T) {
+	// A real plateau (e.g. between files, waiting on a checksum round trip
+	// with no new bytes read) must not show a stale or fabricated ETA.
+	base := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+	window := []dirProgressSample{
+		{bytes: 5000, at: base},
+		{bytes: 5000, at: base.Add(3 * time.Second)},
+	}
+	line := dirProgressLine(window, 10000, 1, 3, false)
+	if !strings.Contains(line, "0.0 MB/s") {
+		t.Errorf("line = %q, want 0.0 MB/s with no movement", line)
+	}
+	if !strings.Contains(line, "ETA ~--") {
+		t.Errorf("line = %q, want ETA ~-- with no movement (not a stale/fabricated value)", line)
+	}
+}
+
+func TestDirProgressLineCompleteShowsZeroETA(t *testing.T) {
+	base := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+	window := []dirProgressSample{
+		{bytes: 100, at: base},
+		{bytes: 1000, at: base.Add(time.Second)},
+	}
+	line := dirProgressLine(window, 1000, 5, 5, true)
+	if !strings.Contains(line, "ETA ~0s") {
+		t.Errorf("line = %q, want ETA ~0s once scanned has reached the total", line)
+	}
+}
+
+func TestDirProgressLineWalkTildeReflectsWalkDone(t *testing.T) {
+	base := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+	window := []dirProgressSample{{bytes: 0, at: base}}
+	if line := dirProgressLine(window, 100, 0, 1, false); !strings.Contains(line, "0/1~") {
+		t.Errorf("line = %q, want a ~ suffix while walking", line)
+	}
+	// "ETA ~" always carries its own tilde regardless of walk state, so
+	// check the files-count segment specifically ("0/1 " with a trailing
+	// space, not "0/1~") rather than a bare "~" anywhere in the line.
+	if line := dirProgressLine(window, 100, 0, 1, true); !strings.Contains(line, "0/1 ") {
+		t.Errorf("line = %q, want \"0/1 \" (no ~ suffix) once the walk is done", line)
+	}
+}
+
+func TestDirProgressLineEmptyWindowDoesNotPanic(t *testing.T) {
+	// startDirProgressRenderer can in principle render before its first
+	// sample is even appended (defensive only; run() always appends
+	// before calling this in practice).
+	line := dirProgressLine(nil, 0, 0, 0, false)
+	if !strings.Contains(line, "files 0/0~") {
+		t.Errorf("line = %q, want \"files 0/0~\"", line)
+	}
+}
+
+// TestDirProgressRendererStartStopDoesNotPanicOrHang is a smoke test of the
+// goroutine/timing wrapper itself (dirProgressLine's own tests above cover
+// the computation precisely): start, let it tick at least once, stop, and
+// confirm Stop returns promptly.
+func TestDirProgressRendererStartStopDoesNotPanicOrHang(t *testing.T) {
+	sess := NewSyncSession()
+	sess.AddFile(newTestFileEntry(0, 1))
+	r := startDirProgressRenderer(sess)
+	time.Sleep(20 * time.Millisecond)
+	done := make(chan struct{})
+	go func() { r.Stop(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Stop() did not return")
+	}
 }
