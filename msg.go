@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"io"
 )
 
 const magicLen = 17
@@ -179,4 +180,86 @@ func unpack(dataBytes []byte) (*Msg, error) {
 		return nil, err
 	}
 	return data, nil
+}
+
+// AnnounceRec is one record inside an OpAnnounce trailer: a file, directory,
+// or skipped path discovered by the walker. Kind reuses walk.go's EntryKind
+// (KindFile/KindDir/KindSkipped) — kindSkipped entries (symlinks, sockets,
+// FIFOs, devices) are announced without being created, so a later --delete
+// pass knows not to remove their destination-side namesakes if any exist.
+type AnnounceRec struct {
+	FileID   uint32
+	FileSize uint64
+	Mode     uint32
+	MTimeSec int64
+	MTimeNs  int32
+	Kind     EntryKind
+	Path     string // '/'-separated, sanitized, relative to the source root
+}
+
+// announceBatchMaxRecs bounds decodeAnnounceBatch's record count against a
+// corrupt or hostile claim that would otherwise drive a huge allocation
+// before any record is actually validated. Real batches are expected to
+// hold at most a few hundred records (see the client-side announce
+// batcher); a million is already generous headroom.
+const announceBatchMaxRecs = 1_000_000
+
+// encodeAnnounceBatch serializes recs into the trailer bytes that follow an
+// OpAnnounce header's DataSize: a uint32 count, then each record as
+// FileID(4) FileSize(8) Mode(4) MTimeSec(8) MTimeNs(4) Kind(1) PathLen(2)
+// Path(PathLen), all little-endian.
+func encodeAnnounceBatch(recs []AnnounceRec) ([]byte, error) {
+	buf := new(bytes.Buffer)
+	if err := binary.Write(buf, binary.LittleEndian, uint32(len(recs))); err != nil {
+		return nil, fmt.Errorf("encode announce count: %w", err)
+	}
+	for i, r := range recs {
+		if len(r.Path) > 0xFFFF {
+			return nil, fmt.Errorf("record %d: path is %d bytes, exceeds the uint16 length field", i, len(r.Path))
+		}
+		fields := []any{r.FileID, r.FileSize, r.Mode, r.MTimeSec, r.MTimeNs, uint8(r.Kind), uint16(len(r.Path))}
+		for _, f := range fields {
+			if err := binary.Write(buf, binary.LittleEndian, f); err != nil {
+				return nil, fmt.Errorf("encode record %d: %w", i, err)
+			}
+		}
+		if _, err := buf.WriteString(r.Path); err != nil {
+			return nil, fmt.Errorf("encode record %d path: %w", i, err)
+		}
+	}
+	return buf.Bytes(), nil
+}
+
+// decodeAnnounceBatch is encodeAnnounceBatch's inverse. It never trusts the
+// claimed count to size an allocation beyond announceBatchMaxRecs, and every
+// short read is a hard error — the trailer is either well-formed in full or
+// rejected, never partially accepted.
+func decodeAnnounceBatch(b []byte) ([]AnnounceRec, error) {
+	buf := bytes.NewReader(b)
+	var count uint32
+	if err := binary.Read(buf, binary.LittleEndian, &count); err != nil {
+		return nil, fmt.Errorf("decode announce count: %w", err)
+	}
+	if count > announceBatchMaxRecs {
+		return nil, fmt.Errorf("announce batch claims %d records, exceeds sanity limit %d", count, announceBatchMaxRecs)
+	}
+	recs := make([]AnnounceRec, 0, count)
+	for i := uint32(0); i < count; i++ {
+		var r AnnounceRec
+		var kind uint8
+		var pathLen uint16
+		for _, f := range []any{&r.FileID, &r.FileSize, &r.Mode, &r.MTimeSec, &r.MTimeNs, &kind, &pathLen} {
+			if err := binary.Read(buf, binary.LittleEndian, f); err != nil {
+				return nil, fmt.Errorf("decode record %d: %w", i, err)
+			}
+		}
+		r.Kind = EntryKind(kind)
+		pathBuf := make([]byte, pathLen)
+		if _, err := io.ReadFull(buf, pathBuf); err != nil {
+			return nil, fmt.Errorf("decode record %d path: %w", i, err)
+		}
+		r.Path = string(pathBuf)
+		recs = append(recs, r)
+	}
+	return recs, nil
 }

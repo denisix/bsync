@@ -73,6 +73,16 @@ type AutoReconnectTCP struct {
 	// future caller (e.g. request pipelining) that might be tempted to trust
 	// a partial byte count across a reconnect.
 	frameBroken bool
+
+	// gen counts successful dials, starting at 0 (never connected). It is
+	// how a directory-mode transfer worker notices "this connection was
+	// silently redialed under me" and knows to re-send OpFileOpen before
+	// its next block — the server resolves every block by FileID regardless
+	// of which physical connection sends it (see server_dir.go), so a
+	// missed rebind never corrupts data, but it does cost the server an
+	// extra file acquire it wouldn't otherwise need, and the client uses a
+	// generation mismatch to avoid that where it can.
+	gen uint64
 }
 
 // FrameBroken reports whether the last Write left a partial frame stranded
@@ -109,7 +119,30 @@ func (a *AutoReconnectTCP) connect() error {
 	a.conn.SetWriteBuffer(tcpBufferSize)
 	// Disable Nagle's algorithm for immediate sending of small packets
 	a.conn.SetNoDelay(true)
+	a.gen++
 	return nil
+}
+
+// Dial establishes the connection if it isn't already up, exactly like the
+// implicit dial inside Read/Write, but lets a caller do so explicitly and
+// then read Gen() before writing anything — needed to notice a redial that
+// happens mid-handshake rather than only after the fact.
+func (a *AutoReconnectTCP) Dial() error {
+	return a.connect()
+}
+
+// Gen returns the number of successful dials so far (0 before the first).
+// It increases by exactly 1 on every (re)connect, including one triggered
+// transparently inside Read/Write, so comparing it before and after an
+// operation reveals a silent redial.
+func (a *AutoReconnectTCP) Gen() uint64 {
+	return a.gen
+}
+
+// Connected reports whether the connection is currently up. False right
+// after construction, and after any error until the next successful redial.
+func (a *AutoReconnectTCP) Connected() bool {
+	return a.conn != nil
 }
 
 // handleErr closes and nils the connection on any error so the next

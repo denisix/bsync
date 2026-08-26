@@ -3,6 +3,7 @@
 package main
 
 import (
+	"fmt"
 	"io"
 	"os"
 )
@@ -35,4 +36,27 @@ func truncateIfRegularFile(file *os.File, size uint64) {
 			Log("file truncated to %d bytes\n", size)
 		}
 	}
+}
+
+// truncateRegular is truncateIfRegularFile's non-fatal counterpart. The
+// single-file path's Err() exits the whole process on failure, which is
+// correct there (there is only ever one file), but directory mode must not
+// let one bad file kill a transfer of thousands of others.
+func truncateRegular(file *os.File, size uint64) error {
+	info, err := file.Stat()
+	if err != nil {
+		return fmt.Errorf("stat: %w", err)
+	}
+	mode := info.Mode()
+	isBlock := mode&os.ModeDevice != 0 && mode&os.ModeCharDevice == 0
+	if isBlock || !mode.IsRegular() {
+		return nil
+	}
+	if uint64(info.Size()) == size {
+		return nil
+	}
+	if err := file.Truncate(int64(size)); err != nil {
+		return fmt.Errorf("truncate: %w", err)
+	}
+	return nil
 }

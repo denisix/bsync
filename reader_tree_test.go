@@ -391,7 +391,11 @@ func TestPrecomputeTreeBlocksPopulatesFields(t *testing.T) {
 	out := make(chan PrecomputedBlock, 16)
 	precomputeTreeBlocks(tr, sess, out, 3, true) // noCompress=true keeps Data set for direct comparison
 
-	seen := map[uint32][][]byte{}
+	// Keyed by BlockIdx, not appended in receive order: with workers > 1,
+	// multiple goroutines pull blocks from tr.Blocks() concurrently and race
+	// to push onto out, so two blocks of the SAME file can legitimately
+	// arrive out of order. Reassembly must sort by index, not by arrival.
+	seen := map[uint32]map[uint32][]byte{}
 	for pb := range out {
 		fe := sess.FileByID(pb.FileID)
 		if fe == nil {
@@ -413,13 +417,21 @@ func TestPrecomputeTreeBlocksPopulatesFields(t *testing.T) {
 		if pb.Data == nil {
 			t.Errorf("FileID %d block %d: Data is nil with noCompress=true", pb.FileID, pb.BlockIdx)
 		}
-		seen[pb.FileID] = append(seen[pb.FileID], append([]byte(nil), pb.Data...))
+		if seen[pb.FileID] == nil {
+			seen[pb.FileID] = map[uint32][]byte{}
+		}
+		seen[pb.FileID][pb.BlockIdx] = append([]byte(nil), pb.Data...)
 		pb.Release() // must not panic even though release may be nil in some paths
 	}
 
 	for _, fe := range entries {
 		var reassembled []byte
-		for _, chunk := range seen[fe.ID] {
+		for idx := uint32(0); idx < fe.Blocks; idx++ {
+			chunk, ok := seen[fe.ID][idx]
+			if !ok {
+				t.Errorf("FileID %d: block %d never arrived on out", fe.ID, idx)
+				continue
+			}
 			reassembled = append(reassembled, chunk...)
 		}
 		if !bytes.Equal(reassembled, contents[fe.ID]) {

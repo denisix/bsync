@@ -136,3 +136,63 @@ func TestValidateProtocolMessageStates(t *testing.T) {
 		}
 	}
 }
+
+func TestAnnounceBatchRoundTrip(t *testing.T) {
+	recs := []AnnounceRec{
+		{FileID: 0, FileSize: 12345, Mode: 0644, MTimeSec: 1700000000, MTimeNs: 123456789, Kind: KindFile, Path: "a/b/c.txt"},
+		{FileID: 1, Mode: 0755, Kind: KindDir, Path: "a/b"},
+		{FileID: 2, Kind: KindSkipped, Path: "a/symlink"},
+		{FileID: 3, Kind: KindFile, Path: "ünïcödé/файл with spaces.bin"},
+		{FileID: 4, Kind: KindFile, Path: ""}, // encoder doesn't validate paths; that's sanitizeRelPath's job
+	}
+	encoded, err := encodeAnnounceBatch(recs)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	decoded, err := decodeAnnounceBatch(encoded)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(decoded) != len(recs) {
+		t.Fatalf("got %d records, want %d", len(decoded), len(recs))
+	}
+	for i := range recs {
+		if decoded[i] != recs[i] {
+			t.Errorf("record %d mismatch: got %+v, want %+v", i, decoded[i], recs[i])
+		}
+	}
+}
+
+func TestAnnounceBatchEmpty(t *testing.T) {
+	encoded, err := encodeAnnounceBatch(nil)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	decoded, err := decodeAnnounceBatch(encoded)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(decoded) != 0 {
+		t.Errorf("got %d records, want 0", len(decoded))
+	}
+}
+
+func TestDecodeAnnounceBatchRejectsTruncated(t *testing.T) {
+	encoded, err := encodeAnnounceBatch([]AnnounceRec{{FileID: 1, Kind: KindFile, Path: "a/b.txt"}})
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	for cut := 0; cut < len(encoded); cut++ {
+		if _, err := decodeAnnounceBatch(encoded[:cut]); err == nil {
+			t.Errorf("truncated to %d/%d bytes was unexpectedly accepted", cut, len(encoded))
+		}
+	}
+}
+
+func TestDecodeAnnounceBatchRejectsAbsurdCount(t *testing.T) {
+	buf := make([]byte, 4)
+	binary.LittleEndian.PutUint32(buf, announceBatchMaxRecs+1)
+	if _, err := decodeAnnounceBatch(buf); err == nil {
+		t.Error("a record count over the sanity limit was unexpectedly accepted")
+	}
+}

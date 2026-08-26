@@ -51,7 +51,16 @@ func setupTransfer(t *testing.T, o e2eOpts) {
 		encryptionKey = GenerateEncryptionKey()
 		aeadOnce = sync.Once{}
 	}
-	t.Cleanup(func() { blockSize = 10485760 })
+	t.Cleanup(func() {
+		blockSize = 10485760
+		// Without this, a live key set by an -e subtest leaks into every
+		// later test in the process that doesn't itself call
+		// resetEngineGlobals() — including tests that assert on plaintext
+		// wire bytes, which then fail with a decrypt error instead of the
+		// assertion they were actually testing.
+		encryptionKey = nil
+		aeadOnce = sync.Once{}
+	})
 }
 
 // runUpload performs src -> dst over loopback using the real client/server and

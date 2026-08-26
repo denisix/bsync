@@ -1,7 +1,11 @@
 package main
 
 import (
+	"bytes"
+	"encoding/binary"
 	"fmt"
+	"io"
+	"net"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -79,6 +83,20 @@ func (s *SyncSession) FileCount() int {
 	return len(s.files)
 }
 
+// TotalBytes sums the Size of every KindFile entry known so far. Grows
+// alongside FileCount as the walk discovers more entries.
+func (s *SyncSession) TotalBytes() uint64 {
+	s.filesMu.RLock()
+	defer s.filesMu.RUnlock()
+	var total uint64
+	for _, fe := range s.files {
+		if fe.Kind == KindFile {
+			total += fe.Size
+		}
+	}
+	return total
+}
+
 // MarkWalkDone records that the walk has finished discovering files; the
 // file count and any totals derived from it are final from this point on.
 func (s *SyncSession) MarkWalkDone() {
@@ -147,4 +165,479 @@ func (s *SyncSession) MarkFileDone() {
 // files, excluded paths — anything walkSource reported via onSkip).
 func (s *SyncSession) MarkFileSkipped() {
 	s.filesSkipped.Add(1)
+}
+
+// --- client-side directory transfer (Phase 4: on-demand hashing only) ---
+
+// announceBatchSize caps how many AnnounceRec accumulate before a batch is
+// flushed as one OpAnnounce frame, so a 100k-file tree sends ~500 frames
+// instead of 100k.
+const announceBatchSize = 200
+
+// ctrlConn serializes writes to the control connection: the announce
+// batcher, per-file OpFileDone signals from transfer workers, and
+// startDirClient's own OpAnnounceEnd/OpTreeDone all write to it
+// concurrently, and a single net.Conn is not safe for concurrent writers
+// without this.
+type ctrlConn struct {
+	conn       net.Conn
+	mu         sync.Mutex
+	magicBytes [magicLen]byte
+}
+
+func newCtrlConn(conn net.Conn) *ctrlConn {
+	return &ctrlConn{conn: conn, magicBytes: stringToFixedSizeArray(magicHead)}
+}
+
+func (c *ctrlConn) send(msg *Msg, trailer []byte) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	msg.MagicHead = c.magicBytes
+	data, err := pack(msg)
+	if err != nil {
+		return err
+	}
+	if err := connWrite(c.conn, data); err != nil {
+		return err
+	}
+	if len(trailer) > 0 {
+		return connWrite(c.conn, trailer)
+	}
+	return nil
+}
+
+// runAnnounceBatcher drains records, sending an OpAnnounce frame every time
+// announceBatchSize records have accumulated, plus a final one for
+// whatever's left when records closes.
+func runAnnounceBatcher(ctrl *ctrlConn, records <-chan AnnounceRec) error {
+	batch := make([]AnnounceRec, 0, announceBatchSize)
+	flush := func() error {
+		if len(batch) == 0 {
+			return nil
+		}
+		trailer, err := encodeAnnounceBatch(batch)
+		if err != nil {
+			return fmt.Errorf("encode announce batch: %w", err)
+		}
+		if err := ctrl.send(&Msg{Op: uint8(OpAnnounce), DataSize: uint32(len(trailer))}, trailer); err != nil {
+			return fmt.Errorf("send announce batch: %w", err)
+		}
+		batch = batch[:0]
+		return nil
+	}
+	for rec := range records {
+		batch = append(batch, rec)
+		if len(batch) >= announceBatchSize {
+			if err := flush(); err != nil {
+				return err
+			}
+		}
+	}
+	return flush()
+}
+
+// dirTransferState is the shared, read-mostly state every transfer worker
+// needs: the session, the control connection (for per-file OpFileDone), the
+// per-file remaining-block counters, and transfer options.
+type dirTransferState struct {
+	sess       *SyncSession
+	ctrl       *ctrlConn
+	magicBytes [magicLen]byte
+	noCompress bool
+	remaining  sync.Map // FileID -> *atomic.Int64, blocks left before OpFileDone
+}
+
+// recordBlockDone accounts for one block of fileID having been fully
+// processed (whether transferred or found already in sync — both count
+// toward "this file is done"). Whichever worker's call brings the count to
+// zero sends OpFileDone; blocks complete out of order across workers, so
+// this is not necessarily the worker that opened the file.
+func (dt *dirTransferState) recordBlockDone(fileID uint32) {
+	total := int64(1)
+	if fe := dt.sess.FileByID(fileID); fe != nil && fe.Blocks > 0 {
+		total = int64(fe.Blocks)
+	}
+	fresh := new(atomic.Int64)
+	fresh.Store(total)
+	v, _ := dt.remaining.LoadOrStore(fileID, fresh)
+	counter := v.(*atomic.Int64)
+	if counter.Add(-1) == 0 {
+		dt.sess.MarkFileDone()
+		if err := dt.ctrl.send(&Msg{Op: uint8(OpFileDone), FileID: fileID}, nil); err != nil {
+			Log("file %d: failed to send file-done: %v\n", fileID, err)
+		}
+	}
+}
+
+// startDirClient walks srcRoot, announces it to serverAddress, and
+// transfers every differing block over workers parallel connections. The
+// returned SyncSession's FailedCount/FailedError report per-file failures
+// that did not abort the transfer; the returned error is non-nil only for a
+// failure of the transfer as a whole (the walk itself, or the control
+// connection).
+func startDirClient(srcRoot, serverAddress string, blockSizeCap uint32, noCompress bool, workers int) (*SyncSession, error) {
+	if workers < 1 {
+		return nil, fmt.Errorf("worker count must be at least 1")
+	}
+	saddr, err := net.ResolveTCPAddr("tcp", serverAddress)
+	if err != nil {
+		return nil, fmt.Errorf("resolving: %w", err)
+	}
+
+	// Control connection: opened first, held for the whole transfer. Unlike
+	// a worker connection, losing it is fatal in this phase — it carries
+	// announce/file-done/tree-done, none of which has a safe way to resume
+	// from scratch the way a block-request retry does.
+	rawConn, err := net.DialTimeout("tcp", saddr.String(), dialTimeout)
+	if err != nil {
+		return nil, fmt.Errorf("connecting control channel: %w", err)
+	}
+	if tc, ok := rawConn.(*net.TCPConn); ok {
+		tc.SetKeepAlive(true)
+		tc.SetKeepAlivePeriod(keepAlivePeriod)
+	}
+	defer rawConn.Close()
+	ctrl := newCtrlConn(rawConn)
+
+	sess := NewSyncSession()
+	dt := &dirTransferState{sess: sess, ctrl: ctrl, magicBytes: ctrl.magicBytes, noCompress: noCompress}
+
+	capBS := blockSizeCap
+	if capBS == 0 {
+		capBS = blockSize
+	}
+
+	fileChan := make(chan *FileEntry, 256)
+	treeFileChan := make(chan *FileEntry, 256)
+	announceChan := make(chan AnnounceRec, 256)
+
+	var walkErr error
+	walkDone := make(chan struct{})
+	go func() {
+		defer close(walkDone)
+		walkErr = walkSource(srcRoot, nil, fileChan, func(relPath, reason string) {
+			Log("skip %s: %s\n", relPath, reason)
+		})
+	}()
+
+	// Single consumer of the walk: registering each entry with the session
+	// IS what assigns it there (walkSource's IDs are dense in emission
+	// order, matching AddFile's contract), then fans it out to the tree
+	// reader and the announce queue.
+	go func() {
+		defer close(treeFileChan)
+		defer close(announceChan)
+		for fe := range fileChan {
+			sess.AddFile(fe)
+			if fe.Kind == KindSkipped {
+				sess.MarkFileSkipped()
+			}
+			treeFileChan <- fe
+			announceChan <- AnnounceRec{
+				FileID: fe.ID, FileSize: fe.Size, Mode: uint32(fe.Mode),
+				MTimeSec: fe.ModTime.Unix(), MTimeNs: int32(fe.ModTime.Nanosecond()),
+				Kind: fe.Kind, Path: fe.RelPath,
+			}
+		}
+	}()
+
+	announceErrCh := make(chan error, 1)
+	go func() { announceErrCh <- runAnnounceBatcher(ctrl, announceChan) }()
+
+	<-walkDone
+	if walkErr != nil {
+		return sess, fmt.Errorf("walking %s: %w", srcRoot, walkErr)
+	}
+	sess.MarkWalkDone()
+
+	if err := <-announceErrCh; err != nil {
+		return sess, fmt.Errorf("announcing tree: %w", err)
+	}
+
+	fileCount := uint32(sess.FileCount())
+	if err := ctrl.send(&Msg{Op: uint8(OpAnnounceEnd), BlockIdx: fileCount, FileSize: sess.TotalBytes()}, nil); err != nil {
+		return sess, fmt.Errorf("send announce end: %w", err)
+	}
+
+	// Every announce is now confirmed sent, so it's safe to immediately
+	// finish any zero-byte file: it produces no blocks (TreeReader skips
+	// Size==0 entries entirely), so recordBlockDone's block-counting path
+	// never reaches it.
+	for id := uint32(0); id < fileCount; id++ {
+		fe := sess.FileByID(id)
+		if fe != nil && fe.Kind == KindFile && fe.Size == 0 {
+			sess.MarkFileDone()
+			if err := ctrl.send(&Msg{Op: uint8(OpFileDone), FileID: fe.ID}, nil); err != nil {
+				return sess, fmt.Errorf("send file-done for empty file %d: %w", fe.ID, err)
+			}
+		}
+	}
+
+	tr := NewTreeReader(treeFileChan, sess, int64(workers)*4*int64(capBS))
+	tr.Start()
+	precompChan := make(chan PrecomputedBlock, workers*2)
+	precomputeTreeBlocks(tr, sess, precompChan, workers, noCompress)
+
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			runDirTransferWorker(saddr, dt, precompChan)
+		}()
+	}
+	wg.Wait()
+
+	if err := ctrl.send(&Msg{Op: uint8(OpTreeDone), BlockIdx: fileCount, FileSize: sess.TotalBytes()}, nil); err != nil {
+		return sess, fmt.Errorf("send tree done: %w", err)
+	}
+	ackBuf := make([]byte, binary.Size(Msg{}))
+	if _, err := io.ReadFull(rawConn, ackBuf); err != nil {
+		return sess, fmt.Errorf("waiting for tree ack: %w", err)
+	}
+	ack, err := unpack(ackBuf)
+	if err != nil {
+		return sess, fmt.Errorf("unpack tree ack: %w", err)
+	}
+	switch Op(ack.Op) {
+	case OpTreeAck:
+	case OpError:
+		return sess, fmt.Errorf("server reported an error finishing the tree")
+	default:
+		return sess, fmt.Errorf("unexpected reply to tree done: op %d", ack.Op)
+	}
+
+	return sess, nil
+}
+
+// blockOutcome reports what processDirBlock actually did, for progress
+// accounting.
+type blockOutcome struct {
+	changed   bool
+	netBytes  uint32
+	origBytes uint32
+}
+
+// runDirTransferWorker pulls blocks from precompChan and sends them,
+// maintaining its own connection and soft file-binding: it resolves a
+// block's target purely by the FileID carried on every frame (see
+// server_dir.go), so a silently redialed connection never risks
+// corruption, only the cost of one extra OpFileOpen round trip.
+func runDirTransferWorker(saddr *net.TCPAddr, dt *dirTransferState, precompChan <-chan PrecomputedBlock) {
+	conn := NewAutoReconnectTCP(saddr)
+	defer conn.Close()
+
+	var bound bool
+	var boundFileID uint32
+	var boundGen uint64
+
+	for pb := range precompChan {
+		if dt.sess.isFailed(pb.FileID) {
+			// A prior block of this file already exhausted its retries.
+			// This block is skipped, not attempted, but it must still be
+			// accounted for: recordBlockDone's counter tracks blocks
+			// resolved (attempted-and-settled OR skipped-because-doomed),
+			// not blocks that succeeded, or a permanently failing file
+			// would never reach zero remaining, OpFileDone would never be
+			// sent for it, and the server would wait forever for it to
+			// finalize in WaitAllFinalized -- one bad block would hang the
+			// entire tree, not just its own file.
+			dt.recordBlockDone(pb.FileID)
+			pb.Release()
+			continue
+		}
+
+		var lastErr error
+		var outcome blockOutcome
+		for retry := 0; retry < maxRetries; retry++ {
+			if retry > 0 {
+				Log("file %d block %d: retry %d/%d after: %v\n", pb.FileID, pb.BlockIdx, retry, maxRetries-1, lastErr)
+				conn.Close()
+				bound = false
+				time.Sleep(time.Duration(retry) * time.Second)
+			}
+			if err := conn.Dial(); err != nil {
+				lastErr = err
+				continue
+			}
+
+			needRebind := !bound || boundFileID != pb.FileID || boundGen != conn.Gen()
+			if needRebind {
+				sameConnDifferentFile := bound && boundGen == conn.Gen() && boundFileID != pb.FileID
+				if err := dirWorkerBind(conn, dt, pb, sameConnDifferentFile, boundFileID); err != nil {
+					lastErr = err
+					bound = false
+					continue
+				}
+				bound = true
+				boundFileID = pb.FileID
+				boundGen = conn.Gen()
+			}
+
+			outcome, lastErr = processDirBlock(conn, dt, pb)
+			if lastErr == nil {
+				break
+			}
+			bound = false
+		}
+
+		if lastErr != nil {
+			Log("file %d block %d: failed after %d retries: %v\n", pb.FileID, pb.BlockIdx, maxRetries, lastErr)
+			dt.sess.failFile(pb.FileID, fmt.Errorf("block %d: %w", pb.BlockIdx, lastErr))
+		} else {
+			dt.sess.AddBlockProgress(outcome.changed, uint64(outcome.netBytes), uint64(outcome.origBytes))
+		}
+		// Every block that leaves this loop, succeeded or not, counts
+		// toward the file being "resolved" -- see the comment above for
+		// why a failure must still be counted.
+		dt.recordBlockDone(pb.FileID)
+		pb.Release()
+	}
+}
+
+// dirWorkerBind (re)binds conn to pb.FileID: if the same physical
+// connection genuinely held a ref for a DIFFERENT file (sameConnDifferentFile),
+// it releases that ref first via OpFileClose; otherwise (first bind, or a
+// redial happened) there is no ref on this connection to close — the old
+// one, if any, is on a now-dead connection and becomes the server's stale
+// ref to reap, not this connection's problem. Then sends OpFileOpen and
+// waits for the ack.
+func dirWorkerBind(conn *AutoReconnectTCP, dt *dirTransferState, pb PrecomputedBlock, sameConnDifferentFile bool, prevFileID uint32) error {
+	if sameConnDifferentFile {
+		closeMsg := &Msg{MagicHead: dt.magicBytes, Op: uint8(OpFileClose), FileID: prevFileID}
+		data, err := pack(closeMsg)
+		if err == nil {
+			connWrite(conn, data) // best-effort: a failure here just means an extra stale ref for the server to reap
+		}
+	}
+
+	openMsg := &Msg{MagicHead: dt.magicBytes, Op: uint8(OpFileOpen), FileID: pb.FileID, BlockSize: pb.BlockSize, FileSize: pb.FileSize}
+	data, err := pack(openMsg)
+	if err != nil {
+		return err
+	}
+	if err := connWrite(conn, data); err != nil {
+		return fmt.Errorf("send file-open: %w", err)
+	}
+	ackBuf := make([]byte, binary.Size(Msg{}))
+	if _, err := io.ReadFull(conn, ackBuf); err != nil {
+		return fmt.Errorf("read file-open ack: %w", err)
+	}
+	ack, err := unpack(ackBuf)
+	if err != nil {
+		return fmt.Errorf("unpack file-open ack: %w", err)
+	}
+	if Op(ack.Op) == OpError {
+		return fmt.Errorf("server rejected file-open for file %d", pb.FileID)
+	}
+	if Op(ack.Op) != OpFileAck || ack.FileID != pb.FileID {
+		return fmt.Errorf("unexpected reply to file-open for file %d: op %d", pb.FileID, ack.Op)
+	}
+	return nil
+}
+
+// processDirBlock runs the checksum-request/compare/write exchange for one
+// block on a connection already bound to its file, mirroring
+// processPrecomputedBlock's single-file logic.
+func processDirBlock(conn *AutoReconnectTCP, dt *dirTransferState, pb PrecomputedBlock) (blockOutcome, error) {
+	magicBytes := dt.magicBytes
+
+	checkMsg := &Msg{MagicHead: magicBytes, Op: uint8(OpBlockCheck), FileID: pb.FileID, BlockIdx: pb.BlockIdx, BlockSize: pb.BlockSize, FileSize: pb.FileSize}
+	data, err := pack(checkMsg)
+	if err != nil {
+		return blockOutcome{}, err
+	}
+	if err := connWrite(conn, data); err != nil {
+		return blockOutcome{}, fmt.Errorf("send check: %w", err)
+	}
+
+	hdrBuf := make([]byte, binary.Size(Msg{}))
+	if _, err := io.ReadFull(conn, hdrBuf); err != nil {
+		return blockOutcome{}, fmt.Errorf("read hash header: %w", err)
+	}
+	hashHdr, err := unpack(hdrBuf)
+	if err != nil {
+		return blockOutcome{}, fmt.Errorf("unpack hash header: %w", err)
+	}
+	if Op(hashHdr.Op) == OpError {
+		return blockOutcome{}, fmt.Errorf("server error on checksum request for file %d block %d", pb.FileID, pb.BlockIdx)
+	}
+	if Op(hashHdr.Op) != OpHash || hashHdr.FileID != pb.FileID || hashHdr.BlockIdx != pb.BlockIdx {
+		return blockOutcome{}, fmt.Errorf("unexpected hash response for file %d block %d: op %d", pb.FileID, pb.BlockIdx, hashHdr.Op)
+	}
+	serverHash := make([]byte, hashHdr.DataSize)
+	if _, err := io.ReadFull(conn, serverHash); err != nil {
+		return blockOutcome{}, fmt.Errorf("read hash: %w", err)
+	}
+
+	expected := blockPayloadSize(pb.FileSize, pb.BlockSize, pb.BlockIdx)
+
+	if bytes.Equal(pb.Hash, serverHash) {
+		return blockOutcome{changed: false}, nil
+	}
+
+	if pb.IsZero {
+		zmsg := &Msg{MagicHead: magicBytes, Op: uint8(OpBlockZero), FileID: pb.FileID, BlockIdx: pb.BlockIdx, BlockSize: pb.BlockSize, FileSize: pb.FileSize}
+		data, err := pack(zmsg)
+		if err != nil {
+			return blockOutcome{}, err
+		}
+		if err := connWrite(conn, data); err != nil {
+			return blockOutcome{}, fmt.Errorf("send zero: %w", err)
+		}
+		if err := waitDirAck(conn, pb.FileID, pb.BlockIdx); err != nil {
+			return blockOutcome{}, fmt.Errorf("ack zero: %w", err)
+		}
+		return blockOutcome{changed: true, netBytes: 0, origBytes: expected}, nil
+	}
+
+	var dataToSend []byte
+	var flags uint8
+	if dt.noCompress || !pb.UseCompressed {
+		if IsEncryptionEnabled() {
+			dataToSend = encryptBlock(pb.Data)
+		} else {
+			dataToSend = pb.Data
+		}
+	} else {
+		flags |= FlagCompressed
+		dataToSend = pb.Compressed
+	}
+	if len(dataToSend) == 0 {
+		return blockOutcome{}, fmt.Errorf("no data for file %d block %d", pb.FileID, pb.BlockIdx)
+	}
+
+	dmsg := &Msg{MagicHead: magicBytes, Op: uint8(OpBlockData), Flags: flags, FileID: pb.FileID, BlockIdx: pb.BlockIdx, BlockSize: pb.BlockSize, FileSize: pb.FileSize, DataSize: uint32(len(dataToSend))}
+	data2, err := pack(dmsg)
+	if err != nil {
+		return blockOutcome{}, err
+	}
+	if err := connWrite(conn, data2); err != nil {
+		return blockOutcome{}, fmt.Errorf("send data header: %w", err)
+	}
+	if err := connWrite(conn, dataToSend); err != nil {
+		return blockOutcome{}, fmt.Errorf("send data payload: %w", err)
+	}
+	if err := waitDirAck(conn, pb.FileID, pb.BlockIdx); err != nil {
+		return blockOutcome{}, fmt.Errorf("ack data: %w", err)
+	}
+	return blockOutcome{changed: true, netBytes: uint32(len(dataToSend)), origBytes: expected}, nil
+}
+
+func waitDirAck(conn *AutoReconnectTCP, fileID, blockIdx uint32) error {
+	buf := make([]byte, binary.Size(Msg{}))
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		return err
+	}
+	ack, err := unpack(buf)
+	if err != nil {
+		return err
+	}
+	if Op(ack.Op) == OpError {
+		return fmt.Errorf("server error acking file %d block %d", fileID, blockIdx)
+	}
+	if Op(ack.Op) != OpAck || ack.FileID != fileID || ack.BlockIdx != blockIdx {
+		return fmt.Errorf("invalid ack for file %d block %d: op %d", fileID, blockIdx, ack.Op)
+	}
+	return nil
 }
