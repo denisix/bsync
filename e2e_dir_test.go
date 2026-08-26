@@ -352,6 +352,14 @@ type faultyProxy struct {
 	skipFirst      int
 	killConns      int
 	killAfterBytes int64
+	// delayPerChunk, if nonzero, sleeps this long after every ≤512-byte
+	// chunk pumped in either direction on every connection -- a
+	// deterministic way to make a transfer take real, controllable
+	// wall-clock time regardless of how fast local loopback and
+	// CPU-bound hashing/compression actually are, for tests that need a
+	// reliable window to act in while a transfer is still in progress
+	// (see TestE2EDirSourceFileDisappearsAfterWalkStillCompletes).
+	delayPerChunk time.Duration
 
 	mu    sync.Mutex
 	seen  int
@@ -413,6 +421,9 @@ func (p *faultyProxy) handle(client net.Conn, kill bool) {
 					return
 				}
 				p.total.add(int64(n))
+				if p.delayPerChunk > 0 {
+					time.Sleep(p.delayPerChunk)
+				}
 				if kill && total.add(int64(n)) > p.killAfterBytes {
 					closeOnce.Do(func() { close(killed) })
 					return
@@ -1016,4 +1027,184 @@ func TestE2EDirWorkersExceedFileCount(t *testing.T) {
 	mustWriteFile(t, filepath.Join(src, "b.txt"), "two")
 	dst, _ := runDirTransfer(t, src, 8, false) // 8 workers, only 2 files
 	assertTreesEqual(t, src, dst)
+}
+
+// TestE2EDirLargeTreeDoesNotDeadlock is a regression test for the most
+// severe bug found in the hardening pass: startDirClient's fan-out
+// goroutine wrote every walked entry to BOTH treeFileChan and
+// announceChan, but treeFileChan (buffered 256) had no reader until AFTER
+// the whole walk finished -- so any tree past roughly 256+256 entries
+// deadlocked the client (and consequently the server) forever, with no
+// timeout and no error. 700+ entries is comfortably past that threshold;
+// every other e2e dir test in this file stays well under it, which is
+// exactly why this went unnoticed. Run in its own goroutine with an
+// explicit timeout so a regression fails loudly instead of hanging the
+// whole test binary.
+func TestE2EDirLargeTreeDoesNotDeadlock(t *testing.T) {
+	src := t.TempDir()
+	const nDirs = 20
+	const filesPerDir = 35 // 700 files + 20 dirs = 720 entries
+	for d := 0; d < nDirs; d++ {
+		dir := filepath.Join(src, fmt.Sprintf("dir%03d", d))
+		mustMkdirAll(t, dir)
+		for f := 0; f < filesPerDir; f++ {
+			mustWriteFile(t, filepath.Join(dir, fmt.Sprintf("f%03d.txt", f)), "x")
+		}
+	}
+
+	resetEngineGlobals()
+	dstRoot := t.TempDir()
+	port := freeTCPPort(t)
+	addr := "127.0.0.1:" + port
+	srvErrCh := make(chan error, 1)
+	go func() { srvErrCh <- startDirServer(dstRoot, "127.0.0.1", port, 4, true) }()
+	waitForListener(t, addr)
+
+	clientDone := make(chan struct{})
+	var sess *SyncSession
+	var clientErr error
+	go func() {
+		defer close(clientDone)
+		sess, clientErr = startDirClient(src, addr, 0, true, 4)
+	}()
+	select {
+	case <-clientDone:
+	case <-time.After(15 * time.Second):
+		t.Fatal("startDirClient did not complete within 15s -- deadlock regression (large tree)")
+	}
+	if clientErr != nil {
+		t.Fatalf("startDirClient: %v", clientErr)
+	}
+	select {
+	case err := <-srvErrCh:
+		if err != nil {
+			t.Fatalf("startDirServer: %v", err)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("startDirServer did not complete within 15s -- deadlock regression (large tree)")
+	}
+	if sess.FailedCount() != 0 {
+		t.Fatalf("%d failed file(s)", sess.FailedCount())
+	}
+	assertTreesEqual(t, src, dstRoot)
+}
+
+// TestE2EDirSourceFileDisappearsAfterWalkStillCompletes is a regression
+// test for a bug (A5) distinct from TestE2EDirUnreadableSourceFileIsSkippedNotFailed:
+// that test chmods the file BEFORE the walk starts, so walkSource's own
+// open (for metadata) fails and the file is never announced at all. THIS
+// test lets the file be announced normally, then removes it only once a
+// preceding sentinel file has already landed at the destination -- proving
+// the walk (and this file's own announce) completed successfully well
+// before the removal. Before the fix, TreeReader's failure to open an
+// ANNOUNCED file never told the client's per-file block counter that no
+// blocks were coming, so OpFileDone was never sent for it, and the server
+// hung in WaitAllFinalized for its full timeout, failing the WHOLE tree --
+// not just the one vanished file.
+func TestE2EDirSourceFileDisappearsAfterWalkStillCompletes(t *testing.T) {
+	// Linux does not invalidate an already-open fd when its directory
+	// entry is unlinked (reads keep succeeding against the orphaned
+	// inode), so removal only reproduces a REAL failure if it lands
+	// before TreeReader's own os.Open for this file -- and after
+	// walkSource's own (separate, metadata-only) open+close, or this hits
+	// the walk-time skip path instead (already covered by
+	// TestE2EDirUnreadableSourceFileIsSkippedNotFailed). walkSource itself
+	// is fast regardless of content (stat-only per entry), so it reliably
+	// finishes well before this; the real difficulty is making TreeReader's
+	// CONTENT read of earlier files take long enough, in real wall-clock
+	// time, to leave a reliable window -- on loopback with tiny files this
+	// is a race measured in microseconds. Routing the transfer through a
+	// deliberately-slowed proxy (delayPerChunk) makes the window
+	// deterministic instead of hoping local I/O happens to be slow enough.
+	src := t.TempDir()
+	saved := blockSize
+	blockSize = 4096
+	defer func() { blockSize = saved }()
+
+	// 16 blocks (64KB) deliberately exceeds the default byte budget
+	// (workers*4*blockSize = 1*4*4096 = 16KB): TreeReader can read the
+	// first ~4 blocks into the budget for free, but must then genuinely
+	// BLOCK, waiting for the (proxy-slowed) worker to actually finish
+	// sending each earlier block before there's room to read further --
+	// including opening the file that comes after this one.
+	mustWriteFile(t, filepath.Join(src, "0-pad.bin"), string(randomBytes(16*4096, 901)))
+	vanishingPath := filepath.Join(src, "1-vanishing.txt")
+	mustWriteFile(t, vanishingPath, "will be removed shortly after the transfer starts")
+	mustWriteFile(t, filepath.Join(src, "2-good.txt"), "still fine")
+
+	resetEngineGlobals()
+	dst := t.TempDir()
+	port := freeTCPPort(t)
+	realAddr := "127.0.0.1:" + port
+	srvErrCh := make(chan error, 1)
+	go func() { srvErrCh <- startDirServer(dst, "127.0.0.1", port, 1, true) }()
+	waitForListener(t, realAddr)
+	proxyAddr, proxy := startFaultyProxy(t, realAddr, 0, 0, 0) // pure passthrough
+	proxy.delayPerChunk = 3 * time.Millisecond
+
+	clientDone := make(chan struct{})
+	var sess *SyncSession
+	var clientErr error
+	go func() {
+		defer close(clientDone)
+		sess, clientErr = startDirClient(src, proxyAddr, 0, true, 1)
+	}()
+
+	// The walk (stat-only) is done essentially instantly; TreeReader is
+	// still blocked on the byte budget working through 0-pad.bin's real
+	// content when the target is removed.
+	time.Sleep(150 * time.Millisecond)
+	if err := os.Remove(vanishingPath); err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+
+	select {
+	case <-clientDone:
+	case <-time.After(20 * time.Second):
+		t.Fatal("startDirClient did not complete -- the transfer hung (A5 regression)")
+	}
+	if clientErr != nil {
+		t.Fatalf("startDirClient: %v", clientErr)
+	}
+	select {
+	case err := <-srvErrCh:
+		if err != nil {
+			t.Fatalf("startDirServer: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("startDirServer did not complete after the client finished")
+	}
+
+	if sess.FailedCount() != 1 {
+		t.Fatalf("FailedCount = %d, want 1 (only the vanished file) -- if this flakes, the removal raced TreeReader's read and lost; widen the margin", sess.FailedCount())
+	}
+	if !sess.isFailed(1) { // 0-pad.bin is FileID 0, vanishing file is FileID 1 in lexical walk order
+		t.Error("the vanished file's specific FileID was not the one marked failed")
+	}
+	// 0-pad.bin and 2-good.txt are entirely unaffected by 1-vanishing.txt's
+	// failure -- the whole point of A5 is that one file's failure must not
+	// take down the rest of the tree.
+	for _, rel := range []string{"0-pad.bin", "2-good.txt"} {
+		got, rerr := os.ReadFile(filepath.Join(dst, rel))
+		if rerr != nil {
+			t.Errorf("%s missing at destination: %v", rel, rerr)
+			continue
+		}
+		want, _ := os.ReadFile(filepath.Join(src, rel))
+		if string(got) != string(want) {
+			t.Errorf("%s content mismatch", rel)
+		}
+	}
+	// 1-vanishing.txt's destination entry is NOT asserted absent here:
+	// removing it mid-transfer (rather than before the walk, which
+	// TestE2EDirUnreadableSourceFileIsSkippedNotFailed already covers)
+	// exercises TreeReader's MID-FILE failure path -- some of its blocks
+	// may have already been read and even written before the removal won
+	// the race, so the destination file can legitimately exist, correctly
+	// sized but with incomplete content for whichever blocks never
+	// arrived (finalizeIO truncates/chmods/chtimes it regardless, exactly
+	// as an interrupted single-file transfer would leave things -- a later
+	// re-run is what actually fixes it up). What matters, and is asserted
+	// above, is that the failure was correctly isolated to this one file
+	// and did not affect 0-pad.bin or 2-good.txt, or hang the transfer.
 }

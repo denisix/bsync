@@ -21,8 +21,8 @@ import (
 // directory client can legitimately spend a long time hashing/reading a
 // large file between connections, and the control connection staying open
 // for the whole transfer (not any one worker socket) is the real liveness
-// signal.
-const dirIdlePeriod = 30 * time.Second
+// signal. A var, not a const, so tests can shrink it (see ioTimeout).
+var dirIdlePeriod = 30 * time.Second
 
 // staleRefCheckPeriod is how often WaitAllFinalized re-scans for a stale
 // ref: a connection that acquired a file (OpFileOpen) and then vanished
@@ -34,8 +34,22 @@ const staleRefCheckPeriod = 2 * time.Second
 // staleRefAge is how long a ref may sit idle, once OpFileDone has already
 // been seen for that file, before it's force-released. Generous relative to
 // ioTimeout so a merely-slow (not dead) connection is never force-closed
-// out from under it.
-const staleRefAge = 2 * ioTimeout
+// out from under it. A var (its initializer reads the var ioTimeout), so a
+// test that shrinks ioTimeout must also reassign this if it wants the
+// relationship to still hold -- it is NOT automatically recomputed.
+var staleRefAge = 2 * ioTimeout
+
+// ctrlIoTimeout is the read deadline used once a connection has shown
+// itself to be the CONTROL connection (it has carried an OpAnnounce,
+// OpAnnounceEnd, or OpFileDone -- opcodes the client's architecture only
+// ever sends on that one connection). The control connection legitimately
+// sends nothing between OpAnnounceEnd and the first OpFileDone, which for
+// one large file or a slow link can easily exceed ioTimeout (5 minutes) --
+// using ioTimeout uniformly would false-positive-kill a perfectly healthy
+// transfer. Generous (not unbounded), so a truly-dead peer is still
+// eventually reaped; a var so tests can shrink it instead of waiting on
+// the real value.
+var ctrlIoTimeout = 6 * time.Hour
 
 // isWithinRoot reports whether path is root itself or a descendant of it,
 // after both are cleaned. Used after joining a sanitized relative path to
@@ -730,6 +744,23 @@ func startDirServer(root, bindIp, port string, workers int, quiet bool) error {
 	connChan := make(chan net.Conn)
 	errChan := make(chan error, 1)
 	doneChan := make(chan struct{})
+	// connClosed is how a per-connection goroutine tells the main loop it
+	// finished, WITHOUT touching idleTimer itself: Timer.Reset from
+	// multiple goroutines on a possibly-fired timer is documented-unsafe
+	// (the exact class of bug Phase 0 already fixed once for the legacy
+	// single-file server's shutdownTimer). All Timer mutation stays on
+	// this one goroutine; connClosed just triggers the decision.
+	connClosed := make(chan struct{}, 1)
+
+	// connWG tracks every dirHandleConn goroutine. startDirServer must not
+	// return (and therefore must not run its deferred ow.Close(), which
+	// closes the OrderedWriter's channel) while a handler could still be
+	// mid-write -- see the defer ordering note below.
+	var connWG sync.WaitGroup
+	// Declared AFTER `defer ow.Close()` above: Go defers run LIFO, so this
+	// Wait() executes FIRST on return, guaranteeing every handler has
+	// exited before the writer is closed out from under it.
+	defer connWG.Wait()
 
 	go func() {
 		for {
@@ -750,13 +781,44 @@ func startDirServer(root, bindIp, port string, workers int, quiet bool) error {
 		}
 	}()
 
+	// stopIdleTimer and resetIdleTimer are the standard drain-before-reuse
+	// idiom for time.Timer: Stop (or an unconsumed prior fire) can leave a
+	// value sitting in idleTimer.C, and Reset is only documented-safe on a
+	// timer whose channel is known-empty. Both are called only from this
+	// function's own single goroutine, alongside every other read of
+	// idleTimer.C, so there is no concurrent-access race to guard against
+	// beyond this drain.
+	stopIdleTimer := func() {
+		if !idleTimer.Stop() {
+			select {
+			case <-idleTimer.C:
+			default:
+			}
+		}
+	}
+	resetIdleTimer := func() {
+		stopIdleTimer()
+		idleTimer.Reset(dirIdlePeriod)
+	}
+
 	for {
 		select {
 		case conn := <-connChan:
-			idleTimer.Stop()
+			stopIdleTimer()
 			atomic.AddInt64(&st.activeConns, 1)
+			connWG.Add(1)
 			go func(c net.Conn) {
+				defer connWG.Done()
 				defer atomic.AddInt64(&st.activeConns, -1)
+				defer func() {
+					select {
+					case connClosed <- struct{}{}:
+					default:
+						// A signal is already pending; the main loop will
+						// re-check activeConns when it processes that one,
+						// so a dropped duplicate here loses nothing.
+					}
+				}()
 				if handlerErr := dirHandleConn(c, st, doneChan); handlerErr != nil {
 					// A per-connection error (a dropped link, a malformed
 					// frame, a rejected protocol violation) must not abort
@@ -778,6 +840,19 @@ func startDirServer(root, bindIp, port string, workers int, quiet bool) error {
 		case <-idleTimer.C:
 			if atomic.LoadInt64(&st.activeConns) == 0 && atomic.LoadInt32(&st.treeDoneSeen) == 0 {
 				return fmt.Errorf("directory server idle timeout: no client ever connected")
+			}
+
+		case <-connClosed:
+			// A connection just finished. If every connection is now
+			// closed and the client hasn't sent OpTreeDone yet, restart
+			// the idle clock -- without this, a client that connects and
+			// then vanishes (crash, network partition, or any bug that
+			// kills its connections) leaves this server blocked in this
+			// select forever: idleTimer.Stop() above only ever fires
+			// once, on the FIRST connection, and nothing else was
+			// resetting it.
+			if atomic.LoadInt64(&st.activeConns) == 0 && atomic.LoadInt32(&st.treeDoneSeen) == 0 {
+				resetIdleTimer()
 			}
 
 		case <-doneChan:
@@ -832,8 +907,22 @@ func dirHandleConn(conn net.Conn, st *dirServerState, doneChan chan struct{}) er
 	}
 	defer releaseBinding()
 
+	// isControlConn tracks whether this connection has carried a
+	// control-only opcode (OpAnnounce, OpAnnounceEnd, OpFileDone) -- by the
+	// client's own architecture, those are only ever sent on the control
+	// connection, which legitimately falls silent between OpAnnounceEnd
+	// and the first OpFileDone for as long as the first file in flight
+	// takes to complete. Applying the short worker-oriented ioTimeout
+	// uniformly here would false-positive-kill a perfectly healthy but
+	// slow transfer (see ctrlIoTimeout's doc comment).
+	isControlConn := false
+
 	for {
-		conn.SetDeadline(time.Now().Add(ioTimeout))
+		deadline := ioTimeout
+		if isControlConn {
+			deadline = ctrlIoTimeout
+		}
+		conn.SetDeadline(time.Now().Add(deadline))
 		if _, err := io.ReadFull(c, msgBuf); err != nil {
 			if err == io.EOF || err == io.ErrUnexpectedEOF {
 				return nil
@@ -853,11 +942,13 @@ func dirHandleConn(conn net.Conn, st *dirServerState, doneChan chan struct{}) er
 
 		switch Op(msg.Op) {
 		case OpAnnounce:
+			isControlConn = true
 			if err := handleAnnounce(conn, c, msg, st.ft); err != nil {
 				return err
 			}
 
 		case OpAnnounceEnd:
+			isControlConn = true
 			atomic.StoreUint32(&st.fileCount, msg.BlockIdx)
 			atomic.StoreUint64(&st.totalBytes, msg.FileSize)
 			atomic.StoreInt32(&st.announceEndSeen, 1)
@@ -909,6 +1000,7 @@ func dirHandleConn(conn net.Conn, st *dirServerState, doneChan chan struct{}) er
 			}
 
 		case OpFileDone:
+			isControlConn = true
 			// OpFileDone is fire-and-forget from the client (see
 			// recordBlockDone: it sends and moves on, never reads a
 			// reply) — unlike OpFileOpen/OpBlockCheck/OpTreeDone, which

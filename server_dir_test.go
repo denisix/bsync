@@ -851,3 +851,85 @@ func TestFileTableWaitAllFinalizedDoesNotTrustFinalizedAloneWithoutFinalizeCompl
 		t.Fatalf("WaitAllFinalized after finalizeComplete flipped: %v", err)
 	}
 }
+
+// TestFileTableDrainFileErrorIsolatedToItsOwnFile is a regression test for
+// A6: one file's write failure (a closed fd, ENOSPC, EIO, a race with
+// reapStaleRefs) must not poison a DIFFERENT file's finalize. Before the
+// fix, DrainFile returned the writer's STICKY GLOBAL error, so every file
+// finalized after the first failure anywhere in the tree silently skipped
+// its own truncate/chmod/chtimes -- wrong size/mode/mtime on a file whose
+// own blocks wrote perfectly, and the whole tree reported failed via
+// FirstFinalizeErr() regardless.
+func TestFileTableDrainFileErrorIsolatedToItsOwnFile(t *testing.T) {
+	ft, root := newTestFileTable(t, 2)
+	mtime := time.Now().Add(-24 * time.Hour).Truncate(time.Second)
+	if err := ft.Announce(AnnounceRec{
+		FileID: 1, Kind: KindFile, Path: "bad.txt", FileSize: 10, Mode: 0640,
+		MTimeSec: mtime.Unix(), MTimeNs: int32(mtime.Nanosecond()),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := ft.Announce(AnnounceRec{
+		FileID: 2, Kind: KindFile, Path: "good.txt", FileSize: 10, Mode: 0640,
+		MTimeSec: mtime.Unix(), MTimeNs: int32(mtime.Nanosecond()),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	dfBad, _, err := ft.Acquire(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dfGood, _, err := ft.Acquire(2)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Force a real write failure on file 1 by closing its underlying fd
+	// out from under it, then submitting a write the normal block-handling
+	// path (handleBlockData/handleBlockZero) would have made.
+	dfBad.file.Close()
+	if err := ft.ow.SubmitAndWaitFile(dfBad.file, writeKey(1, 0), 0, make([]byte, 10)); err == nil {
+		t.Fatal("expected a write error on the closed fd")
+	}
+
+	// File 1 finalizes with a recorded error -- expected, its own write
+	// really did fail. MarkDone (refs still 1 here) just records sawDone;
+	// Release is what brings refs to 0 and actually triggers finalizeIO,
+	// so its return value legitimately IS this file's finalize error, not
+	// something to fail the test setup on.
+	if err := ft.MarkDone(1); err != nil {
+		t.Fatal(err)
+	}
+	if err := ft.Release(dfBad); err == nil {
+		t.Fatal("setup problem: expected file 1's finalize (triggered by Release) to fail")
+	}
+	if dfBad.finalizeErr == nil {
+		t.Fatal("setup problem: file 1's finalizeErr should be recorded")
+	}
+
+	// File 2's own block wrote fine; its finalize must be entirely
+	// unaffected by file 1's earlier, unrelated failure.
+	if err := ft.ow.SubmitAndWaitFile(dfGood.file, writeKey(2, 0), 0, make([]byte, 10)); err != nil {
+		t.Fatalf("file 2's own write: %v", err)
+	}
+	if err := ft.MarkDone(2); err != nil {
+		t.Fatal(err)
+	}
+	if err := ft.Release(dfGood); err != nil {
+		t.Fatal(err)
+	}
+	if dfGood.finalizeErr != nil {
+		t.Errorf("file 2's finalizeErr = %v, want nil -- must not be poisoned by file 1's failure", dfGood.finalizeErr)
+	}
+	info, err := os.Stat(filepath.Join(root, "good.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0640 {
+		t.Errorf("file 2 mode = %o, want 0640 -- chmod must not have been skipped", info.Mode().Perm())
+	}
+	if !info.ModTime().Equal(mtime) {
+		t.Errorf("file 2 mtime = %v, want %v -- chtimes must not have been skipped", info.ModTime(), mtime)
+	}
+}

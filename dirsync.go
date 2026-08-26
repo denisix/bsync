@@ -245,6 +245,43 @@ type dirTransferState struct {
 	magicBytes [magicLen]byte
 	noCompress bool
 	remaining  sync.Map // FileID -> *atomic.Int64, blocks left before OpFileDone
+	// doneOnce guards OpFileDone to exactly one send per file, independent
+	// of the remaining-block counter above: forceFileDone (below) can fire
+	// for a file that never had all its blocks flow through
+	// recordBlockDone at all (TreeReader failed to open or fully read it),
+	// so the counter alone cannot be trusted to converge on zero. Both
+	// paths funnel through sendFileDone, so whichever fires first wins and
+	// the other becomes a no-op.
+	doneOnce sync.Map // FileID -> *sync.Once
+}
+
+// sendFileDone marks fileID done in the session and sends OpFileDone,
+// exactly once, regardless of which caller (a block reaching zero
+// remaining, or forceFileDone below) triggers it.
+func (dt *dirTransferState) sendFileDone(fileID uint32) {
+	v, _ := dt.doneOnce.LoadOrStore(fileID, &sync.Once{})
+	v.(*sync.Once).Do(func() {
+		dt.sess.MarkFileDone()
+		if err := dt.ctrl.send(&Msg{Op: uint8(OpFileDone), FileID: fileID}, nil); err != nil {
+			Log("file %d: failed to send file-done: %v\n", fileID, err)
+		}
+	})
+}
+
+// remainingCounter returns fileID's per-file remaining-block counter
+// (lazily seeded from its expected total block count on first touch, by
+// whichever caller — a real completing block via recordBlockDone, or a
+// correction via forceFileDone — touches it first) alongside that expected
+// total, so a caller needing both doesn't have to look fe.Blocks up twice.
+func (dt *dirTransferState) remainingCounter(fileID uint32) (counter *atomic.Int64, total int64) {
+	total = 1
+	if fe := dt.sess.FileByID(fileID); fe != nil && fe.Blocks > 0 {
+		total = int64(fe.Blocks)
+	}
+	fresh := new(atomic.Int64)
+	fresh.Store(total)
+	v, _ := dt.remaining.LoadOrStore(fileID, fresh)
+	return v.(*atomic.Int64), total
 }
 
 // recordBlockDone accounts for one block of fileID having been fully
@@ -253,19 +290,44 @@ type dirTransferState struct {
 // zero sends OpFileDone; blocks complete out of order across workers, so
 // this is not necessarily the worker that opened the file.
 func (dt *dirTransferState) recordBlockDone(fileID uint32) {
-	total := int64(1)
-	if fe := dt.sess.FileByID(fileID); fe != nil && fe.Blocks > 0 {
-		total = int64(fe.Blocks)
-	}
-	fresh := new(atomic.Int64)
-	fresh.Store(total)
-	v, _ := dt.remaining.LoadOrStore(fileID, fresh)
-	counter := v.(*atomic.Int64)
+	counter, _ := dt.remainingCounter(fileID)
 	if counter.Add(-1) == 0 {
-		dt.sess.MarkFileDone()
-		if err := dt.ctrl.send(&Msg{Op: uint8(OpFileDone), FileID: fileID}, nil); err != nil {
-			Log("file %d: failed to send file-done: %v\n", fileID, err)
-		}
+		dt.sendFileDone(fileID)
+	}
+}
+
+// forceFileDone corrects fileID's remaining-block counter for a file
+// TreeReader could not fully read: an open failure emits zero blocks, and a
+// mid-file read failure emits fewer than the file's expected total, so
+// recordBlockDone's counter would otherwise never reach zero on its own —
+// stranding OpFileDone forever and hanging the server's WaitAllFinalized
+// for its full timeout, failing the WHOLE tree even though every other file
+// completed normally. (A source file being deleted, renamed, or losing
+// read permission between the walk and the read is the ordinary case for a
+// live source tree, not a contrived one.)
+//
+// This does NOT send OpFileDone directly — that would be unsafe. Some of
+// blocksEmitted's blocks may still be in flight through the transfer
+// pipeline (opened, checksummed, or mid-write) when this fires; declaring
+// the file done before they actually complete risks the server
+// truncating/closing/chmod-ing it out from under an in-progress write.
+// Instead, this subtracts exactly the blocks that will now NEVER arrive
+// (expectedTotal - blocksEmitted) from the SAME counter recordBlockDone
+// uses, through the SAME atomic Add-and-check-zero operation — so whoever
+// (a legitimately completing block, or this correction) brings the counter
+// to zero is the one that sends OpFileDone, with the same
+// exactly-one-caller-observes-zero guarantee already relied on for every
+// ordinary block. Every block that WAS emitted still counts down normally
+// through its own recordBlockDone call; only the blocks that will never
+// exist are cancelled out.
+func (dt *dirTransferState) forceFileDone(fileID uint32, blocksEmitted uint32) {
+	counter, total := dt.remainingCounter(fileID)
+	neverComing := total - int64(blocksEmitted)
+	if neverComing <= 0 {
+		return // every expected block was actually emitted; nothing to correct
+	}
+	if counter.Add(-neverComing) == 0 {
+		dt.sendFileDone(fileID)
 	}
 }
 
@@ -344,6 +406,41 @@ func startDirClient(srcRoot, serverAddress string, blockSizeCap uint32, noCompre
 	announceErrCh := make(chan error, 1)
 	go func() { announceErrCh <- runAnnounceBatcher(ctrl, announceChan) }()
 
+	// The tree reader, precompute pool, and transfer workers must start
+	// consuming treeFileChan/precompChan CONCURRENTLY with the walk, not
+	// after it finishes: treeFileChan is only 256-deep, and the fan-out
+	// goroutine above writes to it synchronously for every entry (files
+	// AND dirs). On any tree past that threshold, the fan-out goroutine
+	// blocks on `treeFileChan <- fe`, which stalls announceChan too (same
+	// goroutine), which stalls the announce batcher, which stalls
+	// walkSource's own output channel, which stalls walkDone below —
+	// deadlocking the whole client forever with no timeout. Starting the
+	// downstream pipeline first, before the walkDone/announceErrCh waits,
+	// is what makes this a real pipeline instead of "walk fully, then
+	// read" — which is also what the design's "announce while still
+	// walking" intent always required.
+	tr := NewTreeReader(treeFileChan, sess, int64(workers)*4*int64(capBS))
+	tr.onFileFailed = dt.forceFileDone
+	tr.Start()
+	precompChan := make(chan PrecomputedBlock, workers*2)
+	precomputeTreeBlocks(tr, sess, precompChan, workers, noCompress)
+
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			runDirTransferWorker(saddr, dt, precompChan)
+		}()
+	}
+	// Guarantees the reader/precompute/worker chain always drains via the
+	// natural channel-close cascade (walkSource closes its output on any
+	// return, error or not) on EVERY exit path below, including the early
+	// returns on a walk/announce/send error -- without this, an early
+	// return here would leak the goroutines still blocked on a channel
+	// that will now never be read from again.
+	defer wg.Wait()
+
 	<-walkDone
 	if walkErr != nil {
 		return sess, fmt.Errorf("walking %s: %w", srcRoot, walkErr)
@@ -373,19 +470,6 @@ func startDirClient(srcRoot, serverAddress string, blockSizeCap uint32, noCompre
 		}
 	}
 
-	tr := NewTreeReader(treeFileChan, sess, int64(workers)*4*int64(capBS))
-	tr.Start()
-	precompChan := make(chan PrecomputedBlock, workers*2)
-	precomputeTreeBlocks(tr, sess, precompChan, workers, noCompress)
-
-	var wg sync.WaitGroup
-	for i := 0; i < workers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			runDirTransferWorker(saddr, dt, precompChan)
-		}()
-	}
 	wg.Wait()
 
 	if err := ctrl.send(&Msg{Op: uint8(OpTreeDone), BlockIdx: fileCount, FileSize: sess.TotalBytes()}, nil); err != nil {

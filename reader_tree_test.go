@@ -25,9 +25,11 @@ func TestReadFileBlocksTagsFileID(t *testing.T) {
 
 	out := make(chan FileBlock, 8)
 	errCh := make(chan error, 1)
+	emittedCh := make(chan uint32, 1)
 	go func() {
-		err := readFileBlocks(f, 42, bs, uint64(len(data)), 0, out, nil, nil)
+		emitted, err := readFileBlocks(f, 42, bs, uint64(len(data)), 0, out, nil, nil)
 		close(out) // readFileBlocks never closes out itself; the caller owns that
+		emittedCh <- emitted
 		errCh <- err
 	}()
 
@@ -37,6 +39,9 @@ func TestReadFileBlocksTagsFileID(t *testing.T) {
 	}
 	if err := <-errCh; err != nil {
 		t.Fatalf("readFileBlocks: %v", err)
+	}
+	if emitted := <-emittedCh; emitted != 4 {
+		t.Errorf("reported emitted = %d, want 4", emitted)
 	}
 	if len(blocks) != 4 {
 		t.Fatalf("got %d blocks, want 4", len(blocks))
@@ -74,10 +79,13 @@ func TestReadFileBlocksEmptyFileNoOp(t *testing.T) {
 	}
 	defer f.Close()
 	out := make(chan FileBlock, 1)
-	err = readFileBlocks(f, 0, 4096, 0, 0, out, nil, nil)
+	emitted, err := readFileBlocks(f, 0, 4096, 0, 0, out, nil, nil)
 	close(out)
 	if err != nil {
 		t.Fatalf("readFileBlocks on empty file: %v", err)
+	}
+	if emitted != 0 {
+		t.Errorf("emitted = %d, want 0 for an empty file", emitted)
 	}
 	if _, ok := <-out; ok {
 		t.Error("expected no blocks for an empty file")
@@ -110,7 +118,7 @@ func TestReadFileBlocksCustomAcquireUsed(t *testing.T) {
 
 	out := make(chan FileBlock, 8)
 	go func() {
-		readFileBlocks(f, 0, bs, uint64(len(data)), 0, out, nil, acquire)
+		_, _ = readFileBlocks(f, 0, bs, uint64(len(data)), 0, out, nil, acquire)
 		close(out)
 	}()
 	var n int
@@ -145,9 +153,12 @@ func TestReadFileBlocksDoneCancelsEarly(t *testing.T) {
 	done := make(chan struct{})
 	close(done) // already cancelled
 
-	err = readFileBlocks(f, 0, bs, uint64(len(data)), 0, out, done, nil)
+	emitted, err := readFileBlocks(f, 0, bs, uint64(len(data)), 0, out, done, nil)
 	if err != nil {
 		t.Fatalf("cancellation should return nil, got %v", err)
+	}
+	if emitted != 0 {
+		t.Errorf("emitted = %d, want 0 -- cancelled before the first send", emitted)
 	}
 }
 

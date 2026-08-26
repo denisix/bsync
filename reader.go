@@ -77,12 +77,15 @@ type BlockData = FileBlock
 //
 // If done is non-nil and closes while a send is blocked, readFileBlocks
 // stops and returns nil — cancellation is a normal way to stop, not an
-// error. Returns the first read error encountered, if any.
+// error. Returns the number of blocks actually sent to out (needed by
+// TreeReader callers to know exactly how many of a file's blocks will ever
+// arrive when a failure — or cancellation — stops it short of the full
+// count) and the first read error encountered, if any.
 func readFileBlocks(file *os.File, fileID uint32, blockSize uint32, fileSize uint64,
 	skipIdx uint32, out chan<- FileBlock, done <-chan struct{},
-	acquire func(size uint32) (data []byte, release func())) error {
+	acquire func(size uint32) (data []byte, release func())) (uint32, error) {
 	if fileSize == 0 {
-		return nil
+		return 0, nil
 	}
 	if acquire == nil {
 		acquire = func(size uint32) ([]byte, func()) {
@@ -91,6 +94,7 @@ func readFileBlocks(file *os.File, fileID uint32, blockSize uint32, fileSize uin
 		}
 	}
 
+	var emitted uint32
 	lastBlockNum := uint32((fileSize - 1) / uint64(blockSize))
 	for blockIdx := skipIdx; blockIdx <= lastBlockNum; blockIdx++ {
 		// Read each block directly into its own buffer. The buffer is handed
@@ -102,7 +106,7 @@ func readFileBlocks(file *os.File, fileID uint32, blockSize uint32, fileSize uin
 		n, err := file.ReadAt(buf, offset)
 		if err != nil && err != io.EOF {
 			release()
-			return fmt.Errorf("read block %d: %w", blockIdx, err)
+			return emitted, fmt.Errorf("read block %d: %w", blockIdx, err)
 		}
 
 		// We won't read this source range again; drop its clean page-cache
@@ -118,12 +122,13 @@ func readFileBlocks(file *os.File, fileID uint32, blockSize uint32, fileSize uin
 		}
 		select {
 		case out <- fb:
+			emitted++
 		case <-done:
 			release()
-			return nil
+			return emitted, nil
 		}
 	}
-	return nil
+	return emitted, nil
 }
 
 // SequentialReader reads blocks sequentially and pushes to channel
@@ -170,7 +175,7 @@ func (sr *SequentialReader) Start() {
 			return
 		}
 
-		if err := readFileBlocks(sr.file, 0, sr.blockSize, sr.fileSize, sr.skipIdx, sr.blockChan, nil, nil); err != nil {
+		if _, err := readFileBlocks(sr.file, 0, sr.blockSize, sr.fileSize, sr.skipIdx, sr.blockChan, nil, nil); err != nil {
 			Log("sequential reader error: %s\n", err)
 		}
 	}()
@@ -245,6 +250,25 @@ type TreeReader struct {
 	sess   *SyncSession
 	budget *byteBudget
 	wg     sync.WaitGroup
+
+	// onFileFailed, if non-nil, is called synchronously (from the single
+	// reader goroutine, so it must not block) whenever a file could not be
+	// opened or fully read, reporting exactly how many of its blocks WERE
+	// successfully emitted to out before the failure (0 for an open
+	// failure). This precision matters: a downstream consumer counting
+	// blocks per file (dirTransferState's per-file remaining counter)
+	// would otherwise never see that file reach zero and never send its
+	// OpFileDone -- but the fix must not just declare the file "done"
+	// outright, since blocks that WERE emitted may still be in flight
+	// through the transfer pipeline; declaring completion before they are
+	// actually written risks truncating/closing the file out from under
+	// them. Reporting the exact count lets the caller correct its
+	// expected-block-count downward instead, so completion still waits for
+	// every block that was really emitted. Set by the caller (e.g.
+	// startDirClient wiring it to dirTransferState.forceFileDone) before
+	// Start; nil is fine for callers that don't need it (tests, or a
+	// future non-network consumer of TreeReader).
+	onFileFailed func(fileID uint32, blocksEmitted uint32)
 }
 
 // NewTreeReader creates a TreeReader draining files. sess, if non-nil,
@@ -288,6 +312,9 @@ func (tr *TreeReader) readOneFile(fe *FileEntry) {
 		if tr.sess != nil {
 			tr.sess.failFile(fe.ID, fmt.Errorf("open %s: %w", fe.RelPath, err))
 		}
+		if tr.onFileFailed != nil {
+			tr.onFileFailed(fe.ID, 0)
+		}
 		return
 	}
 	AdviseSequential(f)
@@ -301,13 +328,22 @@ func (tr *TreeReader) readOneFile(fe *FileEntry) {
 			tr.budget.release(n)
 		}
 	}
-	readErr := readFileBlocks(f, fe.ID, fe.BlockSize, fe.Size, 0, tr.out, nil, acquire)
+	emitted, readErr := readFileBlocks(f, fe.ID, fe.BlockSize, fe.Size, 0, tr.out, nil, acquire)
 	closeErr := f.Close()
 	if readErr == nil {
+		// Every block was emitted; only the close itself failed. Report
+		// the full emitted count below (not 0) -- onFileFailed only needs
+		// to correct the expected-block-count when FEWER than the whole
+		// file's blocks were ever emitted, which isn't the case here.
 		readErr = closeErr
 	}
-	if readErr != nil && tr.sess != nil {
-		tr.sess.failFile(fe.ID, fmt.Errorf("read %s: %w", fe.RelPath, readErr))
+	if readErr != nil {
+		if tr.sess != nil {
+			tr.sess.failFile(fe.ID, fmt.Errorf("read %s: %w", fe.RelPath, readErr))
+		}
+		if tr.onFileFailed != nil {
+			tr.onFileFailed(fe.ID, emitted)
+		}
 	}
 }
 

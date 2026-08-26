@@ -405,6 +405,14 @@ func TestOrderedWriterPerItemErrorsDoNotPoisonOtherFiles(t *testing.T) {
 	if ow.Err() == nil {
 		t.Error("Err() should still report the recorded failure")
 	}
+	// A6 regression: DrainFile must NOT report the earlier, unrelated
+	// file's sticky error either -- it used to return ow.Err()
+	// unconditionally, which meant finalizeIO would skip fGood's own
+	// truncate/chmod/chtimes purely because SOME OTHER file failed
+	// earlier in the transfer.
+	if err := ow.DrainFile(fGood); err != nil {
+		t.Errorf("DrainFile(fGood) = %v, want nil -- must not be poisoned by fBad's earlier failure", err)
+	}
 }
 
 // TestOrderedWriterLegacyStickyErrorPoisonsSubsequentWrites is the

@@ -301,11 +301,26 @@ func (ow *OrderedWriter) SubmitAndWaitFile(f *os.File, key uint64, offset int64,
 // and chtimes a file, as an explicit safety net beyond the fact that every
 // individual SubmitAndWaitFile call already blocks until its own block is
 // written.
+//
+// Deliberately does NOT return ow.Err(): that is the STICKY, GLOBAL first
+// error across every file this writer has ever touched, not anything
+// specific to f. By the time finalizeIO calls this, every one of f's own
+// blocks was already individually confirmed via its own SubmitAndWaitFile
+// return (which delivers success/failure synchronously to its own caller,
+// before that call even returns) — DrainFile's only real job is ensuring
+// nothing still buffered in the reorder heap is left unflushed before f is
+// truncated/closed, not reporting some OTHER file's historical write
+// failure. Returning ow.Err() here used to mean one file's ENOSPC/EIO
+// silently made every file finalized afterward skip its own
+// truncate/chmod/chtimes (wrong size/mode/mtime, breaking the
+// idempotent-second-run property) and fail the WHOLE tree via
+// FirstFinalizeErr() — even though each of those later files' own blocks
+// had written perfectly.
 func (ow *OrderedWriter) DrainFile(f *os.File) error {
 	done := make(chan struct{})
 	ow.ch <- writeItem{drain: true, drainDone: done, file: f}
 	<-done
-	return ow.Err()
+	return nil
 }
 
 // Err returns the first write error encountered, if any.

@@ -6,9 +6,13 @@ import (
 	"time"
 )
 
+// ioTimeout is a var, not a const, purely so tests can shrink it instead of
+// waiting on the real 5-minute value (matching the same var-not-const
+// treatment magicHead got in Phase 0 for the same reason).
+var ioTimeout = 5 * time.Minute // generous for large blocks on slow links
+
 const (
 	dialTimeout     = 30 * time.Second
-	ioTimeout       = 5 * time.Minute // generous for large blocks on slow links
 	keepAlivePeriod = 30 * time.Second
 	maxRetries      = 3
 
