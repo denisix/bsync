@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"encoding/binary"
 	"fmt"
 	"io"
 	"net"
@@ -146,20 +145,18 @@ func startClient(file *os.File, serverAddress string, skipIdx uint32, fileSize u
 			conn := NewAutoReconnectTCP(saddr)
 			defer conn.Close()
 			for block := range precompressedChan {
-				var lastErr error
-				for retry := 0; retry < maxRetries; retry++ {
-					if retry > 0 {
+				lastErr := withRetry(
+					func(retry int) error {
+						if cliVisualizer != nil {
+							cliVisualizer.UpdateBlockStatus(block.BlockIdx, StatusProcessing)
+						}
+						return processPrecomputedBlock(conn, block, blockSize, fileSize, noCompress, checksumCache)
+					},
+					func(retry int, lastErr error) {
 						Log("block %d: retry %d/%d after: %v\n", block.BlockIdx, retry, maxRetries-1, lastErr)
 						conn.Close() // force reconnect on next call
-						time.Sleep(time.Duration(retry) * time.Second)
-					}
-					if cliVisualizer != nil {
-						cliVisualizer.UpdateBlockStatus(block.BlockIdx, StatusProcessing)
-					}
-					if lastErr = processPrecomputedBlock(conn, block, blockSize, fileSize, noCompress, checksumCache); lastErr == nil {
-						break
-					}
-				}
+					},
+				)
 				// block.Data (when non-nil) is a readerBufPool buffer that
 				// precomputeChecksumsParallel handed off instead of
 				// releasing itself, because it's the buffer actually sent
@@ -220,11 +217,7 @@ func startClient(file *os.File, serverAddress string, skipIdx uint32, fileSize u
 }
 
 func waitForBlockAck(conn io.Reader, blockIdx uint32) error {
-	buf := make([]byte, binary.Size(Msg{}))
-	if _, err := io.ReadFull(conn, buf); err != nil {
-		return err
-	}
-	ack, err := unpack(buf)
+	ack, err := readMsg(conn)
 	if err != nil {
 		return err
 	}
@@ -261,13 +254,9 @@ func processPrecomputedBlock(conn *AutoReconnectTCP, block PrecomputedBlock, blo
 	// Get server hash. Framed as a proper OpHash message (header + payload)
 	// rather than bare bytes, so a rejected/malformed exchange surfaces as a
 	// decodable error instead of desynchronizing the stream.
-	hashHdrBuf := make([]byte, binary.Size(Msg{}))
-	if _, err := io.ReadFull(conn, hashHdrBuf); err != nil {
-		return fmt.Errorf("read hash header: %w", err)
-	}
-	hashHdr, err := unpack(hashHdrBuf)
+	hashHdr, err := readMsg(conn)
 	if err != nil {
-		return fmt.Errorf("unpack hash header: %w", err)
+		return fmt.Errorf("read hash header: %w", err)
 	}
 	if Op(hashHdr.Op) != OpHash || hashHdr.MagicHead != magicBytes || hashHdr.FileID != 0 ||
 		hashHdr.BlockIdx != block.BlockIdx || hashHdr.Flags != 0 || int(hashHdr.DataSize) != len(block.Hash) {
@@ -421,15 +410,9 @@ func startClientDownload(file *os.File, serverAddress string, skipIdx uint32, bl
 	}
 
 	// Read file metadata from server
-	msgBuf := make([]byte, binary.Size(Msg{}))
-	_, err = io.ReadFull(conn, msgBuf)
+	metaMsg, err := readMsg(conn)
 	if err != nil {
 		return fmt.Errorf("read metadata: %w", err)
-	}
-
-	metaMsg, err3 := unpack(msgBuf)
-	if err3 != nil {
-		return fmt.Errorf("unpack metadata: %w", err3)
 	}
 	if Op(metaMsg.Op) != OpDownData || metaMsg.MagicHead != magicBytes || metaMsg.FileID != 0 ||
 		metaMsg.BlockSize == 0 || metaMsg.DataSize != 0 || metaMsg.Flags != 0 {
@@ -484,15 +467,15 @@ func startClientDownload(file *os.File, serverAddress string, skipIdx uint32, bl
 			return fmt.Errorf("send block request: %w", err)
 		}
 
-		// Read response
-		_, err = io.ReadFull(conn, msgBuf)
+		// Read response. Allocates fresh per block rather than reusing one
+		// buffer across iterations -- matching the upload path's equivalent
+		// per-block reads (waitForBlockAck, the hash-header read in
+		// processPrecomputedBlock), which have always done the same; a
+		// 48-byte header allocation per block is negligible next to the
+		// block payload itself.
+		blockMsg, err := readMsg(conn)
 		if err != nil {
 			return fmt.Errorf("read block response: %w", err)
-		}
-
-		blockMsg, err4 := unpack(msgBuf)
-		if err4 != nil {
-			return fmt.Errorf("unpack block response: %w", err4)
 		}
 
 		if Op(blockMsg.Op) == OpDownDone {

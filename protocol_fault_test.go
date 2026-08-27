@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"encoding/binary"
 	"fmt"
 	"io"
 	"net"
@@ -24,7 +23,7 @@ func writeTestMsg(t *testing.T, conn net.Conn, msg *Msg) {
 }
 
 func readTestMsg(conn net.Conn) (*Msg, error) {
-	buf := make([]byte, binary.Size(Msg{}))
+	buf := make([]byte, msgSize)
 	if _, err := io.ReadFull(conn, buf); err != nil {
 		return nil, err
 	}

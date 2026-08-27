@@ -274,6 +274,22 @@ func unpack(dataBytes []byte) (*Msg, error) {
 	return data, nil
 }
 
+// readMsg reads and unpacks exactly one Msg header from r: the
+// make([]byte, msgSize) / io.ReadFull / unpack sequence repeated at every
+// ONE-SHOT read site in this codebase (waiting for a single ack, a single
+// hash header, a single metadata probe reply). A persistent per-connection
+// read loop that reuses one buffer across many iterations instead
+// (server.go's serverHandleReq, server_dir.go's dirHandleConn) intentionally
+// does NOT use this — that reuse avoids a fresh allocation per message in a
+// hot path, which this helper, allocating fresh every call, would undo.
+func readMsg(r io.Reader) (*Msg, error) {
+	buf := make([]byte, msgSize)
+	if _, err := io.ReadFull(r, buf); err != nil {
+		return nil, err
+	}
+	return unpack(buf)
+}
+
 // AnnounceRec is one record inside an OpAnnounce trailer: a file, directory,
 // or skipped path discovered by the walker. Kind reuses walk.go's EntryKind
 // (KindFile/KindDir/KindSkipped) — kindSkipped entries (symlinks, sockets,

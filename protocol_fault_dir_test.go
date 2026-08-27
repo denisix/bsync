@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"encoding/binary"
 	"io"
 	"net"
 	"os"
@@ -14,20 +13,12 @@ import (
 )
 
 // newTestDirServerState builds a dirServerState with a fresh fileTable
-// rooted at a temp dir, for driving dirHandleConn directly in tests without
-// a real listener.
+// rooted at a temp dir (via newTestFileTableOpts, server_dir_test.go), for
+// driving dirHandleConn directly in tests without a real listener.
 func newTestDirServerState(t *testing.T, workers int) *dirServerState {
 	t.Helper()
-	// See newTestFileTable's identical call for why this must be
-	// unconditional: these tests drive the real block-decode/decrypt path
-	// and must not inherit a stale encryption key from an unrelated test
-	// that ran earlier in the same process.
-	resetEngineGlobals()
-	root := t.TempDir()
-	ow := NewOrderedWriter(nil, workers)
-	ow.EnablePerItemErrors()
-	t.Cleanup(func() { ow.Close() })
-	return &dirServerState{ft: newFileTable(root, workers, ow)}
+	ft, _ := newTestFileTableOpts(t, workers, 0)
+	return &dirServerState{ft: ft}
 }
 
 // runDirHandleConn drives dirHandleConn against one side of a net.Pipe,
@@ -56,7 +47,7 @@ func writeDirMsg(t *testing.T, conn net.Conn, msg *Msg) {
 }
 
 func readDirMsg(conn net.Conn) (*Msg, error) {
-	buf := make([]byte, binary.Size(Msg{}))
+	buf := make([]byte, msgSize)
 	if _, err := io.ReadFull(conn, buf); err != nil {
 		return nil, err
 	}
@@ -360,16 +351,10 @@ func TestDirHandleConnFullExchangeWritesCorrectContent(t *testing.T) {
 		t.Fatal("dirHandleConn did not return after client close")
 	}
 
-	df, err := st.ft.lookup(1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctxDeadline := time.Now().Add(3 * time.Second)
-	for !df.isFinalized() && time.Now().Before(ctxDeadline) {
-		time.Sleep(10 * time.Millisecond)
-	}
-	if !df.isFinalized() {
-		t.Fatal("file never finalized after OpFileDone and connection close (refs never released)")
+	waitCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := st.ft.WaitAllFinalized(waitCtx); err != nil {
+		t.Fatalf("file never finalized after OpFileDone and connection close (refs never released): %v", err)
 	}
 	content, err := os.ReadFile(filepath.Join(st.ft.root, "f.txt"))
 	if err != nil {

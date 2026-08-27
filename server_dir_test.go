@@ -9,30 +9,27 @@ import (
 	"time"
 )
 
-func newTestFileTable(t *testing.T, workers int) (*fileTable, string) {
-	t.Helper()
-	// Directory-mode tests are order-dependent on shared package globals
-	// (crypto key, block size, ...) set by unrelated tests elsewhere in the
-	// suite; reset unconditionally so this helper's caller is self-contained
-	// regardless of run order (see setupTransfer's crypto-leak fix).
-	resetEngineGlobals()
-	root := t.TempDir()
-	ow := NewOrderedWriter(nil, workers)
-	ow.EnablePerItemErrors()
-	t.Cleanup(func() { ow.Close() })
-	return newFileTable(root, workers, ow), root
-}
-
-// newTestFileTableWithBudget is newTestFileTable but with an explicit,
-// possibly tiny, openBudget -- newFileTable itself always floors it at 64,
-// which makes budget-exhaustion paths impractical to exercise directly.
-func newTestFileTableWithBudget(t *testing.T, workers, budget int) (*fileTable, string) {
+// newTestFileTableOpts is the one shared setup behind every directory-mode
+// test that needs a fileTable (directly, or wrapped in a dirServerState):
+// resets the package globals directory-mode tests are order-dependent on
+// (crypto key, block size, ... — see setupTransfer's identical crypto-leak
+// fix), builds an OrderedWriter with EnablePerItemErrors (matching
+// production wiring in startDirServer), and returns a fileTable rooted at a
+// fresh temp dir. budget <= 0 uses newFileTable's own default flooring
+// (workers*4, floored at 64); a positive budget bypasses that floor
+// entirely via a hand-built fileTable literal, for tests that need to
+// exercise budget-exhaustion paths a floor of 64 would make impractical to
+// reach.
+func newTestFileTableOpts(t *testing.T, workers, budget int) (*fileTable, string) {
 	t.Helper()
 	resetEngineGlobals()
 	root := t.TempDir()
 	ow := NewOrderedWriter(nil, workers)
 	ow.EnablePerItemErrors()
 	t.Cleanup(func() { ow.Close() })
+	if budget <= 0 {
+		return newFileTable(root, workers, ow), root
+	}
 	ft := &fileTable{
 		root:       root,
 		ow:         ow,
@@ -42,6 +39,19 @@ func newTestFileTableWithBudget(t *testing.T, workers, budget int) (*fileTable, 
 	}
 	ft.cond = sync.NewCond(&ft.mu)
 	return ft, root
+}
+
+func newTestFileTable(t *testing.T, workers int) (*fileTable, string) {
+	t.Helper()
+	return newTestFileTableOpts(t, workers, 0)
+}
+
+// newTestFileTableWithBudget is newTestFileTable but with an explicit,
+// possibly tiny, openBudget -- newFileTable itself always floors it at 64,
+// which makes budget-exhaustion paths impractical to exercise directly.
+func newTestFileTableWithBudget(t *testing.T, workers, budget int) (*fileTable, string) {
+	t.Helper()
+	return newTestFileTableOpts(t, workers, budget)
 }
 
 // --- Announce: path safety ---
@@ -810,7 +820,7 @@ func TestFileTableAcquireExtendsShorterExistingDestination(t *testing.T) {
 // --- finalizeComplete vs finalized (F8) ---
 
 // TestFileTableWaitAllFinalizedDoesNotTrustFinalizedAloneWithoutFinalizeComplete
-// is a regression test for F8: allFinalizedLocked must check
+// is a regression test for F8: allFinalized must check
 // finalizeComplete, not finalized. finalized flips BEFORE finalizeIO's
 // actual drain/truncate/close/chmod/chtimes work runs -- by design, to
 // close the Acquire-exclusion TOCTOU window (see Release's comment) -- so a

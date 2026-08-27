@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"encoding/binary"
 	"fmt"
 	"io"
 	"net"
@@ -674,13 +673,9 @@ func startDirClient(srcRoot, serverAddress string, blockSizeCap uint32, noCompre
 	if err := ctrl.send(&Msg{Op: uint8(OpTreeDone), BlockIdx: fileCount, FileSize: sess.TotalBytes()}, nil); err != nil {
 		return sess, fmt.Errorf("send tree done: %w", err)
 	}
-	ackBuf := make([]byte, binary.Size(Msg{}))
-	if _, err := io.ReadFull(rawConn, ackBuf); err != nil {
-		return sess, fmt.Errorf("waiting for tree ack: %w", err)
-	}
-	ack, err := unpack(ackBuf)
+	ack, err := readMsg(rawConn)
 	if err != nil {
-		return sess, fmt.Errorf("unpack tree ack: %w", err)
+		return sess, fmt.Errorf("waiting for tree ack: %w", err)
 	}
 	switch Op(ack.Op) {
 	case OpTreeAck:
@@ -730,39 +725,36 @@ func runDirTransferWorker(saddr *net.TCPAddr, dt *dirTransferState, precompChan 
 			continue
 		}
 
-		var lastErr error
 		var outcome blockOutcome
-		for retry := 0; retry < maxRetries; retry++ {
-			if retry > 0 {
+		lastErr := withRetry(
+			func(retry int) error {
+				if err := conn.Dial(); err != nil {
+					return err
+				}
+				needRebind := !bound || boundFileID != pb.FileID || boundGen != conn.Gen()
+				if needRebind {
+					sameConnDifferentFile := bound && boundGen == conn.Gen() && boundFileID != pb.FileID
+					if err := dirWorkerBind(conn, dt, pb, sameConnDifferentFile, boundFileID); err != nil {
+						bound = false
+						return err
+					}
+					bound = true
+					boundFileID = pb.FileID
+					boundGen = conn.Gen()
+				}
+				var err error
+				outcome, err = processDirBlock(conn, dt, pb)
+				if err != nil {
+					bound = false
+				}
+				return err
+			},
+			func(retry int, lastErr error) {
 				Log("file %d block %d: retry %d/%d after: %v\n", pb.FileID, pb.BlockIdx, retry, maxRetries-1, lastErr)
 				conn.Close()
 				bound = false
-				time.Sleep(time.Duration(retry) * time.Second)
-			}
-			if err := conn.Dial(); err != nil {
-				lastErr = err
-				continue
-			}
-
-			needRebind := !bound || boundFileID != pb.FileID || boundGen != conn.Gen()
-			if needRebind {
-				sameConnDifferentFile := bound && boundGen == conn.Gen() && boundFileID != pb.FileID
-				if err := dirWorkerBind(conn, dt, pb, sameConnDifferentFile, boundFileID); err != nil {
-					lastErr = err
-					bound = false
-					continue
-				}
-				bound = true
-				boundFileID = pb.FileID
-				boundGen = conn.Gen()
-			}
-
-			outcome, lastErr = processDirBlock(conn, dt, pb)
-			if lastErr == nil {
-				break
-			}
-			bound = false
-		}
+			},
+		)
 
 		if lastErr != nil {
 			Log("file %d block %d: failed after %d retries: %v\n", pb.FileID, pb.BlockIdx, maxRetries, lastErr)
@@ -803,13 +795,9 @@ func dirWorkerBind(conn *AutoReconnectTCP, dt *dirTransferState, pb PrecomputedB
 	if err := connWrite(conn, data); err != nil {
 		return fmt.Errorf("send file-open: %w", err)
 	}
-	ackBuf := make([]byte, binary.Size(Msg{}))
-	if _, err := io.ReadFull(conn, ackBuf); err != nil {
-		return fmt.Errorf("read file-open ack: %w", err)
-	}
-	ack, err := unpack(ackBuf)
+	ack, err := readMsg(conn)
 	if err != nil {
-		return fmt.Errorf("unpack file-open ack: %w", err)
+		return fmt.Errorf("read file-open ack: %w", err)
 	}
 	if Op(ack.Op) == OpError {
 		return fmt.Errorf("server rejected file-open for file %d", pb.FileID)
@@ -835,13 +823,9 @@ func processDirBlock(conn *AutoReconnectTCP, dt *dirTransferState, pb Precompute
 		return blockOutcome{}, fmt.Errorf("send check: %w", err)
 	}
 
-	hdrBuf := make([]byte, binary.Size(Msg{}))
-	if _, err := io.ReadFull(conn, hdrBuf); err != nil {
-		return blockOutcome{}, fmt.Errorf("read hash header: %w", err)
-	}
-	hashHdr, err := unpack(hdrBuf)
+	hashHdr, err := readMsg(conn)
 	if err != nil {
-		return blockOutcome{}, fmt.Errorf("unpack hash header: %w", err)
+		return blockOutcome{}, fmt.Errorf("read hash header: %w", err)
 	}
 	if Op(hashHdr.Op) == OpError {
 		return blockOutcome{}, fmt.Errorf("server error on checksum request for file %d block %d", pb.FileID, pb.BlockIdx)
@@ -908,12 +892,13 @@ func processDirBlock(conn *AutoReconnectTCP, dt *dirTransferState, pb Precompute
 	return blockOutcome{changed: true, netBytes: uint32(len(dataToSend)), origBytes: expected}, nil
 }
 
-func waitDirAck(conn *AutoReconnectTCP, fileID, blockIdx uint32) error {
-	buf := make([]byte, binary.Size(Msg{}))
-	if _, err := io.ReadFull(conn, buf); err != nil {
-		return err
-	}
-	ack, err := unpack(buf)
+// waitDirAck takes io.Reader, not *AutoReconnectTCP, even though every
+// production caller passes one: it only ever reads, and pinning the
+// parameter type to the concrete connection type is unnecessary coupling
+// (also matches the legacy path's equivalent, waitForBlockAck, which has
+// always taken io.Reader).
+func waitDirAck(conn io.Reader, fileID, blockIdx uint32) error {
+	ack, err := readMsg(conn)
 	if err != nil {
 		return err
 	}

@@ -3,7 +3,6 @@ package main
 import (
 	"bufio"
 	"context"
-	"encoding/binary"
 	"fmt"
 	"io"
 	"net"
@@ -184,7 +183,7 @@ func serverHandleReq(conn net.Conn, file *os.File, _ *ChecksumCache, ow *Ordered
 	// is blockSize+encryptOverhead bytes on the wire.
 	initialBlockSize := atomic.LoadUint32(&blockSize)
 	filebuf := make([]byte, initialBlockSize+encryptOverhead)
-	msgBuf := make([]byte, binary.Size(Msg{}))
+	msgBuf := make([]byte, msgSize)
 
 	var lastBlockNum uint32 = 0
 	var currentBlockSize uint32 = initialBlockSize
@@ -624,7 +623,7 @@ func serverHandleUpload(conn net.Conn, file *os.File, fileSize uint64, checksumC
 	magicBytes := stringToFixedSizeArray(magicHead)
 
 	filebuf := make([]byte, blockSize)
-	msgBuf := make([]byte, binary.Size(Msg{}))
+	msgBuf := make([]byte, msgSize)
 
 	var lastBlockNum uint32
 	if fileSize > 0 {

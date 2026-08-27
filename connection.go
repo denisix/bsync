@@ -29,6 +29,31 @@ const (
 // TCP buffer size, can be overridden by auto-tuning
 var tcpBufferSize int = 4 * 1024 * 1024 // Default 4MB
 
+// withRetry calls attempt up to maxRetries times total, with a linear
+// backoff (retry*1s) between attempts, and returns the last error (nil once
+// attempt succeeds). Before every attempt after the first, it calls onRetry
+// (if non-nil) with the retry number and the previous attempt's error, so a
+// caller can reset its own per-attempt state (closing/redialing a
+// connection, clearing a "currently bound to X" flag) before trying again —
+// exactly the shape both the legacy single-file client's block-transfer
+// retry loop and the directory-tree transfer worker's retry loop needed
+// independently, differing only in what that per-attempt state actually is.
+func withRetry(attempt func(retry int) error, onRetry func(retry int, lastErr error)) error {
+	var lastErr error
+	for retry := 0; retry < maxRetries; retry++ {
+		if retry > 0 {
+			if onRetry != nil {
+				onRetry(retry, lastErr)
+			}
+			time.Sleep(time.Duration(retry) * time.Second)
+		}
+		if lastErr = attempt(retry); lastErr == nil {
+			return nil
+		}
+	}
+	return lastErr
+}
+
 // SetTCPBufferSize sets the TCP buffer size for new connections.
 func SetTCPBufferSize(size int) {
 	tcpBufferSize = size

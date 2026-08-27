@@ -3,7 +3,6 @@ package main
 import (
 	"bufio"
 	"context"
-	"encoding/binary"
 	"fmt"
 	"io"
 	"net"
@@ -167,12 +166,32 @@ func (df *destFile) negotiateBlockSize(bs uint32) error {
 
 // isFinalized reports whether df's finalizeIO has actually completed — not
 // just been decided — matching what WaitAllFinalized itself waits for (see
-// allFinalizedLocked). Safe to call (and to poll in a loop) concurrently
+// allFinalized). Safe to call (and to poll in a loop) concurrently
 // with Release/MarkDone/reapStaleRefs, unlike reading a field directly.
 func (df *destFile) isFinalized() bool {
 	df.mu.Lock()
 	defer df.mu.Unlock()
 	return df.finalizeComplete
+}
+
+// handle returns df's currently-open file handle (nil if never Acquired).
+// Safe to call concurrently with anything else touching df.
+func (df *destFile) handle() *os.File {
+	df.mu.Lock()
+	defer df.mu.Unlock()
+	return df.file
+}
+
+// touch refreshes df.lastActive to now, on any block-level activity that
+// doesn't otherwise already update it as part of a larger critical section
+// (Acquire/Release/reapStaleRefs each fold their own lastActive update into
+// their existing refs/finalized critical section instead of calling this,
+// since splitting that into two lock acquisitions would reopen exactly the
+// TOCTOU window their own comments explain why they avoid).
+func (df *destFile) touch() {
+	df.mu.Lock()
+	df.lastActive = time.Now()
+	df.mu.Unlock()
 }
 
 // fileTable is the directory destination server's per-transfer state: every
@@ -438,26 +457,24 @@ func (ft *fileTable) Acquire(id uint32) (df *destFile, created bool, err error) 
 	return df, created, nil
 }
 
-// Release decrements df's reference count and finalizes it if both halves
-// of the double latch now hold: sawDone (OpFileDone seen) and refs == 0. A
-// connection can still be mid-retry on a redialed link when OpFileDone
-// arrives on the control connection, so neither event reliably comes last;
-// both Release and MarkDone must re-check the pair.
+// tryFinalize is the shared double-latch pattern behind Release, MarkDone,
+// and reapStaleRefs: decide, under df.mu, evaluates whatever combination of
+// fields and side effects that specific caller needs (Release decrements
+// refs; MarkDone sets sawDone; reapStaleRefs force-zeros refs) and returns
+// whether df should finalize now. If so, tryFinalize flips df.finalized —
+// in the SAME critical section decide ran in, not a decide-then-unlock-
+// then-flip sequence — and only then runs finalizeIO.
 //
-// The decision to finalize and the act of setting df.finalized happen in
-// the SAME critical section (df.mu held throughout), not a decide-then-
-// unlock-then-call sequence: unlocking between "shouldFinalize == true" and
-// actually flipping the flag would leave a window where a stray Acquire
-// (a buggy or hostile peer re-opening a file after its OpFileDone) could
-// slip in, bump refs, and then race finalizeIO's close/chmod/chtimes
-// against that caller's still-in-flight writes.
-func (ft *fileTable) Release(df *destFile) error {
+// This ordering is load-bearing, not stylistic: unlocking between "the
+// decision came back true" and "the flag is actually set" would leave a
+// window where a stray Acquire (a buggy or hostile peer re-opening a file
+// after its OpFileDone) could slip in, bump refs, and then race
+// finalizeIO's close/chmod/chtimes against that caller's still-in-flight
+// writes. decide must therefore never itself lock df.mu (it already holds
+// it) and should be side-effect-free beyond mutating df's own fields.
+func (ft *fileTable) tryFinalize(df *destFile, decide func() bool) error {
 	df.mu.Lock()
-	if df.refs > 0 {
-		df.refs--
-	}
-	df.lastActive = time.Now()
-	shouldFinalize := df.sawDone && df.refs == 0 && !df.finalized
+	shouldFinalize := decide()
 	var f *os.File
 	if shouldFinalize {
 		df.finalized = true
@@ -470,31 +487,37 @@ func (ft *fileTable) Release(df *destFile) error {
 	return nil
 }
 
+// Release decrements df's reference count and finalizes it if both halves
+// of the double latch now hold: sawDone (OpFileDone seen) and refs == 0. A
+// connection can still be mid-retry on a redialed link when OpFileDone
+// arrives on the control connection, so neither event reliably comes last;
+// both Release and MarkDone must re-check the pair.
+func (ft *fileTable) Release(df *destFile) error {
+	return ft.tryFinalize(df, func() bool {
+		if df.refs > 0 {
+			df.refs--
+		}
+		df.lastActive = time.Now()
+		return df.sawDone && df.refs == 0 && !df.finalized
+	})
+}
+
 // MarkDone records that OpFileDone was received for id (every block
-// delivered) and finalizes it if refs is already 0. See Release for why the
-// finalize decision and the finalized flag flip share one critical section.
+// delivered) and finalizes it if refs is already 0. See tryFinalize for why
+// the finalize decision and the finalized flag flip share one critical
+// section.
 func (ft *fileTable) MarkDone(id uint32) error {
 	df, err := ft.lookup(id)
 	if err != nil {
 		return err
 	}
-	df.mu.Lock()
-	if df.finalized {
-		df.mu.Unlock()
-		return nil
-	}
-	df.sawDone = true
-	shouldFinalize := df.refs == 0
-	var f *os.File
-	if shouldFinalize {
-		df.finalized = true
-		f = df.file
-	}
-	df.mu.Unlock()
-	if shouldFinalize {
-		return ft.runFinalizeIO(df, f)
-	}
-	return nil
+	return ft.tryFinalize(df, func() bool {
+		if df.finalized {
+			return false
+		}
+		df.sawDone = true
+		return df.refs == 0
+	})
 }
 
 // runFinalizeIO calls finalizeIO and then, once it has actually returned,
@@ -582,39 +605,43 @@ func (ft *fileTable) recordFinalizeErr(df *destFile, err error) {
 	df.mu.Unlock()
 }
 
+// snapshot returns every destFile currently known to the table, as a plain
+// slice safe to range over without holding ft.mu (the lock is only needed
+// to safely copy the map's values out; each destFile then has its own
+// mu for whatever the caller does with it next).
+func (ft *fileTable) snapshot() []*destFile {
+	ft.mu.Lock()
+	defer ft.mu.Unlock()
+	files := make([]*destFile, 0, len(ft.byID))
+	for _, df := range ft.byID {
+		files = append(files, df)
+	}
+	return files
+}
+
 // reapStaleRefs force-releases any ref that has sat idle past staleRefAge
 // on a file that has already seen OpFileDone — the connection that held it
 // is presumed gone (redialed elsewhere without sending OpFileClose, or
 // simply died) rather than legitimately still working. Returns how many
 // refs were reaped, for logging.
 func (ft *fileTable) reapStaleRefs() int {
-	ft.mu.Lock()
-	files := make([]*destFile, 0, len(ft.byID))
-	for _, df := range ft.byID {
-		files = append(files, df)
-	}
-	ft.mu.Unlock()
+	files := ft.snapshot()
 
 	reaped := 0
 	for _, df := range files {
-		df.mu.Lock()
-		stale := df.sawDone && !df.finalized && df.refs > 0 && time.Since(df.lastActive) > staleRefAge
-		var shouldFinalize bool
-		var f *os.File
-		if stale {
-			df.refs = 0
-			df.lastActive = time.Now()
-			shouldFinalize = true
-			df.finalized = true
-			f = df.file
-		}
-		df.mu.Unlock()
-		if stale {
+		wasStale := false
+		ft.tryFinalize(df, func() bool {
+			stale := df.sawDone && !df.finalized && df.refs > 0 && time.Since(df.lastActive) > staleRefAge
+			if stale {
+				df.refs = 0
+				df.lastActive = time.Now()
+				wasStale = true
+			}
+			return stale
+		})
+		if wasStale {
 			reaped++
 			Log("directory server: reaped a stale reference on file %d (%s); its owning connection is presumed gone\n", df.id, df.relPath)
-		}
-		if shouldFinalize {
-			ft.runFinalizeIO(df, f)
 		}
 	}
 	return reaped
@@ -628,7 +655,7 @@ func (ft *fileTable) WaitAllFinalized(ctx context.Context) error {
 	ticker := time.NewTicker(staleRefCheckPeriod)
 	defer ticker.Stop()
 	for {
-		if ft.allFinalizedLocked() {
+		if ft.allFinalized() {
 			return nil
 		}
 		select {
@@ -640,13 +667,12 @@ func (ft *fileTable) WaitAllFinalized(ctx context.Context) error {
 	}
 }
 
-func (ft *fileTable) allFinalizedLocked() bool {
-	ft.mu.Lock()
-	files := make([]*destFile, 0, len(ft.byID))
-	for _, df := range ft.byID {
-		files = append(files, df)
-	}
-	ft.mu.Unlock()
+// allFinalized reports whether every announced file has actually completed
+// finalizeIO. (Named without the "Locked" suffix Go convention reserves for
+// "caller must hold the lock" — this takes and releases ft.mu itself, via
+// snapshot, and holds no lock on return.)
+func (ft *fileTable) allFinalized() bool {
+	files := ft.snapshot()
 	for _, df := range files {
 		df.mu.Lock()
 		// finalizeComplete, not finalized: the latter flips before
@@ -668,12 +694,7 @@ func (ft *fileTable) allFinalizedLocked() bool {
 // across the whole table, if any, for surfacing as the transfer's overall
 // result.
 func (ft *fileTable) FirstFinalizeErr() error {
-	ft.mu.Lock()
-	files := make([]*destFile, 0, len(ft.byID))
-	for _, df := range ft.byID {
-		files = append(files, df)
-	}
-	ft.mu.Unlock()
+	files := ft.snapshot()
 	for _, df := range files {
 		df.mu.Lock()
 		err := df.finalizeErr
@@ -901,7 +922,7 @@ func dirHandleConn(conn net.Conn, st *dirServerState, doneChan chan struct{}) er
 	}
 
 	magicBytes := stringToFixedSizeArray(magicHead)
-	msgBuf := make([]byte, binary.Size(Msg{}))
+	msgBuf := make([]byte, msgSize)
 	c := bufio.NewReader(conn)
 	sess := &dirSession{}
 
@@ -1116,10 +1137,8 @@ func handleBlockCheck(conn net.Conn, magicBytes [magicLen]byte, sess *dirSession
 	}
 	buf := sess.blockBuf[:expected]
 
-	df.mu.Lock()
-	f := df.file
-	df.lastActive = time.Now()
-	df.mu.Unlock()
+	f := df.handle()
+	df.touch()
 	n, err := f.ReadAt(buf, int64(msg.BlockIdx)*int64(msg.BlockSize))
 	if err != nil && err != io.EOF {
 		return fmt.Errorf("read destination block %d of file %d: %w", msg.BlockIdx, msg.FileID, err)
@@ -1171,6 +1190,23 @@ func takePending(df *destFile, blockIdx uint32) bool {
 	return true
 }
 
+// writeAndAck writes payload at msg's block offset (via the shared
+// OrderedWriter, ordered across the whole tree by writeKey), refreshes
+// df.lastActive, and sends the OpAck response — the epilogue
+// handleBlockZero and handleBlockData both need identically, once each has
+// separately decided what payload to write (an all-zero buffer, or the
+// decoded wire payload).
+func writeAndAck(conn net.Conn, magicBytes [magicLen]byte, df *destFile, ft *fileTable, msg *Msg, payload []byte) error {
+	offset := int64(msg.BlockIdx) * int64(msg.BlockSize)
+	key := writeKey(msg.FileID, msg.BlockIdx)
+	if err := ft.ow.SubmitAndWaitFile(df.handle(), key, offset, payload); err != nil {
+		return fmt.Errorf("write file %d block %d: %w", msg.FileID, msg.BlockIdx, err)
+	}
+	df.touch()
+	ack := &Msg{MagicHead: magicBytes, Op: uint8(OpAck), FileID: msg.FileID, BlockIdx: msg.BlockIdx, BlockSize: msg.BlockSize, FileSize: df.size}
+	return sendMsg(conn, ack)
+}
+
 func handleBlockZero(conn net.Conn, magicBytes [magicLen]byte, sess *dirSession, ft *fileTable, msg *Msg) error {
 	if !sess.bound || sess.fileID != msg.FileID {
 		return fmt.Errorf("zero write for file %d without a matching OpFileOpen", msg.FileID)
@@ -1183,19 +1219,7 @@ func handleBlockZero(conn net.Conn, magicBytes [magicLen]byte, sess *dirSession,
 	if expected == 0 {
 		return fmt.Errorf("invalid zero block %d for file %d", msg.BlockIdx, msg.FileID)
 	}
-	offset := int64(msg.BlockIdx) * int64(msg.BlockSize)
-	key := writeKey(msg.FileID, msg.BlockIdx)
-	df.mu.Lock()
-	f := df.file
-	df.mu.Unlock()
-	if err := ft.ow.SubmitAndWaitFile(f, key, offset, getZeroBuf(int(expected))); err != nil {
-		return fmt.Errorf("write zero block %d of file %d: %w", msg.BlockIdx, msg.FileID, err)
-	}
-	df.mu.Lock()
-	df.lastActive = time.Now()
-	df.mu.Unlock()
-	ack := &Msg{MagicHead: magicBytes, Op: uint8(OpAck), FileID: msg.FileID, BlockIdx: msg.BlockIdx, BlockSize: msg.BlockSize, FileSize: df.size}
-	return sendMsg(conn, ack)
+	return writeAndAck(conn, magicBytes, df, ft, msg, getZeroBuf(int(expected)))
 }
 
 func handleBlockData(conn net.Conn, r *bufio.Reader, magicBytes [magicLen]byte, sess *dirSession, ft *fileTable, msg *Msg) error {
@@ -1239,19 +1263,7 @@ func handleBlockData(conn net.Conn, r *bufio.Reader, magicBytes [magicLen]byte, 
 		return fmt.Errorf("file %d block %d has invalid decoded size %d", msg.FileID, msg.BlockIdx, len(payload))
 	}
 
-	offset := int64(msg.BlockIdx) * int64(msg.BlockSize)
-	key := writeKey(msg.FileID, msg.BlockIdx)
-	df.mu.Lock()
-	f := df.file
-	df.mu.Unlock()
-	if err := ft.ow.SubmitAndWaitFile(f, key, offset, payload); err != nil {
-		return fmt.Errorf("write file %d block %d: %w", msg.FileID, msg.BlockIdx, err)
-	}
-	df.mu.Lock()
-	df.lastActive = time.Now()
-	df.mu.Unlock()
-	ack := &Msg{MagicHead: magicBytes, Op: uint8(OpAck), FileID: msg.FileID, BlockIdx: msg.BlockIdx, BlockSize: msg.BlockSize, FileSize: df.size}
-	return sendMsg(conn, ack)
+	return writeAndAck(conn, magicBytes, df, ft, msg, payload)
 }
 
 func handleTreeDone(conn net.Conn, magicBytes [magicLen]byte, st *dirServerState, msg *Msg, doneChan chan struct{}) error {
