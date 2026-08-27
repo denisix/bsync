@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -1288,4 +1289,304 @@ func TestE2EDirExcludeEndToEnd(t *testing.T) {
 			t.Errorf("%s should have been excluded but exists at the destination", excluded)
 		}
 	}
+}
+
+// TestE2EDirServerIdleTimerResetsAfterConnectionCloses is a regression test
+// for A2: idleTimer.Stop() ran on the FIRST accepted connection, but
+// nothing ever called Reset -- once any client had ever connected, the
+// idle-timeout escape hatch was permanently dead, so a client that
+// connected and then vanished (crash, network partition, or any other bug)
+// left startDirServer blocked in its select loop forever. Connects and
+// immediately disconnects without ever completing the protocol, then
+// asserts the server still gives up within a bounded time instead of
+// hanging.
+func TestE2EDirServerIdleTimerResetsAfterConnectionCloses(t *testing.T) {
+	savedIdle := dirIdlePeriod
+	dirIdlePeriod = 200 * time.Millisecond
+	defer func() { dirIdlePeriod = savedIdle }()
+
+	resetEngineGlobals()
+	dst := t.TempDir()
+	port := freeTCPPort(t)
+	addr := "127.0.0.1:" + port
+	srvErrCh := make(chan error, 1)
+	go func() { srvErrCh <- startDirServer(dst, "127.0.0.1", port, 1, true) }()
+	waitForListener(t, addr)
+
+	// Connect (this is what stops the FIRST idle timer) and immediately
+	// disconnect without sending anything -- simulating a vanished client.
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	conn.Close()
+
+	select {
+	case err := <-srvErrCh:
+		if err == nil {
+			t.Fatal("startDirServer unexpectedly succeeded after its only client vanished")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("startDirServer did not time out -- the idle timer never reset (A2 regression)")
+	}
+}
+
+// TestE2EDirControlConnectionSurvivesLongIdleBetweenFiles is a regression
+// test for A4: the control connection used the same short ioTimeout as
+// every worker connection, but it legitimately sends nothing between
+// OpAnnounceEnd and the first OpFileDone -- for a slow file or a slow link,
+// easily longer than ioTimeout. Shrinks ioTimeout drastically (so a control
+// connection using it would time out almost immediately) while leaving
+// ctrlIoTimeout comfortably longer than the test's own delay, then confirms
+// the transfer still completes normally despite an idle gap on the control
+// connection that would fail the OLD uniform-deadline behavior.
+//
+// The delay must be spread across many small per-chunk hops on the WORKER
+// connection (one 20KB file cut into 10 blocks via a small blockSizeCap),
+// each comfortably under ioTimeout on its own, so their cumulative sum is
+// what exceeds ioTimeout on the control connection's idle gap -- not any
+// single worker round-trip, which would just make the worker connection
+// itself time out instead of exercising the control-connection path this
+// test targets. This was empirically double-checked: an earlier version of
+// this test (single 1-byte file, one big delayPerChunk) was found to pass
+// even with the A4 fix entirely disabled, because the real gap between
+// OpAnnounceEnd and OpFileDone for a trivial one-block file turned out to
+// be far smaller than assumed (~80ms against a 150ms ioTimeout). This
+// version was verified, by temporarily disabling the ctrlIoTimeout branch
+// in server_dir.go and rebuilding, to actually FAIL (a broken-pipe /
+// io-timeout error) without the fix, and PASS with it restored.
+func TestE2EDirControlConnectionSurvivesLongIdleBetweenFiles(t *testing.T) {
+	savedIoTimeout := ioTimeout
+	savedCtrlIoTimeout := ctrlIoTimeout
+	ioTimeout = 100 * time.Millisecond
+	ctrlIoTimeout = 5 * time.Second
+	defer func() {
+		ioTimeout = savedIoTimeout
+		ctrlIoTimeout = savedCtrlIoTimeout
+	}()
+
+	resetEngineGlobals()
+	src := t.TempDir()
+	mustWriteFile(t, filepath.Join(src, "f.txt"), strings.Repeat("x", 20*1024))
+
+	dst := t.TempDir()
+	port := freeTCPPort(t)
+	realAddr := "127.0.0.1:" + port
+	srvErrCh := make(chan error, 1)
+	go func() { srvErrCh <- startDirServer(dst, "127.0.0.1", port, 1, true) }()
+	waitForListener(t, realAddr)
+	// Delay every chunk so the SUM of per-block hops on the worker
+	// connection comfortably exceeds the (deliberately shrunk) worker
+	// ioTimeout by the time OpFileDone finally reaches the control
+	// connection, while each individual hop stays well under ioTimeout
+	// (so the worker connection itself never times out) and the whole
+	// transfer still finishes well within ctrlIoTimeout.
+	proxyAddr, proxy := startFaultyProxy(t, realAddr, 0, 0, 0)
+	proxy.delayPerChunk = 15 * time.Millisecond
+
+	sess, err := startDirClient(src, proxyAddr, 2048, true, 1, nil)
+	if err != nil {
+		t.Fatalf("startDirClient: %v (control connection should have survived the idle gap via ctrlIoTimeout)", err)
+	}
+	if err := <-srvErrCh; err != nil {
+		t.Fatalf("startDirServer: %v", err)
+	}
+	if sess.FailedCount() != 0 {
+		t.Fatalf("%d failed file(s)", sess.FailedCount())
+	}
+	assertTreesEqual(t, src, dst)
+}
+
+// TestE2EDirSingleWorkerManyFilesConnectionChurn covers a worker-pool gap:
+// workers=1 against a few-hundred-file tree means every single file's
+// OpFileOpen/OpBlockCheck/OpBlockData/OpFileClose cycle serializes onto the
+// SAME connection (dirWorkerBind's "same conn, different file" rebind path,
+// not a fresh dial per file) -- unlike every other many-file test in this
+// suite, which spreads files across multiple workers/connections and so
+// never exercises that one connection carrying hundreds of file
+// open/close cycles back to back.
+func TestE2EDirSingleWorkerManyFilesConnectionChurn(t *testing.T) {
+	src := t.TempDir()
+	const nDirs = 5
+	const filesPerDir = 60 // 300 files, one worker, one connection
+	for d := 0; d < nDirs; d++ {
+		dir := filepath.Join(src, fmt.Sprintf("dir%02d", d))
+		mustMkdirAll(t, dir)
+		for f := 0; f < filesPerDir; f++ {
+			mustWriteFile(t, filepath.Join(dir, fmt.Sprintf("f%03d.txt", f)), string(randomBytes(150, int64(d*1000+f))))
+		}
+	}
+	dst, sess := runDirTransfer(t, src, 1, false)
+	assertTreesEqual(t, src, dst)
+	if want := nDirs * filesPerDir; int(sess.filesDone.Load()) != want {
+		t.Errorf("filesDone = %d, want %d", sess.filesDone.Load(), want)
+	}
+}
+
+// TestE2EDirWorkerPermanentFailureStillSendsFileDoneForOtherFiles is a
+// regression/invariant test for the thing A5's counter-correction and
+// runDirTransferWorker's "count every block as resolved, not just
+// successful ones" comment both depend on: when a block exhausts every
+// retry and the worker gives up on it PERMANENTLY (not a redial that
+// eventually succeeds, which TestE2EDirSurvivesMidTransferConnectionDrops
+// already covers), recordBlockDone must still fire for that block so
+// OpFileDone is still sent for its file -- otherwise one permanently
+// unlucky file would hang the ENTIRE tree in WaitAllFinalized, not just
+// fail its own file. Kills exactly maxRetries worker connections (after
+// sparing the control connection's own first dial), exhausting the first
+// file's block-0 retry budget entirely; the worker's later dial for the
+// second file is outside the proxy's kill budget and succeeds normally.
+func TestE2EDirWorkerPermanentFailureStillSendsFileDoneForOtherFiles(t *testing.T) {
+	resetEngineGlobals()
+	src := t.TempDir()
+	mustWriteFile(t, filepath.Join(src, "a-bad.txt"), string(randomBytes(2000, 1)))
+	mustWriteFile(t, filepath.Join(src, "b-good.txt"), string(randomBytes(2000, 2)))
+	dst := t.TempDir()
+
+	port := freeTCPPort(t)
+	realAddr := "127.0.0.1:" + port
+	srvErrCh := make(chan error, 1)
+	go func() { srvErrCh <- startDirServer(dst, "127.0.0.1", port, 1, true) }()
+	waitForListener(t, realAddr)
+
+	// skipFirst=1 spares the control connection; killConns=maxRetries kills
+	// every one of the single worker's dial attempts for "a-bad.txt"'s only
+	// block, exhausting its retry budget entirely (unlike the
+	// TestE2EDirSurvivesMidTransferConnectionDrops case, which spares the
+	// LAST attempt so it recovers).
+	proxyAddr, _ := startFaultyProxy(t, realAddr, 1, maxRetries, 200)
+
+	sess, err := startDirClient(src, proxyAddr, 0, true, 1, nil)
+	if err != nil {
+		t.Fatalf("startDirClient: %v (a permanently failed file must not fail the whole client-side call)", err)
+	}
+	select {
+	case err := <-srvErrCh:
+		if err != nil {
+			t.Fatalf("startDirServer: %v", err)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("startDirServer did not exit -- the permanently-failed file's OpFileDone was never sent, hanging WaitAllFinalized")
+	}
+
+	if got := sess.FailedCount(); got != 1 {
+		t.Fatalf("FailedCount = %d, want exactly 1 (only a-bad.txt)", got)
+	}
+	var badID, goodID uint32 = 1<<32 - 1, 1<<32 - 1
+	for i := 0; i < sess.FileCount(); i++ {
+		fe := sess.FileByID(uint32(i))
+		switch fe.RelPath {
+		case "a-bad.txt":
+			badID = fe.ID
+		case "b-good.txt":
+			goodID = fe.ID
+		}
+	}
+	if badID == 1<<32-1 || goodID == 1<<32-1 {
+		t.Fatalf("could not find both files by RelPath")
+	}
+	if !sess.isFailed(badID) {
+		t.Error("a-bad.txt: expected isFailed == true")
+	}
+	if sess.isFailed(goodID) {
+		t.Error("b-good.txt: expected isFailed == false (should have transferred normally)")
+	}
+	got, err := os.ReadFile(filepath.Join(dst, "b-good.txt"))
+	if err != nil {
+		t.Fatalf("reading b-good.txt at destination: %v", err)
+	}
+	want, err := os.ReadFile(filepath.Join(src, "b-good.txt"))
+	if err != nil {
+		t.Fatalf("reading b-good.txt at source: %v", err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Error("b-good.txt: destination content does not match source, despite a-bad.txt being the only file that should have failed")
+	}
+}
+
+// TestE2EDirServerConnectionChurnDuringShutdownRace is a regression/stress
+// test for A3: startDirServer used to return (and its `defer ow.Close()`
+// run) as soon as doneChan closed, with nothing waiting for in-flight
+// dirHandleConn goroutines -- one still inside handleBlockData/
+// handleBlockZero at that instant would send to the now-closed ow.ch and
+// panic the whole process. The fix (connWG, with `defer connWG.Wait()`
+// declared AFTER `defer ow.Close()` so LIFO ordering runs the Wait first)
+// makes this correct regardless of timing, not just "usually fine" -- so
+// this test's job is to maximize goroutine-scheduling entropy around the
+// exact moment doneChan closes and let the race detector (`go test -race`)
+// and a plain "did the server panic" check confirm nothing slips through.
+// A steady stream of raw connect-then-immediately-disconnect connections
+// runs concurrently with a real multi-worker, multi-file transfer, kept
+// alive until just after the transfer's own OpTreeDone has landed, so
+// several of those churn connections are in various stages of being
+// accepted/read/torn down at the exact moment the server decides to shut
+// down. This is intentionally NOT a byte-for-byte reproduction of the
+// original write-to-closed-channel panic (which required a live in-flight
+// write racing ow.Close, not just connection churn) -- doneChan can only
+// close once every real block has already been acknowledged (the client's
+// own wg.Wait() gates sending OpTreeDone), so that exact window is not
+// independently reproducible from outside the package without reaching
+// into server_dir.go's unexported locals. This test instead pins down the
+// weaker, still-valuable invariant that connWG's wait tolerates a busy,
+// actively-churning connection count at shutdown without panicking or
+// hanging -- run under `-race` (as this whole suite's own verification
+// pipeline always does) it also stands a real chance of catching a
+// reintroduced version of the underlying bug.
+func TestE2EDirServerConnectionChurnDuringShutdownRace(t *testing.T) {
+	resetEngineGlobals()
+	src := t.TempDir()
+	for i := 0; i < 40; i++ {
+		mustWriteFile(t, filepath.Join(src, fmt.Sprintf("f%02d.bin", i)), string(randomBytes(3000, int64(i))))
+	}
+	dst := t.TempDir()
+
+	port := freeTCPPort(t)
+	addr := "127.0.0.1:" + port
+	srvErrCh := make(chan error, 1)
+	go func() { srvErrCh <- startDirServer(dst, "127.0.0.1", port, 6, true) }()
+	waitForListener(t, addr)
+
+	churnDone := make(chan struct{})
+	var churnWG sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		churnWG.Add(1)
+		go func() {
+			defer churnWG.Done()
+			for {
+				select {
+				case <-churnDone:
+					return
+				default:
+				}
+				conn, err := net.Dial("tcp", addr)
+				if err != nil {
+					continue // server may be mid-shutdown; that's fine, just stop trying
+				}
+				conn.Close()
+			}
+		}()
+	}
+
+	sess, err := startDirClient(src, addr, 0, true, 6, nil)
+	// Give the churners a little more time to keep hammering right around
+	// OpTreeDone/shutdown before signaling them to stop.
+	time.Sleep(20 * time.Millisecond)
+	close(churnDone)
+	churnWG.Wait()
+
+	if err != nil {
+		t.Fatalf("startDirClient: %v", err)
+	}
+	select {
+	case err := <-srvErrCh:
+		if err != nil {
+			t.Fatalf("startDirServer: %v", err)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("startDirServer did not exit within 15s")
+	}
+	if sess.FailedCount() != 0 {
+		t.Fatalf("%d failed file(s)", sess.FailedCount())
+	}
+	assertTreesEqual(t, src, dst)
 }
