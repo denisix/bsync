@@ -584,12 +584,17 @@ echo "in a" >"$DIR_SRC/a/one.txt"
 echo "in a/b" >"$DIR_SRC/a/b/two.txt"
 echo "in c" >"$DIR_SRC/c/three.txt"
 echo "excluded" >"$DIR_SRC/skip.log"
+echo "excluded by substring glob" >"$DIR_SRC/a/my_some_file_name_v2.txt"
 if command -v ln >/dev/null 2>&1; then
   ln -sf top.txt "$DIR_SRC/a_symlink" 2>/dev/null || true
 fi
 
+# Comma-separated multi-pattern -exclude, including a *substring* glob (not
+# just a suffix like *.log) -- this is the one place in the whole suite that
+# exercises main.go's own comma-split flag parsing; every Go-level exclude
+# test injects a pre-built []string directly, bypassing it.
 set +e
-"$BSYNC_BIN" -q -f "$DIR_SRC" -t "$DIR_DST" -w 4 -exclude "*.log"
+"$BSYNC_BIN" -q -f "$DIR_SRC" -t "$DIR_DST" -w 4 -exclude "*.log,*some_file_name*"
 exit_code=$?
 set -e
 
@@ -600,6 +605,10 @@ if [ "$exit_code" != "0" ]; then
 else
   if [ -e "$DIR_DST/skip.log" ]; then
     echo "✗ FAIL: excluded file skip.log was synced anyway"
+    dir_test_passed=false
+  fi
+  if [ -e "$DIR_DST/a/my_some_file_name_v2.txt" ]; then
+    echo "✗ FAIL: excluded file a/my_some_file_name_v2.txt (substring glob) was synced anyway"
     dir_test_passed=false
   fi
   if [ -e "$DIR_DST/a_symlink" ]; then
@@ -613,14 +622,14 @@ else
   # Compare everything except the deliberately-excluded/skipped entries: list
   # both trees and diff the sorted relative-path sets, then diff -r the
   # files that ARE expected to exist on both sides.
-  src_set=$(cd "$DIR_SRC" && find . -type f ! -name '*.log' ! -name 'a_symlink' | sort)
+  src_set=$(cd "$DIR_SRC" && find . -type f ! -name '*.log' ! -name '*some_file_name*' ! -name 'a_symlink' | sort)
   dst_set=$(cd "$DIR_DST" && find . -type f | sort)
   if [ "$src_set" != "$dst_set" ]; then
     echo "✗ FAIL: file set mismatch"
     echo "  src: $src_set"
     echo "  dst: $dst_set"
     dir_test_passed=false
-  elif ! diff -r --no-dereference -x '*.log' -x 'a_symlink' "$DIR_SRC" "$DIR_DST" >/tmp/dirdiff.$$ 2>&1; then
+  elif ! diff -r --no-dereference -x '*.log' -x '*some_file_name*' -x 'a_symlink' "$DIR_SRC" "$DIR_DST" >/tmp/dirdiff.$$ 2>&1; then
     echo "✗ FAIL: diff -r found differences:"
     cat /tmp/dirdiff.$$
     dir_test_passed=false
@@ -640,7 +649,7 @@ echo ""
 echo "[TEST $((TOTAL_TESTS + 1))] Directory-tree mode: re-run is idempotent (exit 0, unchanged)"
 TOTAL_TESTS=$((TOTAL_TESTS + 1))
 set +e
-"$BSYNC_BIN" -q -f "$DIR_SRC" -t "$DIR_DST" -w 4 -exclude "*.log"
+"$BSYNC_BIN" -q -f "$DIR_SRC" -t "$DIR_DST" -w 4 -exclude "*.log,*some_file_name*"
 exit_code=$?
 set -e
 if [ "$exit_code" = "0" ]; then
@@ -674,6 +683,24 @@ for flag_desc in "-s 5:resume (-s)" "-d:download (-d)" "-auto:auto-tune (-auto)"
   fi
   echo ""
 done
+
+# Mirror case: -exclude is a directory-mode-only flag; using it against a
+# plain (non-directory) -f target must be rejected too, not silently ignored.
+echo "[TEST $((TOTAL_TESTS + 1))] -exclude rejected against a non-directory -f target"
+TOTAL_TESTS=$((TOTAL_TESTS + 1))
+set +e
+"$BSYNC_BIN" -q -f "$RAND_SEED" -r 127.0.0.1:1 -exclude "*.log" >/dev/null 2>&1
+exit_code=$?
+set -e
+if [ "$exit_code" = "1" ]; then
+  echo "✓ PASS: rejected with exit 1"
+  PASSED_TESTS=$((PASSED_TESTS + 1))
+else
+  echo "✗ FAIL: exit code $exit_code, want 1 (-exclude against a non-directory -f target must be rejected)"
+  FAILED_TESTS=$((FAILED_TESTS + 1))
+  FAILED_TEST_NAMES+=("-exclude rejected against a non-directory -f target")
+fi
+echo ""
 
 echo ""
 echo "=========================================="

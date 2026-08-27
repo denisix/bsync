@@ -30,6 +30,19 @@ func visualEnabled() bool {
 // falls back to a random high port if probing fails. There is a tiny window
 // between probing and the server binding, but this is far more reliable than a
 // blind random pick when launching transfers in rapid succession.
+// parseExcludePatterns splits a comma-separated --exclude flag value into a
+// clean pattern list for walkSource/excluded: each element trimmed, empty
+// elements (from "", trailing/leading/doubled commas) dropped.
+func parseExcludePatterns(raw string) []string {
+	var patterns []string
+	for _, pat := range strings.Split(raw, ",") {
+		if pat = strings.TrimSpace(pat); pat != "" {
+			patterns = append(patterns, pat)
+		}
+	}
+	return patterns
+}
+
 func pickHighPort() string {
 	for i := 0; i < 10; i++ {
 		l, err := net.Listen("tcp", "127.0.0.1:0")
@@ -152,13 +165,10 @@ func main() {
 		if visual {
 			Err("directory mode does not support -v (visual block-grid display); its own progress line is always shown instead\n")
 		}
+	} else if excludeFlag != "" {
+		Err("-exclude is only supported in directory mode (-R or a directory -f target)\n")
 	}
-	var excludePatterns []string
-	for _, pat := range strings.Split(excludeFlag, ",") {
-		if pat = strings.TrimSpace(pat); pat != "" {
-			excludePatterns = append(excludePatterns, pat)
-		}
-	}
+	excludePatterns := parseExcludePatterns(excludeFlag)
 
 	// Handle encryption
 	if encKeyReceived != "" {

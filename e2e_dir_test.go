@@ -1291,6 +1291,50 @@ func TestE2EDirExcludeEndToEnd(t *testing.T) {
 	}
 }
 
+// TestE2EDirExcludeSubstringGlobEndToEnd proves the exact pattern syntax a
+// user would reach for to exclude "anything containing this substring" --
+// *some_file_name* -- works through the real client entry point, both at
+// the top level and nested (matched via excluded()'s basename arm).
+func TestE2EDirExcludeSubstringGlobEndToEnd(t *testing.T) {
+	resetEngineGlobals()
+	src := t.TempDir()
+	mustWriteFile(t, filepath.Join(src, "keep.txt"), "keep me")
+	mustWriteFile(t, filepath.Join(src, "my_some_file_name_v2.txt"), "exclude me")
+	mustMkdirAll(t, filepath.Join(src, "sub"))
+	mustWriteFile(t, filepath.Join(src, "sub", "also_some_file_name.log"), "exclude me too")
+
+	dst := t.TempDir()
+	port := freeTCPPort(t)
+	addr := "127.0.0.1:" + port
+	srvErrCh := make(chan error, 1)
+	go func() { srvErrCh <- startDirServer(dst, "127.0.0.1", port, 1, true) }()
+	waitForListener(t, addr)
+
+	sess, err := startDirClient(src, addr, 0, true, 1, []string{"*some_file_name*"})
+	if err != nil {
+		t.Fatalf("startDirClient: %v", err)
+	}
+	if err := <-srvErrCh; err != nil {
+		t.Fatalf("startDirServer: %v", err)
+	}
+	if sess.FailedCount() != 0 {
+		t.Fatalf("%d failed file(s)", sess.FailedCount())
+	}
+
+	got, err := os.ReadFile(filepath.Join(dst, "keep.txt"))
+	if err != nil {
+		t.Fatalf("keep.txt missing at destination: %v", err)
+	}
+	if string(got) != "keep me" {
+		t.Errorf("keep.txt content mismatch")
+	}
+	for _, excludedPath := range []string{"my_some_file_name_v2.txt", filepath.Join("sub", "also_some_file_name.log")} {
+		if _, err := os.Stat(filepath.Join(dst, excludedPath)); err == nil {
+			t.Errorf("%s should have been excluded but exists at the destination", excludedPath)
+		}
+	}
+}
+
 // TestE2EDirServerIdleTimerResetsAfterConnectionCloses is a regression test
 // for A2: idleTimer.Stop() ran on the FIRST accepted connection, but
 // nothing ever called Reset -- once any client had ever connected, the

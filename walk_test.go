@@ -384,6 +384,59 @@ func TestWalkTreeExcluded(t *testing.T) {
 	}
 }
 
+// TestWalkTreeExcludedSubstringGlob proves the exact syntax a --exclude user
+// would reach for to match "anything containing this substring" --
+// *some_file_name* -- actually works, at both the top level (matched via
+// excluded's full-path arm, which for a root-level entry is identical to its
+// basename) and nested (matched via the basename arm only, since path.Match's
+// '*' does not cross '/').
+func TestWalkTreeExcludedSubstringGlob(t *testing.T) {
+	root := t.TempDir()
+	mustWriteFile(t, filepath.Join(root, "my_some_file_name_v2.txt"), "x")
+	mustWriteFile(t, filepath.Join(root, "unrelated.txt"), "x")
+	mustMkdirAll(t, filepath.Join(root, "sub"))
+	mustWriteFile(t, filepath.Join(root, "sub", "also_some_file_name.log"), "x")
+
+	entries, skips := drainWalk(t, root, []string{"*some_file_name*"})
+	got := relPaths(entries)
+	for _, p := range got {
+		if p == "my_some_file_name_v2.txt" || p == "sub/also_some_file_name.log" {
+			t.Errorf("excluded path %q was emitted", p)
+		}
+	}
+	foundUnrelated := false
+	for _, p := range got {
+		if p == "unrelated.txt" {
+			foundUnrelated = true
+		}
+	}
+	if !foundUnrelated {
+		t.Errorf("non-excluded path missing from %v", got)
+	}
+	wantSkipReasons := 2 // my_some_file_name_v2.txt + sub/also_some_file_name.log
+	if len(skips) != wantSkipReasons {
+		t.Errorf("skips = %v, want %d entries", skips, wantSkipReasons)
+	}
+}
+
+// TestExcludedFullPathArmDoesNotCrossSlash directly exercises excluded()
+// (not through a walk) to prove its two matching arms -- full relative path,
+// and basename -- are independent, and that '*' correctly does not cross
+// '/': a pattern anchored to a subdirectory must not accidentally match a
+// same-named file living elsewhere in the tree.
+func TestExcludedFullPathArmDoesNotCrossSlash(t *testing.T) {
+	pattern := []string{"sub/*.tmp"}
+	if !excluded("sub/x.tmp", pattern) {
+		t.Error(`excluded("sub/x.tmp", ["sub/*.tmp"]) = false, want true (full-path arm)`)
+	}
+	if excluded("x.tmp", pattern) {
+		t.Error(`excluded("x.tmp", ["sub/*.tmp"]) = true, want false (pattern is anchored to sub/, must not match the root-level file)`)
+	}
+	if excluded("other/sub/x.tmp", pattern) {
+		t.Error(`excluded("other/sub/x.tmp", ["sub/*.tmp"]) = true, want false ('*' in the glob must not cross '/', and the full path doesn't match either)`)
+	}
+}
+
 func TestWalkTreeErrorInSubdirContinues(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("permission bits behave differently on windows")

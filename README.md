@@ -60,10 +60,27 @@ writes the destination.
 | `-q` | Quiet mode (no output) | false |
 | `-d` | Download mode: transfer from server to client | false |
 | `-P` | Suppress server-side progress output (set automatically via `-t`) | false |
+| `-R` | Force recursive directory-tree mode (auto-detected from `-f` when it's already a directory) | false |
+| `-exclude` | Comma-separated glob patterns to skip in directory mode, matched against each entry's relative path and base name (e.g. `-exclude "*.log,*tmp*"`) | - |
 
 `-K` is an internal/manual input for a shared 32-byte hexadecimal key. Direct
 network encryption requires the same key on both endpoints; for normal use,
 prefer `-e` with SSH mode (`-t`).
+
+### Directory-Tree Mode
+
+Passing a directory to `-f` (or forcing it with `-R`) switches to recursive
+directory-tree sync: `bsync` walks the source tree and syncs every file and
+empty directory to the destination, upload/push only. `-exclude` patterns are
+shell globs (`*`, `?`, `[...]`) checked against both an entry's full relative
+path and its base name — `*` does not cross `/`, so `-exclude "node_modules"`
+prunes any directory named `node_modules` at any depth, and
+`-exclude "*.log,*tmp*"` skips every `.log` file and anything with `tmp`
+anywhere in its name.
+
+```bash
+./bsync -f /data/src -t user@host:/data/dst -w 8 -exclude "*.log,node_modules,*tmp*"
+```
 
 ## 🔄 Examples
 
