@@ -42,7 +42,7 @@ func NewMMapReader(file *os.File) (*MMapReader, error) {
 	}
 
 	// Advise kernel about sequential access pattern
-	_ = syscall.Madvise(data, syscall.MADV_SEQUENTIAL)
+	madviseSequential(data)
 
 	return &MMapReader{
 		data:     data,
