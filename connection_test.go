@@ -2,12 +2,53 @@ package main
 
 import (
 	"bytes"
+	"errors"
+	"fmt"
 	"io"
 	"net"
 	"sync"
 	"testing"
 	"time"
 )
+
+// TestWithRetryPermanentErrorReturnsImmediately pins errPermanent's
+// contract: an attempt whose error wraps it must not be retried at all --
+// a deterministic peer-state rejection cannot change, and burning
+// maxRetries plus backoff PER doomed entry turns a full-disk failure of
+// thousands of files into hours of pointless churn.
+func TestWithRetryPermanentErrorReturnsImmediately(t *testing.T) {
+	attempts := 0
+	start := time.Now()
+	err := withRetry(func(retry int) error {
+		attempts++
+		return fmt.Errorf("rejected: %w", errPermanent)
+	}, nil)
+	if err == nil || !errors.Is(err, errPermanent) {
+		t.Fatalf("err = %v, want an errPermanent-wrapped error", err)
+	}
+	if attempts != 1 {
+		t.Errorf("attempts = %d, want 1 -- a permanent error must never be retried", attempts)
+	}
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Errorf("took %v -- backoff sleep ran despite the permanent error", elapsed)
+	}
+}
+
+// TestWithRetryOrdinaryErrorStillRetries: the permanent early-out must not
+// change the ordinary path -- a plain error still gets the full maxRetries.
+func TestWithRetryOrdinaryErrorStillRetries(t *testing.T) {
+	attempts := 0
+	err := withRetry(func(retry int) error {
+		attempts++
+		return fmt.Errorf("transient")
+	}, nil)
+	if err == nil {
+		t.Fatal("want an error after exhausting retries")
+	}
+	if attempts != maxRetries {
+		t.Errorf("attempts = %d, want %d", attempts, maxRetries)
+	}
+}
 
 // TestSetTCPBufferSize tests that TCP buffer size can be set.
 func TestSetTCPBufferSize(t *testing.T) {
@@ -176,7 +217,6 @@ func TestAutoReconnectTCPReconnect(t *testing.T) {
 		t.Log("Note: Server may not have accepted second connection (connection reuse)")
 	}
 }
-
 
 // TestAutoReconnectTCPAddresses tests LocalAddr and RemoteAddr.
 func TestAutoReconnectTCPAddresses(t *testing.T) {

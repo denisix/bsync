@@ -13,7 +13,7 @@ import (
 // freeTCPPort asks the OS for an unused port on loopback and returns it as a
 // string. There is a tiny race between closing the probe listener and the
 // server re-binding, but it is acceptable for tests.
-func freeTCPPort(t *testing.T) string {
+func freeTCPPort(t testing.TB) string {
 	t.Helper()
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -56,11 +56,15 @@ func resetEngineGlobals() {
 	// crypto state
 	encryptionKey = nil
 	aeadOnce = sync.Once{}
+
+	// Compression state: pooled encoders carry the window they were built
+	// with (derived from blockSize), and tests change blockSize freely.
+	resetEncoderPool()
 }
 
 // waitForListener dials addr until the connection succeeds or the deadline
 // passes, so a test never races the server's listener startup.
-func waitForListener(t *testing.T, addr string) {
+func waitForListener(t testing.TB, addr string) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
@@ -75,7 +79,7 @@ func waitForListener(t *testing.T, addr string) {
 }
 
 // writeTempFile creates a temp file seeded with data and returns its path.
-func writeTempFile(t *testing.T, data []byte) string {
+func writeTempFile(t testing.TB, data []byte) string {
 	t.Helper()
 	f, err := os.CreateTemp(t.TempDir(), "bsync-*")
 	if err != nil {

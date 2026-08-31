@@ -169,12 +169,9 @@ func runDownload(t *testing.T, src []byte, o e2eOpts) {
 		serverBlock = o.serverBlock
 	}
 	blockSize = serverBlock
+	// A download source runs no checksum precompute (see main.go); the empty
+	// cache only satisfies startServerUpload's signature.
 	srcCache := NewChecksumCache(0)
-	if fileSize > 0 {
-		lastBlock := uint32((fileSize - 1) / uint64(serverBlock))
-		srcCache = NewChecksumCache(lastBlock)
-		go precomputeChecksums(srcFile, serverBlock, lastBlock, srcCache, 0, o.workers)
-	}
 
 	port := freeTCPPort(t)
 	addr := "127.0.0.1:" + port

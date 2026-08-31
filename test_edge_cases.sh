@@ -702,6 +702,60 @@ else
 fi
 echo ""
 
+# Same mirror case for -quick-check: directory-mode-only, must be rejected
+# (not silently ignored) against a non-directory -f target.
+echo "[TEST $((TOTAL_TESTS + 1))] -quick-check rejected against a non-directory -f target"
+TOTAL_TESTS=$((TOTAL_TESTS + 1))
+set +e
+"$BSYNC_BIN" -q -f "$RAND_SEED" -r 127.0.0.1:1 -quick-check >/dev/null 2>&1
+exit_code=$?
+set -e
+if [ "$exit_code" = "1" ]; then
+  echo "✓ PASS: rejected with exit 1"
+  PASSED_TESTS=$((PASSED_TESTS + 1))
+else
+  echo "✗ FAIL: exit code $exit_code, want 1 (-quick-check against a non-directory -f target must be rejected)"
+  FAILED_TESTS=$((FAILED_TESTS + 1))
+  FAILED_TEST_NAMES+=("-quick-check rejected against a non-directory -f target")
+fi
+echo ""
+
+# Same mirror case for -delete: directory-mode-only, must be rejected
+# (not silently ignored) against a non-directory -f target.
+echo "[TEST $((TOTAL_TESTS + 1))] -delete rejected against a non-directory -f target"
+TOTAL_TESTS=$((TOTAL_TESTS + 1))
+set +e
+"$BSYNC_BIN" -q -f "$RAND_SEED" -r 127.0.0.1:1 -delete >/dev/null 2>&1
+exit_code=$?
+set -e
+if [ "$exit_code" = "1" ]; then
+  echo "✓ PASS: rejected with exit 1"
+  PASSED_TESTS=$((PASSED_TESTS + 1))
+else
+  echo "✗ FAIL: exit code $exit_code, want 1 (-delete against a non-directory -f target must be rejected)"
+  FAILED_TESTS=$((FAILED_TESTS + 1))
+  FAILED_TEST_NAMES+=("-delete rejected against a non-directory -f target")
+fi
+echo ""
+
+# Same mirror case for -links: directory-mode-only, must be rejected
+# (not silently ignored) against a non-directory -f target.
+echo "[TEST $((TOTAL_TESTS + 1))] -links rejected against a non-directory -f target"
+TOTAL_TESTS=$((TOTAL_TESTS + 1))
+set +e
+"$BSYNC_BIN" -q -f "$RAND_SEED" -r 127.0.0.1:1 -links >/dev/null 2>&1
+exit_code=$?
+set -e
+if [ "$exit_code" = "1" ]; then
+  echo "✓ PASS: rejected with exit 1"
+  PASSED_TESTS=$((PASSED_TESTS + 1))
+else
+  echo "✗ FAIL: exit code $exit_code, want 1 (-links against a non-directory -f target must be rejected)"
+  FAILED_TESTS=$((FAILED_TESTS + 1))
+  FAILED_TEST_NAMES+=("-links rejected against a non-directory -f target")
+fi
+echo ""
+
 echo ""
 echo "=========================================="
 echo "TEST SUMMARY"

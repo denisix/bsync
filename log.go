@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"strings"
 	"sync"
@@ -38,6 +39,23 @@ func getLogState() (string, bool) {
 	return logPrefix, quiet
 }
 
+// logOut is where Log writes when the visualizer is off. It is os.Stdout in
+// production; the transfer benchmarks point it at io.Discard so that the
+// READY line (deliberately printed even under -q, because the SSH launcher
+// waits for it) does not interleave with the benchmark result lines.
+var logOut atomic.Pointer[io.Writer]
+
+func setLogOutput(w io.Writer) {
+	logOut.Store(&w)
+}
+
+func logWriter() io.Writer {
+	if p := logOut.Load(); p != nil {
+		return *p
+	}
+	return os.Stdout
+}
+
 func setQuiet(q bool) {
 	logStateMu.Lock()
 	quiet = q
@@ -61,7 +79,7 @@ func Log(format string, args ...interface{}) {
 		return
 	}
 
-	fmt.Print(formatted)
+	fmt.Fprint(logWriter(), formatted)
 }
 
 func Err(format string, args ...interface{}) {

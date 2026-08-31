@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"encoding/binary"
+	"math/rand"
 	"testing"
 )
 
@@ -144,6 +146,9 @@ func TestAnnounceBatchRoundTrip(t *testing.T) {
 		{FileID: 2, Kind: KindSkipped, Path: "a/symlink"},
 		{FileID: 3, Kind: KindFile, Path: "ünïcödé/файл with spaces.bin"},
 		{FileID: 4, Kind: KindFile, Path: ""}, // encoder doesn't validate paths; that's sanitizeRelPath's job
+		{FileID: 5, Kind: KindSymlink, Path: "a/rel-link", LinkTarget: "b/c.txt"},
+		{FileID: 6, Kind: KindSymlink, Path: "abs-link", LinkTarget: "/etc/hostname"},
+		{FileID: 7, Kind: KindSymlink, Path: "weird-link", LinkTarget: "тарget with spaces/../x"},
 	}
 	encoded, err := encodeAnnounceBatch(recs)
 	if err != nil {
@@ -178,7 +183,10 @@ func TestAnnounceBatchEmpty(t *testing.T) {
 }
 
 func TestDecodeAnnounceBatchRejectsTruncated(t *testing.T) {
-	encoded, err := encodeAnnounceBatch([]AnnounceRec{{FileID: 1, Kind: KindFile, Path: "a/b.txt"}})
+	// A symlink record (with a target trailer) so every byte of the
+	// extended ver0.04 layout -- including TargetLen and the target bytes
+	// -- is covered by the per-byte truncation sweep.
+	encoded, err := encodeAnnounceBatch([]AnnounceRec{{FileID: 1, Kind: KindSymlink, Path: "a/b.txt", LinkTarget: "c/d.txt"}})
 	if err != nil {
 		t.Fatalf("encode: %v", err)
 	}
@@ -194,5 +202,160 @@ func TestDecodeAnnounceBatchRejectsAbsurdCount(t *testing.T) {
 	binary.LittleEndian.PutUint32(buf, announceBatchMaxRecs+1)
 	if _, err := decodeAnnounceBatch(buf); err == nil {
 		t.Error("a record count over the sanity limit was unexpectedly accepted")
+	}
+}
+
+func TestSkipListRoundTrip(t *testing.T) {
+	ids := []uint32{0, 1, 7, 1000000, 4294967295}
+	encoded, err := encodeSkipList(ids)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	decoded, err := decodeSkipList(encoded)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(decoded) != len(ids) {
+		t.Fatalf("got %d ids, want %d", len(decoded), len(ids))
+	}
+	for i := range ids {
+		if decoded[i] != ids[i] {
+			t.Errorf("id %d mismatch: got %d, want %d", i, decoded[i], ids[i])
+		}
+	}
+}
+
+func TestSkipListEmpty(t *testing.T) {
+	encoded, err := encodeSkipList(nil)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	decoded, err := decodeSkipList(encoded)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(decoded) != 0 {
+		t.Errorf("got %d ids, want 0", len(decoded))
+	}
+}
+
+func TestDecodeSkipListRejectsTruncated(t *testing.T) {
+	encoded, err := encodeSkipList([]uint32{1, 2, 3})
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	for cut := 0; cut < len(encoded); cut++ {
+		if _, err := decodeSkipList(encoded[:cut]); err == nil {
+			t.Errorf("truncated to %d/%d bytes was unexpectedly accepted", cut, len(encoded))
+		}
+	}
+}
+
+func TestDecodeSkipListRejectsAbsurdCount(t *testing.T) {
+	buf := make([]byte, 4)
+	binary.LittleEndian.PutUint32(buf, skipListMaxRecs+1)
+	if _, err := decodeSkipList(buf); err == nil {
+		t.Error("a count over the sanity limit was unexpectedly accepted")
+	}
+}
+
+func TestValidateDirClientFrameAnnounceFlags(t *testing.T) {
+	valid := []*Msg{
+		{Op: uint8(OpAnnounce), DataSize: 1},
+		{Op: uint8(OpAnnounce), DataSize: 1, Flags: FlagQuickCheck},
+	}
+	for _, msg := range valid {
+		if err := validateDirClientFrame(msg); err != nil {
+			t.Errorf("valid announce message %+v rejected: %v", msg, err)
+		}
+	}
+	invalid := []*Msg{
+		{Op: uint8(OpAnnounce), DataSize: 1, Flags: FlagCompressed},
+		{Op: uint8(OpAnnounce), DataSize: 1, Flags: FlagQuickCheck | FlagCompressed},
+	}
+	for _, msg := range invalid {
+		if err := validateDirClientFrame(msg); err == nil {
+			t.Errorf("invalid announce message %+v accepted", msg)
+		}
+	}
+}
+
+func TestValidateDirClientFrameTreeDoneAndAnnounceEndFlags(t *testing.T) {
+	valid := []*Msg{
+		{Op: uint8(OpTreeDone)},
+		{Op: uint8(OpAnnounceEnd)},
+		// FlagDelete rides on OpAnnounceEnd (delete-before-transfer): the
+		// delete pass runs the moment the announce stream is complete,
+		// before any file content moves.
+		{Op: uint8(OpAnnounceEnd), Flags: FlagDelete},
+	}
+	for _, msg := range valid {
+		if err := validateDirClientFrame(msg); err != nil {
+			t.Errorf("valid message %+v rejected: %v", msg, err)
+		}
+	}
+	invalid := []*Msg{
+		// OpTreeDone never accepts flags -- FlagDelete moved to
+		// OpAnnounceEnd when -delete became delete-before.
+		{Op: uint8(OpTreeDone), Flags: FlagDelete},
+		{Op: uint8(OpTreeDone), Flags: FlagQuickCheck},
+		{Op: uint8(OpTreeDone), DataSize: 1},
+		{Op: uint8(OpAnnounceEnd), Flags: FlagQuickCheck},
+		{Op: uint8(OpAnnounceEnd), Flags: FlagDelete | FlagCompressed},
+		{Op: uint8(OpAnnounceEnd), DataSize: 1},
+	}
+	for _, msg := range invalid {
+		if err := validateDirClientFrame(msg); err == nil {
+			t.Errorf("invalid message %+v accepted", msg)
+		}
+	}
+}
+
+// TestPackMatchesBinaryWrite pins the hand-rolled encoder/decoder to the
+// exact byte layout encoding/binary produced for Msg, so replacing the
+// reflective binary.Write/Read (a per-frame reflection walk plus a
+// bytes.Buffer allocation, several times per block) could not change the
+// wire format.
+func TestPackMatchesBinaryWrite(t *testing.T) {
+	r := rand.New(rand.NewSource(7))
+	for i := 0; i < 2000; i++ {
+		m := &Msg{
+			Op:        uint8(r.Intn(256)),
+			Flags:     uint8(r.Intn(256)),
+			FileID:    r.Uint32(),
+			BlockIdx:  r.Uint32(),
+			BlockSize: r.Uint32(),
+			FileSize:  r.Uint64(),
+			DataSize:  r.Uint32(),
+		}
+		r.Read(m.MagicHead[:])
+		r.Read(m.Reserved[:])
+
+		got, err := pack(m)
+		if err != nil {
+			t.Fatalf("pack: %v", err)
+		}
+		var want bytes.Buffer
+		if err := binary.Write(&want, binary.LittleEndian, m); err != nil {
+			t.Fatalf("binary.Write: %v", err)
+		}
+		if !bytes.Equal(got, want.Bytes()) {
+			t.Fatalf("pack layout differs from binary.Write:\n got %x\nwant %x", got, want.Bytes())
+		}
+
+		back, err := unpack(got)
+		if err != nil {
+			t.Fatalf("unpack: %v", err)
+		}
+		if *back != *m {
+			t.Fatalf("unpack round trip: got %+v, want %+v", *back, *m)
+		}
+		ref := &Msg{}
+		if err := binary.Read(bytes.NewReader(got), binary.LittleEndian, ref); err != nil {
+			t.Fatalf("binary.Read: %v", err)
+		}
+		if *ref != *back {
+			t.Fatalf("unpack differs from binary.Read: got %+v, want %+v", *back, *ref)
+		}
 	}
 }

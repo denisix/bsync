@@ -20,7 +20,24 @@ const magicLen = 17
 // non-zero FileIDs and the currently-unused announce/tree opcodes below.
 // README documents that both endpoints must be built from the same commit,
 // so there is no v0.02 interop path.
-var magicHead = "blockSync-ver0.03"
+//
+// ver0.04 extends the OpAnnounce trailer's record layout with a LinkTarget
+// field (see encodeAnnounceBatch) for -links symlink syncing. Bumped so a
+// version-mismatched pair fails with a clean "invalid magic" instead of a
+// garbled trailer decode.
+//
+// ver0.06 replaces the block hash (FNV-128a -> SHA-256 truncated to 16
+// bytes). The digest WIDTH is unchanged, so nothing about the frame layout
+// moves -- but the bytes two endpoints compare no longer agree across the
+// change, and a mismatched pair would silently conclude every block differs
+// and retransmit the entire tree. Bumped so they fail up front instead.
+//
+// ver0.05 adds the KindSpecial record kind (-specials FIFO/socket syncing).
+// The record LAYOUT is unchanged -- the node type rides in the existing Mode
+// field -- but an older server rejects the unknown kind mid-stream and kills
+// the control connection, so the version is bumped to turn that into the
+// same clean up-front "invalid magic" failure.
+var magicHead = "blockSync-ver0.06"
 
 // Op identifies the kind of a message. Reserved is 5 zero bytes so a future
 // field can be added without bumping magicHead again.
@@ -55,6 +72,16 @@ const (
 	OpFileAck     Op = 22 // response to OpFileOpen
 	OpTreeAck     Op = 23 // destination is consistent; safe to exit
 	OpError       Op = 24 // trailer: a UTF-8 error message
+	OpAnnounceAck Op = 25 // response to an OpAnnounce carrying FlagQuickCheck;
+	// trailer: a skip-list of FileIDs the destination already has (see
+	// encodeSkipList) -- sent even when the list is empty, since the
+	// client blocks on exactly one reply per quick-check batch.
+	OpAnnounceEndAck Op = 26 // response to an OpAnnounceEnd carrying
+	// FlagDelete: the destination's delete pass (deleteExtraneous) has
+	// completed, so it is now safe for the client to start transferring
+	// file content. BlockIdx carries the removed-entry count (informational).
+	// Never sent for a plain OpAnnounceEnd -- without FlagDelete the control
+	// stream stays strictly one-way until OpTreeAck.
 )
 
 const (
@@ -64,11 +91,39 @@ const (
 	// no payload follows. (The upload direction has a dedicated OpBlockZero
 	// instead, since the client always initiates that write.)
 	FlagZero uint8 = 1 << 1
-	// FlagNoDest and FlagCreated and FlagDelete are reserved for
-	// directory-tree mode (not yet implemented).
-	FlagNoDest  uint8 = 1 << 2
+	// FlagNoDest is reserved for directory-tree mode (not yet implemented).
+	FlagNoDest uint8 = 1 << 2
+	// FlagCreated marks an OpFileAck reply as being for a file the
+	// destination created fresh (as opposed to one that already existed).
 	FlagCreated uint8 = 1 << 3
-	FlagDelete  uint8 = 1 << 4
+	// FlagDelete marks an OpAnnounceEnd as requesting a `-delete` pass:
+	// with the announce stream now complete (which is exactly what
+	// OpAnnounceEnd means), the destination sweeps its own root for
+	// anything not among the announced files/directories/skipped-
+	// placeholders, removes it (see fileTable.deleteExtraneous), and
+	// replies OpAnnounceEndAck -- BEFORE the client transfers any file
+	// content (rsync's --delete-before), so a full destination is cleared
+	// of stale data before new data needs the space. Purely a wire-level,
+	// per-tree signal -- the destination server needs no matching CLI flag.
+	FlagDelete uint8 = 1 << 4
+	// FlagErrPermanent marks an OpError reply as a PERMANENT rejection:
+	// retrying the request can never change the outcome (e.g. OpFileOpen
+	// for a file the destination has already finalized -- including one
+	// that failed at announce time). The client fails the affected file
+	// immediately instead of burning its retry budget. Its absence means
+	// the rejection may be transient -- most importantly "file was never
+	// announced", which the pipeline legitimately produces when a worker's
+	// open races ahead of the announce batch still buffering client-side
+	// -- and the client retries exactly as it always has.
+	FlagErrPermanent uint8 = 1 << 6
+	// FlagQuickCheck marks an OpAnnounce batch as requesting rsync-style
+	// "quick check" evaluation: the destination stats each announced
+	// KindFile entry and, if an existing file there already matches its
+	// size and modification time (whole-second precision), reports it back
+	// in an OpAnnounceAck skip-list instead of accepting block traffic for
+	// it. Purely a wire-level, per-batch signal -- the destination server
+	// needs no matching CLI flag.
+	FlagQuickCheck uint8 = 1 << 5
 )
 
 const msgSize = 48
@@ -185,7 +240,7 @@ func validateDirClientFrame(msg *Msg) error {
 	}
 	switch Op(msg.Op) {
 	case OpAnnounce:
-		if msg.Flags != 0 {
+		if msg.Flags&^FlagQuickCheck != 0 {
 			return fmt.Errorf("invalid announce message flags")
 		}
 		if msg.DataSize == 0 {
@@ -195,9 +250,14 @@ func validateDirClientFrame(msg *Msg) error {
 			return fmt.Errorf("invalid announce message: DataSize %d exceeds sanity limit %d", msg.DataSize, dirAnnounceMaxDataSize)
 		}
 		return nil
-	case OpAnnounceEnd, OpTreeDone:
+	case OpAnnounceEnd:
+		if msg.DataSize != 0 || msg.Flags&^FlagDelete != 0 {
+			return fmt.Errorf("invalid announce-end message flags")
+		}
+		return nil
+	case OpTreeDone:
 		if msg.DataSize != 0 || msg.Flags != 0 {
-			return fmt.Errorf("invalid announce-end/tree-done message flags")
+			return fmt.Errorf("invalid tree-done message flags")
 		}
 		return nil
 	case OpFileOpen:
@@ -257,21 +317,57 @@ func stringToFixedSizeArray(s string) [magicLen]byte {
 	return arr
 }
 
-func pack(data *Msg) ([]byte, error) {
-	buf := new(bytes.Buffer)
-	if err := binary.Write(buf, binary.LittleEndian, data); err != nil {
-		return nil, err
-	}
-	return buf.Bytes(), nil
+// pack encodes m into its 48-byte little-endian wire form. Hand-rolled
+// rather than binary.Write: Msg contains fixed-size arrays, which sends
+// encoding/binary down its reflection path, and a bytes.Buffer was
+// allocated per call -- for something done three to six times per block (or
+// per small file) on each side. The layout is byte-for-byte identical to
+// what binary.Write produced (TestPackMatchesBinaryWrite pins that), so the
+// wire format is unchanged. The error return is kept so the many call sites
+// need no change; it is always nil.
+func pack(m *Msg) ([]byte, error) {
+	buf := make([]byte, msgSize)
+	m.encode(buf)
+	return buf, nil
 }
 
+// encode writes m's wire form into buf, which must be at least msgSize long.
+func (m *Msg) encode(buf []byte) {
+	_ = buf[msgSize-1]
+	copy(buf[0:17], m.MagicHead[:])
+	buf[17] = m.Op
+	buf[18] = m.Flags
+	copy(buf[19:24], m.Reserved[:])
+	binary.LittleEndian.PutUint32(buf[24:28], m.FileID)
+	binary.LittleEndian.PutUint32(buf[28:32], m.BlockIdx)
+	binary.LittleEndian.PutUint32(buf[32:36], m.BlockSize)
+	binary.LittleEndian.PutUint64(buf[36:44], m.FileSize)
+	binary.LittleEndian.PutUint32(buf[44:48], m.DataSize)
+}
+
+// unpack decodes one wire header. A buffer shorter than msgSize is an
+// error, exactly as binary.Read reported it (io.ErrUnexpectedEOF).
 func unpack(dataBytes []byte) (*Msg, error) {
-	data := &Msg{}
-	buf := bytes.NewReader(dataBytes)
-	if err := binary.Read(buf, binary.LittleEndian, data); err != nil {
-		return nil, err
+	if len(dataBytes) < msgSize {
+		return nil, io.ErrUnexpectedEOF
 	}
-	return data, nil
+	m := &Msg{}
+	m.decode(dataBytes)
+	return m, nil
+}
+
+// decode is encode's inverse; buf must be at least msgSize long.
+func (m *Msg) decode(buf []byte) {
+	_ = buf[msgSize-1]
+	copy(m.MagicHead[:], buf[0:17])
+	m.Op = buf[17]
+	m.Flags = buf[18]
+	copy(m.Reserved[:], buf[19:24])
+	m.FileID = binary.LittleEndian.Uint32(buf[24:28])
+	m.BlockIdx = binary.LittleEndian.Uint32(buf[28:32])
+	m.BlockSize = binary.LittleEndian.Uint32(buf[32:36])
+	m.FileSize = binary.LittleEndian.Uint64(buf[36:44])
+	m.DataSize = binary.LittleEndian.Uint32(buf[44:48])
 }
 
 // readMsg reads and unpacks exactly one Msg header from r: the
@@ -291,10 +387,11 @@ func readMsg(r io.Reader) (*Msg, error) {
 }
 
 // AnnounceRec is one record inside an OpAnnounce trailer: a file, directory,
-// or skipped path discovered by the walker. Kind reuses walk.go's EntryKind
-// (KindFile/KindDir/KindSkipped) — kindSkipped entries (symlinks, sockets,
-// FIFOs, devices) are announced without being created, so a later --delete
-// pass knows not to remove their destination-side namesakes if any exist.
+// symlink, special file, or skipped path discovered by the walker. Kind
+// reuses walk.go's EntryKind. KindSkipped entries (an excluded path, and --
+// unless -links/-specials asked for them -- symlinks, sockets, FIFOs and
+// devices) are announced without being created, so a later --delete pass
+// knows not to remove their destination-side namesakes if any exist.
 type AnnounceRec struct {
 	FileID   uint32
 	FileSize uint64
@@ -303,6 +400,9 @@ type AnnounceRec struct {
 	MTimeNs  int32
 	Kind     EntryKind
 	Path     string // '/'-separated, sanitized, relative to the source root
+	// LinkTarget is a KindSymlink record's target string, verbatim (see
+	// FileEntry.LinkTarget); empty for every other kind.
+	LinkTarget string
 }
 
 // announceBatchMaxRecs bounds decodeAnnounceBatch's record count against a
@@ -315,7 +415,9 @@ const announceBatchMaxRecs = 1_000_000
 // encodeAnnounceBatch serializes recs into the trailer bytes that follow an
 // OpAnnounce header's DataSize: a uint32 count, then each record as
 // FileID(4) FileSize(8) Mode(4) MTimeSec(8) MTimeNs(4) Kind(1) PathLen(2)
-// Path(PathLen), all little-endian.
+// Path(PathLen) TargetLen(2) LinkTarget(TargetLen), all little-endian.
+// TargetLen is 0 for every kind but KindSymlink (2 bytes/record overhead
+// keeps the codec branch-free; added in ver0.04).
 func encodeAnnounceBatch(recs []AnnounceRec) ([]byte, error) {
 	buf := new(bytes.Buffer)
 	if err := binary.Write(buf, binary.LittleEndian, uint32(len(recs))); err != nil {
@@ -325,6 +427,9 @@ func encodeAnnounceBatch(recs []AnnounceRec) ([]byte, error) {
 		if len(r.Path) > 0xFFFF {
 			return nil, fmt.Errorf("record %d: path is %d bytes, exceeds the uint16 length field", i, len(r.Path))
 		}
+		if len(r.LinkTarget) > 0xFFFF {
+			return nil, fmt.Errorf("record %d: link target is %d bytes, exceeds the uint16 length field", i, len(r.LinkTarget))
+		}
 		fields := []any{r.FileID, r.FileSize, r.Mode, r.MTimeSec, r.MTimeNs, uint8(r.Kind), uint16(len(r.Path))}
 		for _, f := range fields {
 			if err := binary.Write(buf, binary.LittleEndian, f); err != nil {
@@ -333,6 +438,12 @@ func encodeAnnounceBatch(recs []AnnounceRec) ([]byte, error) {
 		}
 		if _, err := buf.WriteString(r.Path); err != nil {
 			return nil, fmt.Errorf("encode record %d path: %w", i, err)
+		}
+		if err := binary.Write(buf, binary.LittleEndian, uint16(len(r.LinkTarget))); err != nil {
+			return nil, fmt.Errorf("encode record %d target length: %w", i, err)
+		}
+		if _, err := buf.WriteString(r.LinkTarget); err != nil {
+			return nil, fmt.Errorf("encode record %d link target: %w", i, err)
 		}
 	}
 	return buf.Bytes(), nil
@@ -367,7 +478,62 @@ func decodeAnnounceBatch(b []byte) ([]AnnounceRec, error) {
 			return nil, fmt.Errorf("decode record %d path: %w", i, err)
 		}
 		r.Path = string(pathBuf)
+		var targetLen uint16
+		if err := binary.Read(buf, binary.LittleEndian, &targetLen); err != nil {
+			return nil, fmt.Errorf("decode record %d target length: %w", i, err)
+		}
+		if targetLen > 0 {
+			targetBuf := make([]byte, targetLen)
+			if _, err := io.ReadFull(buf, targetBuf); err != nil {
+				return nil, fmt.Errorf("decode record %d link target: %w", i, err)
+			}
+			r.LinkTarget = string(targetBuf)
+		}
 		recs = append(recs, r)
 	}
 	return recs, nil
+}
+
+// skipListMaxRecs bounds decodeSkipList's claimed count the same way
+// announceBatchMaxRecs bounds decodeAnnounceBatch's: a skip list can never
+// legitimately exceed the batch that provoked it (at most announceBatchSize
+// records), so this is already generous headroom against a corrupted or
+// hostile count driving a huge allocation.
+const skipListMaxRecs = announceBatchMaxRecs
+
+// encodeSkipList serializes an OpAnnounceAck trailer: a uint32 count
+// followed by that many little-endian uint32 FileIDs -- the destination's
+// quick-check skip decision for a just-received OpAnnounce batch.
+func encodeSkipList(ids []uint32) ([]byte, error) {
+	buf := new(bytes.Buffer)
+	if err := binary.Write(buf, binary.LittleEndian, uint32(len(ids))); err != nil {
+		return nil, fmt.Errorf("encode skip-list count: %w", err)
+	}
+	for i, id := range ids {
+		if err := binary.Write(buf, binary.LittleEndian, id); err != nil {
+			return nil, fmt.Errorf("encode skip-list entry %d: %w", i, err)
+		}
+	}
+	return buf.Bytes(), nil
+}
+
+// decodeSkipList is encodeSkipList's inverse, with the same
+// never-trust-the-claimed-count-before-validating posture as
+// decodeAnnounceBatch.
+func decodeSkipList(b []byte) ([]uint32, error) {
+	buf := bytes.NewReader(b)
+	var count uint32
+	if err := binary.Read(buf, binary.LittleEndian, &count); err != nil {
+		return nil, fmt.Errorf("decode skip-list count: %w", err)
+	}
+	if count > skipListMaxRecs {
+		return nil, fmt.Errorf("skip list claims %d entries, exceeds sanity limit %d", count, skipListMaxRecs)
+	}
+	ids := make([]uint32, count)
+	for i := range ids {
+		if err := binary.Read(buf, binary.LittleEndian, &ids[i]); err != nil {
+			return nil, fmt.Errorf("decode skip-list entry %d: %w", i, err)
+		}
+	}
+	return ids, nil
 }

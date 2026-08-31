@@ -1,218 +1,92 @@
 # 🖥️ bsync Visualizer — Win98 Defragmenter-Style Progress Display
 
-## The Idea
+`bsync -v` renders a real-time grid of colored squares instead of a plain text progress line — inspired by the classic Windows 98 Disk Defragmenter. Each square is one block; its color shows what happened to it.
 
-Instead of a plain text progress bar (`block 3047/8192 37% ETA: 4m12s`),
-`bsync -v` renders a real-time grid of coloured squares directly in the
-terminal — inspired by the classic **Windows 98 Disk Defragmenter**.
-
-Each square represents a block of the transfer. Its colour tells you at a
-glance what happened to that block:
-
-| Display | Colour     | ANSI            | Meaning |
-|---------|------------|-----------------|---------|
-| `□`     | Dim        | `\033[2m`       | Not yet transferred (static) |
-| `□`     | Blink dim  | `\033[5m\033[2m` | Currently being processed (blinks) |
-| `■`     | Grey       | `\033[90m`      | Zero block — payload omitted from network (sparse) |
-| `■`     | Blue       | `\033[94m`      | Transferred with zstd compression |
-| `■`     | Orange     | `\033[38;5;208m` | Transferred without compression |
-| `■`     | Green      | `\033[32m`      | Skipped — block already identical at destination |
-
-Only **one cell** blinks at a time — the cell the worker is currently
-sending or receiving. This gives a clear visual pulse showing the transfer
-is actively making progress.
+| Display | Color | ANSI | Meaning |
+|---------|-------|------|---------|
+| `□` | Dim | `\033[2m` | Not yet transferred |
+| `□` | Blink dim | `\033[5m\033[2m` | Currently being sent/received (only one cell at a time) |
+| `■` | Grey | `\033[90m` | Zero block — payload omitted (sparse) |
+| `■` | Blue | `\033[94m` | Transferred with zstd compression |
+| `■` | Orange | `\033[38;5;208m` | Transferred without compression |
+| `■` | Green | `\033[32m` | Skipped — already identical at destination |
 
 ## Layout
 
-The terminal reserves **5 lines for text logs** at the bottom and leaves one
-guard line unused to prevent terminal scroll. The rest is used for the visual
-section: legend, block grid, spacer, and stats.
+5 lines at the bottom are reserved for text logs, plus one guard line to prevent scroll; the rest is legend, block grid, spacer, and stats:
 
 ```
 ┌─ Legend: □ Pending □ Processing ■ Zero ■ Compressed ■ Raw ■ Skipped  ─┐
-│                                                                        │
-│ □□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□  │
 │ □□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□  │  visual
-│ □□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□  │  blocks
-│ ■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■□□□□□□□□□□□□□□□□□□□□□□□  │
-│ ■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■□□□□□□□□□□□  │
-│                                                                        │
-│                                                                        │
+│ ■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■□□□□□□□□□□□□□□□□□□□□□□□  │  blocks
 │ Progress:  45.2% block 3047/8192 82.40 MB/s ETA: 4m12s Each cell: 7 blocks │
 ├────────────────────────────────────────────────────────────────────────┤
-│ 13:33:49 [client] startClient()                                        │  5
-│ 13:33:49 [client] source size: 52428800 bytes, blockNum: 49           │  log
-│ 13:33:49 [client] starting 1 transfer workers                          │  logs
-│ 13:33:49 [client] DONE, waiting for the workers                        │
+│ 13:33:49 [client] starting 1 transfer workers                          │  5 log
+│ 13:33:49 [client] DONE, waiting for the workers                        │  lines
 └────────────────────────────────────────────────────────────────────────┘
 ```
 
-### Visual section
-
-1. **Legend** — colour samples with labels (1 line)
-2. **Block grid** — rows of coloured squares filling available width
-3. **Blank spacer** — one empty line before the stats
-4. **Stats line** — compact `Progress: XX.X% block completed/total speed ETA: value [Each cell: N blocks]` (1 line)
-
-### Log section (5 terminal lines)
-
-Before transfer starts, the last N log messages (up to 200 buffered) are
-displayed below the grid in dim text so connection/setup problems are visible.
-Once the first block starts processing or completes, normal log messages are
-hidden and only warning/error/failure messages remain visible. In `-v` mode,
-`Log()` writes into a ring buffer instead of stdout; the visualizer's
-`renderLogs()` method reads the buffer and prints it below the grid. The newest
-entries appear at the bottom.
+Before the transfer starts, the last buffered log lines (up to 200) show below the grid in dim text; once the first block starts, only warnings/errors stay visible there. `Log()` writes to a ring buffer instead of stdout while `-v` is active; the visualizer reads it for that area.
 
 ## Stats Line
-
-The stats line shows a compact single-line summary:
 
 ```
 Progress:  45.2% block 3047/8192 82.40 MB/s ETA: 4m12s Each cell: 7 blocks
 ```
 
-Labels are dim/grey, the percentage is bright green, completed blocks are
-bright white, the total block count is dim/grey, speed is bright blue, and ETA
-is bright orange.
+Percentage/completed/total real blocks, throughput and ETA from the last 100 completed-block samples, and — only when cells aggregate multiple blocks — how many blocks each cell represents (`Each cell: 7`, or `Cell: 7`/`C: 7` on a narrow terminal).
 
-- **`45.2%`** — percentage of real transfer blocks completed
-- **`3047`** — real blocks completed
-- **`8192`** — total real transfer blocks
-- **`82.40 MB/s`** — recent throughput, calculated from the last 100
-  completed block samples and the active block size
-- **`4m12s`** — ETA from the same last-100-block speed window
-- **`Each cell: 7 blocks`** — shown when visual cells aggregate multiple
-  real transfer blocks; narrow terminals may show this as `Cell: 7` or `C: 7`
+## Visual vs Physical Blocks
 
-## Architecture — Visual vs Physical Blocks
-
-The key design decision: **visual cells ≠ physical transfer blocks**.
-
-```
-realBlockCount  — actual transfer blocks (e.g. 10,000)
-visualCellCount — grid cells on screen (e.g. 1,429)
-blocksPerCell   — how many real blocks each cell represents (e.g. 7)
-```
-
-### Block aggregation formula
+Grid cells don't map 1:1 to transfer blocks once the transfer is larger than the terminal can show:
 
 ```
 gridCols = terminalWidth - 1
-gridRows = terminalHeight - 5 log lines - 4 visual overhead lines - 1 scroll guard line
+gridRows = terminalHeight - 5 log lines - 4 visual overhead - 1 scroll guard
 maxCells = gridCols × gridRows
 
 if realBlockCount > maxCells:
     blocksPerCell = ceil(realBlockCount / maxCells)
     visualCellCount = ceil(realBlockCount / blocksPerCell)   // ≤ maxCells
 else:
-    visualCellCount = realBlockCount, blocksPerCell = 1       // 1:1 mapping
+    visualCellCount = realBlockCount, blocksPerCell = 1       // 1:1
 ```
 
-This ensures:
-- **Small transfers** (< terminal capacity): every block gets its own cell
-- **Large transfers**: blocks are aggregated into cells that fill the screen
-- **No orphan cells**: `visualCellCount × blocksPerCell ≥ realBlockCount`,
-  but the last real block `(realBlockCount-1) / blocksPerCell ≤ visualCellCount - 1`,
-  so every visual cell maps to at least one real block
-
-### Examples
-
-| real blocks | Terminal (W×H) | maxCells | bpc | visualCells | rows |
-|-------------|----------------|----------|-----|-------------|------|
-| 50          | 80×24          | 1106     | 1   | 50          | 1    |
-| 5,000       | 80×24          | 1106     | 5   | 1000        | 13   |
-| 10,000      | 80×24          | 1106     | 10  | 1000        | 13   |
-| 10,000,000  | 80×24          | 1106     | 9042 | 1106      | 14   |
-| 10,000      | 200×50         | 7960     | 2   | 5000        | 26   |
+A small transfer gets one cell per block; a large one aggregates blocks so the grid always fills the screen without orphan cells.
 
 ## Block States
 
-Each visual cell transitions through at most two states:
-
 ```
 StatusPending ──→ StatusProcessing ──→ Status{Skipped,Zero,Compressed,Raw}
-     (dim □)          (blink dim □)          (coloured ■)
+   (dim □)          (blink dim □)             (colored ■)
 ```
 
-- **`StatusPending`** (static dim `□`): the worker hasn't reached this cell yet
-- **`StatusProcessing`** (blinking dim `□`): the worker is actively sending
-  or receiving this cell's blocks. Only one cell has this state at a time.
-  The `currentBlock` atomic is updated whenever this state is set.
-- **Final status** (coloured `■`): the cell is done
+Only one cell is ever `StatusProcessing` at a time — the block a worker is actively sending or receiving.
 
-## Terminal Size Detection
+## Terminal Size & Resize
 
-### Unix (Linux / macOS)
+- **Unix**: `TIOCGWINSZ` ioctl on stdout, falling back to `$COLUMNS`/`$LINES`, then 80×24.
+- **Windows**: `GetConsoleScreenBufferInfoEx`, falling back to `GetConsoleScreenBufferInfo`.
+- `calcGridDimensions()` runs on every render; `visualCellCount`/`blocksPerCell` are recalculated on a significant capacity change, and per-block completion state is remapped into the new cells. The first render and any resize do a full `\033[2J\033[H` clear; normal renders use cursor positioning plus per-line `\033[K`.
 
-Uses `TIOCGWINSZ` ioctl on stdout — returns both width (`ws.Col`) and
-height (`ws.Row`). Falls back to `$COLUMNS` / `$LINES` env vars, then
-80×24.
+## Non-Blocking Render
 
-### Windows
+Render never blocks a transfer worker:
 
-Uses `GetConsoleScreenBufferInfoEx` (kernel32) — reads `Window.Right -
-Window.Left + 1` for width and `Window.Bottom - Window.Top + 1` for
-height. Falls back to `GetConsoleScreenBufferInfo` on older Windows.
+1. `RenderIfNeeded()` launches `go v.Render()` — the worker returns immediately.
+2. `v.mu` serializes concurrent render goroutines to one draw at a time.
+3. Each frame is built in memory and written to the terminal in one shot.
+4. Renders are coalesced to at most one per 100ms while work is active (first update renders immediately); a single in-flight render loop prevents unbounded goroutine buildup.
+5. `RenderFinal()` is synchronous, so the final state is on screen before exit.
 
-## Terminal Resize Handling
-
-- `calcGridDimensions()` runs **every `Render()`** call
-- `cols` and `rows` adapt while `logLines` stays fixed at 5
-- `visualCellCount` and `blocksPerCell` are recalculated on significant
-  terminal-capacity changes so the grid continues to cover the screen well
-- Per-block completion state is preserved across resize and remapped into
-  the new visual cells
-- The first render uses `\033[2J\033[H` to clear the screen and move home.
-  Resize renders also use a full clear to remove stale wrapped rows. Normal
-  later renders use cursor positioning plus per-line `\033[K` clears.
-
-## Performance — Non-Blocking Render
-
-The render must never block the transfer worker goroutines. Five
-mechanisms ensure this:
-
-1. **Async rendering** — `RenderIfNeeded()` launches `go v.Render()`
-   instead of calling `v.Render()` synchronously. The worker returns to
-   processing blocks immediately.
-
-2. **Mutex serialization** — `v.mu` inside `Render()` serialises
-   concurrent render goroutines. Only one screen draw at a time.
-
-3. **Single-frame output** — each render is built in memory and written to
-   the terminal once, avoiding per-cell terminal writes and reducing visible
-   paint/flicker.
-
-4. **Time-bounded refresh** — every non-pending status update requests a
-   render, including `StatusProcessing` and skipped blocks. The first
-   transfer update renders immediately; later updates are coalesced to at
-   most one render every 100ms while work is active. A single in-flight
-   render loop prevents unbounded `go v.Render()` buildup.
-
-5. **Final render** — `RenderFinal()` is synchronous (no more work
-   after it), ensuring the final state is displayed before exit.
-
-## Concurrency Safety
-
-| Resource | Protection | Used by |
-|----------|------------|---------|
-| `cellStatus[]` | `atomic.Int32` per entry | `UpdateBlockStatus()` (workers), `Render()` (goroutine) |
-| `currentBlock` | `atomic.Int32` | `UpdateBlockStatus()` when setting `StatusProcessing` |
-| `completedBlocks` | `atomic.Uint32` | `UpdateBlockStatus()` final states, `renderStats()` |
-| `progressSamples` | `progressMu sync.Mutex` | ETA and MB/s from last 100 completed blocks |
-| `lastRenderAt` / `renderRequested` / `renderInFlight` | atomics | `RenderIfNeeded()` (workers), render scheduler |
-| Screen output | `v.mu sync.Mutex` | `Render()` (goroutine) |
-| Log buffer | `logBufferMu sync.Mutex` | `Log()` (workers), `GetRecentLogs()` (render goroutine) |
-| Visual log phase | `visualTransferStarted atomic.Bool` | `UpdateBlockStatus()`, `Log()` filtering |
+Shared state (`cellStatus[]`, `currentBlock`, `completedBlocks`) is atomics-only; the last-100-samples window, screen output, and log buffer each have their own mutex.
 
 ## Implementation Files
 
 | File | Purpose |
 |------|---------|
-| `visualizer.go` | Core: Visualizer struct, grid render, legend, stats, aggregation |
-| `visualizer_unix.go` | Terminal size via `TIOCGWINSZ` ioctl (Linux/macOS) |
-| `visualizer_windows.go` | Terminal size via `GetConsoleScreenBufferInfoEx` (Windows) |
-| `log.go` | Log buffer ring, `GetRecentLogs()` for log-area display |
-| `client.go` | Wires `cliVisualizer` into upload/download worker path |
-| `server.go` | Wires `srvVisualizer` into server receive path |
-| `main.go` | `-v` flag parsing, `v_visual` global |
+| `visualizer.go` | Core: struct, grid render, legend, stats, aggregation |
+| `visualizer_unix.go` / `visualizer_windows.go` | Terminal size, per-OS |
+| `log.go` | Log ring buffer for the log-area display |
+| `client.go` / `server.go` | Wire `cliVisualizer`/`srvVisualizer` into the transfer path |
+| `main.go` | `-v` flag parsing |

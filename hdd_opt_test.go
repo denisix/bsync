@@ -3,11 +3,9 @@ package main
 import (
 	"fmt"
 	"os"
-	"strconv"
 	"sync/atomic"
 	"syscall"
 	"testing"
-	"unsafe"
 )
 
 // TestReaderBufferPool tests that the reader buffer pool works correctly.
@@ -38,12 +36,17 @@ func TestReaderBufferPool(t *testing.T) {
 	putReaderBuf(buf2)
 	putReaderBuf(buf3)
 
-	// Large buffer (>10MB) should not pollute pool
+	// A size well past the typical block cap still gets its own exact-size
+	// pool (bounded by maxDistinctReaderBufSizes, not by an absolute size
+	// threshold) rather than being rounded up to some larger class.
 	largeBuf := getReaderBuf(20 * 1024 * 1024)
 	if len(largeBuf) != 20*1024*1024 {
 		t.Errorf("largeBuf size: got %d, want %d", len(largeBuf), 20*1024*1024)
 	}
-	putReaderBuf(largeBuf) // Should be GC'd, not pooled
+	if cap(largeBuf) != 20*1024*1024 {
+		t.Errorf("largeBuf capacity: got %d, want exactly %d (no rounding up)", cap(largeBuf), 20*1024*1024)
+	}
+	putReaderBuf(largeBuf)
 }
 
 // TestReaderBufferPoolConcurrency tests concurrent access to the buffer pool.
@@ -218,81 +221,6 @@ func TestAdviseSequentialOnNilFile(t *testing.T) {
 	tmpFile.Close()
 }
 
-// TestAlignedBuffer tests that aligned buffers are properly aligned.
-func TestAlignedBuffer(t *testing.T) {
-	sizes := []int{1024, 4096, 10 * 1024 * 1024}
-
-	for _, size := range sizes {
-		t.Run(strconv.Itoa(size), func(t *testing.T) {
-			buf := AlignedBuffer(size)
-
-			// Check size
-			if len(buf) != size {
-				t.Errorf("buffer size: got %d, want %d", len(buf), size)
-			}
-
-			// Check alignment
-			ptr := uintptr(unsafe.Pointer(&buf[0]))
-			if ptr%4096 != 0 {
-				t.Errorf("buffer not 4K aligned: ptr=%x, mod=%d", ptr, ptr%4096)
-			}
-		})
-	}
-}
-
-// TestIsAligned tests the alignment checker.
-func TestIsAligned(t *testing.T) {
-	tests := []struct {
-		ptr       uintptr
-		alignment int
-		expected  bool
-	}{
-		{0x1000, 4096, true},
-		{0x1000, 1024, true},
-		{0x1001, 4096, false},
-		{0x2000, 4096, true},
-		{0x2000, 1024, true},
-	}
-
-	for _, tt := range tests {
-		t.Run("", func(t *testing.T) {
-			result := IsAligned(tt.ptr, tt.alignment)
-			if result != tt.expected {
-				t.Errorf("IsAligned(%x, %d) = %v, want %v", tt.ptr, tt.alignment, result, tt.expected)
-			}
-		})
-	}
-}
-
-// TestAlignedBufferPool tests the aligned buffer pool.
-func TestAlignedBufferPool(t *testing.T) {
-	// Get buffers from pool
-	buf1 := getAlignedReaderBuf(1024)
-	buf2 := getAlignedReaderBuf(10 * 1024 * 1024)
-
-	// Check alignment
-	ptr1 := uintptr(unsafe.Pointer(&buf1[0]))
-	if ptr1%4096 != 0 {
-		t.Errorf("buf1 not aligned: ptr=%x", ptr1)
-	}
-
-	ptr2 := uintptr(unsafe.Pointer(&buf2[0]))
-	if ptr2%4096 != 0 {
-		t.Errorf("buf2 not aligned: ptr=%x", ptr2)
-	}
-
-	// Return to pool
-	putAlignedReaderBuf(buf1)
-	putAlignedReaderBuf(buf2)
-
-	// Get again - should reuse
-	buf3 := getAlignedReaderBuf(10 * 1024 * 1024)
-	ptr3 := uintptr(unsafe.Pointer(&buf3[0]))
-	if ptr3%4096 != 0 {
-		t.Errorf("buf3 not aligned: ptr=%x", ptr3)
-	}
-}
-
 // TestCompressionBufferPool tests the compression output buffer pool.
 func TestCompressionBufferPool(t *testing.T) {
 	// This test verifies the compressData function uses the pool
@@ -316,56 +244,6 @@ func TestCompressionBufferPool(t *testing.T) {
 			// Data might not compress, but should get same or smaller
 			t.Logf("warning: compressed size %d >= original %d", len(compressed), len(testData))
 		}
-	}
-}
-
-// TestLockUnlockBuffer tests mlock/munlock functionality.
-func TestLockUnlockBuffer(t *testing.T) {
-	// Small buffer - should work even with low RLIMIT_MEMLOCK
-	buf := make([]byte, 4096)
-
-	// Lock the buffer
-	if err := LockBuffer(buf); err != nil {
-		t.Logf("LockBuffer failed (may be due to RLIMIT_MEMLOCK): %v", err)
-		// Don't fail the test - locking is best-effort
-		return
-	}
-
-	// Buffer should still be usable
-	buf[0] = 42
-	if buf[0] != 42 {
-		t.Error("locked buffer is not usable")
-	}
-
-	// Unlock the buffer
-	if err := UnlockBuffer(buf); err != nil {
-		t.Logf("UnlockBuffer failed: %v", err)
-	}
-}
-
-// TestTryLockBuffer tests the best-effort locking function.
-func TestTryLockBuffer(t *testing.T) {
-	// This should not panic or fail the test
-	buf := make([]byte, 8192)
-	TryLockBuffer(buf)
-
-	// Buffer should still be usable
-	buf[0] = 42
-	if buf[0] != 42 {
-		t.Error("locked buffer is not usable")
-	}
-}
-
-// TestLockEmptyBuffer tests that empty buffers are handled gracefully.
-func TestLockEmptyBuffer(t *testing.T) {
-	var buf []byte
-
-	if err := LockBuffer(buf); err != nil {
-		t.Errorf("LockBuffer(empty) failed: %v", err)
-	}
-
-	if err := UnlockBuffer(buf); err != nil {
-		t.Errorf("UnlockBuffer(empty) failed: %v", err)
 	}
 }
 
@@ -507,133 +385,6 @@ func TestMMapReader(t *testing.T) {
 	partial := mmap.ReadAt(6, 5) // "world"
 	if string(partial) != "world" {
 		t.Errorf("Partial read = %q, want %q", string(partial), "world")
-	}
-}
-
-// ============================================================================
-// Category A: Memory Locking Tests
-// ============================================================================
-
-// TestLargeBufferLocking tests locking buffers of various sizes.
-func TestLargeBufferLocking(t *testing.T) {
-	sizes := []int{
-		64 * 1024,        // 64KB - should succeed
-		1024 * 1024,      // 1MB - should succeed
-		16 * 1024 * 1024, // 16MB - may fail due to RLIMIT_MEMLOCK
-		128 * 1024 * 1024,
-	}
-
-	for _, size := range sizes {
-		t.Run(strconv.Itoa(size), func(t *testing.T) {
-			buf := make([]byte, size)
-			err := LockBuffer(buf)
-
-			if err != nil {
-				t.Logf("LockBuffer(%d) failed (expected for large sizes): %v", size, err)
-				// Don't fail - RLIMIT_MEMLOCK may be low
-			} else {
-				// If lock succeeded, verify buffer is still usable
-				buf[0] = 42
-				buf[size-1] = 24
-				if buf[0] != 42 || buf[size-1] != 24 {
-					t.Error("Locked buffer is not usable")
-				}
-				_ = UnlockBuffer(buf)
-			}
-		})
-	}
-}
-
-// TestConcurrentLocking tests concurrent lock/unlock operations.
-func TestConcurrentLocking(t *testing.T) {
-	const goroutines = 100
-	const bufSize = 1024 * 1024 // 1MB each
-
-	var done atomic.Int32
-	var errors atomic.Int32
-
-	for i := 0; i < goroutines; i++ {
-		go func() {
-			defer done.Add(1)
-
-			buf := make([]byte, bufSize)
-			if err := LockBuffer(buf); err != nil {
-				// Expected if RLIMIT_MEMLOCK is low
-				return
-			}
-
-			// Use the buffer
-			buf[0] = 42
-			if buf[0] != 42 {
-				errors.Add(1)
-			}
-
-			_ = UnlockBuffer(buf)
-		}()
-	}
-
-	for done.Load() != int32(goroutines) {
-	}
-
-	if errors.Load() != 0 {
-		t.Errorf(" %d goroutines reported buffer errors", errors.Load())
-	}
-}
-
-// TestLockUnlockCycle tests repeated lock/unlock cycles.
-func TestLockUnlockCycle(t *testing.T) {
-	const iterations = 1000
-	buf := make([]byte, 4096)
-
-	for i := 0; i < iterations; i++ {
-		if err := LockBuffer(buf); err != nil {
-			t.Logf("LockBuffer failed on iteration %d: %v", i, err)
-			// May fail due to RLIMIT_MEMLOCK
-			continue
-		}
-
-		buf[0] = byte(i % 256)
-		_ = UnlockBuffer(buf)
-	}
-
-	// Buffer should still be usable
-	buf[0] = 255
-	if buf[0] != 255 {
-		t.Error("Buffer not usable after cycles")
-	}
-}
-
-// TestLockAllMemoryBestEffort tests LockAllMemory/UnlockAllMemory.
-func TestLockAllMemoryBestEffort(t *testing.T) {
-	// This is a dangerous operation and may not be permitted
-	// Test should not fail even if permission denied
-	if err := LockAllMemory(); err != nil {
-		t.Logf("LockAllMemory failed (expected if not root): %v", err)
-		return
-	}
-
-	// If we got here, we locked all memory - unlock it
-	if err := UnlockAllMemory(); err != nil {
-		t.Logf("UnlockAllMemory failed: %v", err)
-	}
-}
-
-// TestDoubleUnlock tests unlocking an already unlocked buffer.
-func TestDoubleUnlock(t *testing.T) {
-	buf := make([]byte, 4096)
-
-	if err := LockBuffer(buf); err != nil {
-		t.Skip("LockBuffer failed, skipping double unlock test")
-	}
-
-	// First unlock
-	if err := UnlockBuffer(buf); err != nil {
-		t.Errorf("First UnlockBuffer failed: %v", err)
-	}
-
-	// Second unlock - may return error but shouldn't panic
-	if err := UnlockBuffer(buf); err != nil {
-		t.Logf("Second UnlockBuffer returned error (expected): %v", err)
 	}
 }
 
@@ -1176,120 +927,13 @@ func TestVmSpliceNonPipe(t *testing.T) {
 }
 
 // ============================================================================
-// Category D: Aligned Memory Tests
-// ============================================================================
-
-// TestAlignedBufferVariousSizes tests alignment for various buffer sizes.
-func TestAlignedBufferVariousSizes(t *testing.T) {
-	sizes := []int{1, 512, 4096, 8192, 1024 * 1024, 10 * 1024 * 1024}
-
-	for _, size := range sizes {
-		t.Run(strconv.Itoa(size), func(t *testing.T) {
-			buf := AlignedBuffer(size)
-
-			if len(buf) != size {
-				t.Errorf("buffer size: got %d, want %d", len(buf), size)
-			}
-
-			ptr := uintptr(unsafe.Pointer(&buf[0]))
-			if ptr%4096 != 0 {
-				t.Errorf("buffer not 4K aligned: ptr=%x, mod=%d", ptr, ptr%4096)
-			}
-
-			// Verify buffer is usable
-			for i := range buf {
-				buf[i] = byte(i % 256)
-			}
-		})
-	}
-}
-
-// TestAlignedBufferPoolReuse tests pool buffer reuse and alignment.
-func TestAlignedBufferPoolReuse(t *testing.T) {
-	bufs := make([][]byte, 0, 10)
-
-	// Get buffers
-	for i := 0; i < 10; i++ {
-		buf := getAlignedReaderBuf(1024 * 1024)
-		ptr := uintptr(unsafe.Pointer(&buf[0]))
-		if ptr%4096 != 0 {
-			t.Errorf("Buffer %d not aligned: ptr=%x", i, ptr)
-		}
-		buf[0] = byte(i)
-		bufs = append(bufs, buf)
-	}
-
-	// Return buffers
-	for _, buf := range bufs {
-		putAlignedReaderBuf(buf)
-	}
-
-	// Get again - should reuse
-	for i := 0; i < 10; i++ {
-		buf := getAlignedReaderBuf(1024 * 1024)
-		ptr := uintptr(unsafe.Pointer(&buf[0]))
-		if ptr%4096 != 0 {
-			t.Errorf("Reused buffer %d not aligned: ptr=%x", i, ptr)
-		}
-		putAlignedReaderBuf(buf)
-	}
-}
-
-// TestIsAlignedEdgeCases tests IsAligned with edge cases.
-func TestIsAlignedEdgeCases(t *testing.T) {
-	tests := []struct {
-		ptr        uintptr
-		alignment  int
-		expected   bool
-	}{
-		{0, 1, true},         // Zero is always aligned
-		{0, 4096, true},      // Zero to any alignment
-		{4096, 1, true},      // Any number to alignment 1
-		{4096, 4096, true},   // Exact match
-		{4095, 4096, false},  // One byte off
-		{8192, 4096, true},   // Multiple of alignment
-		{0x1000, 512, true},  // 4K is aligned to 512
-	}
-
-	for _, tt := range tests {
-		t.Run(fmt.Sprintf("%x_%d", tt.ptr, tt.alignment), func(t *testing.T) {
-			result := IsAligned(tt.ptr, tt.alignment)
-			if result != tt.expected {
-				t.Errorf("IsAligned(%x, %d) = %v, want %v", tt.ptr, tt.alignment, result, tt.expected)
-			}
-		})
-	}
-}
-
-// TestAlignedBufferMemoryLocking verifies aligned buffers work correctly.
-func TestAlignedBufferMemoryLocking(t *testing.T) {
-	// AlignedBuffer internally calls TryLockBuffer
-	// We can't directly verify the lock, but we can verify functionality
-
-	size := 1024 * 1024
-	buf := AlignedBuffer(size)
-
-	// Buffer should be usable
-	for i := range buf {
-		buf[i] = byte(i % 256)
-	}
-
-	// Verify
-	for i := range buf {
-		expected := byte(i % 256)
-		if buf[i] != expected {
-			t.Errorf("buf[%d] = %d, want %d", i, buf[i], expected)
-		}
-	}
-}
-
-// ============================================================================
 // Category E: Integration Tests
 // ============================================================================
 
 // TestBufferPoolMemoryLocking tests buffer pool functionality.
 func TestBufferPoolMemoryLocking(t *testing.T) {
-	// Get buffers from pool (they should be locked on creation)
+	// No longer mlock'd (see reader.go); this just exercises get/put across
+	// two distinct size classes and a reuse cycle.
 	buf1 := getReaderBuf(1024 * 1024)
 	buf2 := getReaderBuf(10 * 1024 * 1024)
 

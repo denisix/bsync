@@ -91,6 +91,9 @@ func serverPrintStats(blockIdx uint32, indicator string, netBytes uint32, origBy
 	if last == 0 {
 		return
 	}
+	if !statsShouldLog(uint64(blockIdx) >= last) {
+		return
+	}
 
 	currentBlockSize := atomic.LoadUint32(&blockSize)
 	blockMb := float64(currentBlockSize) / float64(mb1)
@@ -319,10 +322,7 @@ func serverHandleReq(conn net.Conn, file *os.File, _ *ChecksumCache, ow *Ordered
 			if err != nil {
 				return fmt.Errorf("pack hash: %w", err)
 			}
-			if err := connWrite(conn, hashMsg); err != nil {
-				return nil
-			}
-			if err := connWrite(conn, hash[:]); err != nil {
+			if err := connWriteFrame(conn, hashMsg, hash); err != nil {
 				return nil
 			}
 			request := *msg
@@ -357,8 +357,10 @@ func serverHandleReq(conn net.Conn, file *os.File, _ *ChecksumCache, ow *Ordered
 					}
 					payload = plain
 				} else {
-					payload = make([]byte, msg.DataSize)
-					copy(payload, filebuf[:msg.DataSize])
+					// No copy: writeDestBlock -> SubmitAndWait blocks until
+					// the write has completed, and filebuf is not touched
+					// again until the next message is read.
+					payload = filebuf[:msg.DataSize]
 				}
 			}
 			if uint32(len(payload)) != expectedSize {
@@ -725,10 +727,23 @@ func serverHandleUpload(conn net.Conn, file *os.File, fileSize uint64, checksumC
 
 		// Read block: prefer the sequential prefetch stream; fall back to a
 		// direct read if the request is out of the expected order.
+		//
+		// A prefetched block owns a pooled buffer that must go back to the
+		// pool once its bytes are on the wire; releaseBlock does that (and
+		// is a no-op for the filebuf fallback). Every exit from this
+		// iteration after this point calls it -- connWrite is synchronous,
+		// so by the time it returns the kernel has its own copy.
 		var data []byte
+		releaseBlock := func() {}
 		if bd, ok := <-pfChan; ok && bd.BlockIdx == msg.BlockIdx {
 			data = bd.Data
+			if bd.release != nil {
+				releaseBlock = bd.release
+			}
 		} else {
+			if ok && bd.release != nil {
+				bd.release() // out-of-order request: this prefetched block is not the one wanted
+			}
 			n, err := file.ReadAt(filebuf, offset)
 			if err != nil && err != io.EOF {
 				return fmt.Errorf("read source block %d: %w", msg.BlockIdx, err)
@@ -737,21 +752,14 @@ func serverHandleUpload(conn net.Conn, file *os.File, fileSize uint64, checksumC
 		}
 		n := len(data)
 
-		// Get precomputed hash (currently unused beyond synchronizing with the
-		// background precompute pass; see the zero-block check below for why
-		// its value must not be trusted for zero-ness).
-		_ = checksumCache.WaitFor(msg.BlockIdx)
-
 		// Check if block is zero - send only Msg, NO data (sparse file optimization).
 		//
-		// Deciding this from the hash (bytes.Equal(hash, zeroBlockHash)) is
-		// unsafe: zeroBlockHash is 16 zero bytes, and ChecksumCache.WaitFor
-		// also returns 16 zero bytes for an out-of-range or not-yet-computed
-		// index (checksum.go's noPrecompute/out-of-bounds path). An unknown
-		// hash would then be misreported as a zero block, and the client
-		// would zero-fill the destination with data that was never verified.
-		// Deciding straight from the just-read bytes has no such ambiguity.
+		// Decided straight from the just-read bytes, never from a hash: a
+		// download source has no one to compare hashes with, and the old
+		// checksumCache.WaitFor here only served to stall this loop behind a
+		// redundant second read of the whole device (see main.go).
 		if isZeroBlock(data) {
+			releaseBlock()
 			respMsg, err1 := pack(&Msg{
 				MagicHead: magicBytes,
 				Op:        uint8(OpDownData),
@@ -773,8 +781,15 @@ func serverHandleUpload(conn net.Conn, file *os.File, fileSize uint64, checksumC
 		}
 
 		// Compress if beneficial, unless the user disabled compression (-n).
+		// Below compressMinSize a zstd frame's own overhead already exceeds
+		// any savings, so the attempt (and the encoder pool round trip it
+		// costs) is skipped outright; compBuf stays nil, and the "did
+		// compression help" check below is gated on tried, not just on
+		// compBuf's length -- a nil compBuf must never look "smaller than
+		// n" and be sent as an empty compressed payload.
 		var compBuf []byte
-		if !noCompress {
+		tried := !noCompress && n >= compressMinSize
+		if tried {
 			var cerr error
 			compBuf, cerr = compressData(data)
 			if cerr != nil {
@@ -782,7 +797,7 @@ func serverHandleUpload(conn net.Conn, file *os.File, fileSize uint64, checksumC
 			}
 		}
 
-		if !noCompress && uint32(len(compBuf)) < uint32(n) {
+		if tried && uint32(len(compBuf)) < uint32(n) {
 			// Send compressed (compressData also encrypts when -e is set)
 			msg, err1 := pack(&Msg{
 				MagicHead: magicBytes,
@@ -797,27 +812,25 @@ func serverHandleUpload(conn net.Conn, file *os.File, fileSize uint64, checksumC
 			if err1 != nil {
 				return fmt.Errorf("pack compressed response: %w", err1)
 			}
-			if err := connWrite(conn, msg); err != nil {
-				return fmt.Errorf("send compressed header: %w", err)
-			}
-			if err := connWrite(conn, compBuf); err != nil {
-				return fmt.Errorf("send compressed payload: %w", err)
+			if err := connWriteFrame(conn, msg, compBuf); err != nil {
+				return fmt.Errorf("send compressed block: %w", err)
 			}
 		} else {
 			// Send uncompressed. When encryption is on, encrypt the raw block
 			// so -n still produces an encrypted stream.
+			//
+			// data is sent directly, whether it is a prefetched pooled
+			// buffer or filebuf: connWrite loops on conn.Write, which
+			// returns only after the kernel has copied the bytes, so the
+			// buffer is free to be reused the moment connWrite returns.
+			// (An earlier version copied every block into a second pooled
+			// buffer here on the mistaken belief that the write was
+			// asynchronous -- a full block-sized memcpy per block.)
 			var payload []byte
-			var pooledPayload []byte // Track to return to pool after send
 			if IsEncryptionEnabled() {
 				payload = encryptBlock(data)
 			} else {
-				// CRITICAL FIX: data points to a reused buffer (either bd.Data from
-				// SequentialReader or filebuf[:n] from direct ReadAt). connWrite
-				// reads asynchronously and the buffer will be overwritten in the next
-				// loop iteration, so we must copy the data first.
-				// Use pooled buffer to reduce GC pressure.
-				payload = GetPayload(data)
-				pooledPayload = payload
+				payload = data
 			}
 			msg, err1 := pack(&Msg{
 				MagicHead: magicBytes,
@@ -829,28 +842,13 @@ func serverHandleUpload(conn net.Conn, file *os.File, fileSize uint64, checksumC
 				DataSize:  uint32(len(payload)),
 			})
 			if err1 != nil {
-				if pooledPayload != nil {
-					PutPayload(pooledPayload)
-				}
 				return fmt.Errorf("pack uncompressed response: %w", err1)
 			}
-			if err := connWrite(conn, msg); err != nil {
-				if pooledPayload != nil {
-					PutPayload(pooledPayload)
-				}
-				return fmt.Errorf("send uncompressed header: %w", err)
-			}
-			if err := connWrite(conn, payload); err != nil {
-				if pooledPayload != nil {
-					PutPayload(pooledPayload)
-				}
-				return fmt.Errorf("send uncompressed payload: %w", err)
-			}
-			// Return pooled buffer to pool for reuse
-			if pooledPayload != nil {
-				PutPayload(pooledPayload)
+			if err := connWriteFrame(conn, msg, payload); err != nil {
+				return fmt.Errorf("send uncompressed block: %w", err)
 			}
 		}
+		releaseBlock()
 
 		if debug {
 			Log("\t- sent block [%d] %d bytes\n", msg.BlockIdx, n)

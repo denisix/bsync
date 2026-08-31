@@ -223,3 +223,45 @@ func TestIsZeroBlockBoundaries(t *testing.T) {
 		}
 	}
 }
+
+func TestAffinityWorkerThreshold(t *testing.T) {
+	const workers = 4
+
+	// blocks == 0 ("unknown") always falls back to shared, regardless of
+	// fileID or workers -- routing must never be decided on incomplete
+	// information.
+	for _, fileID := range []uint32{0, 1, 100} {
+		if got := affinityWorker(fileID, 0, workers); got != -1 {
+			t.Errorf("affinityWorker(%d, 0, %d) = %d, want -1", fileID, workers, got)
+		}
+	}
+
+	// blocks in [1, workers]: routed, deterministic, exactly fileID % workers.
+	for blocks := uint32(1); blocks <= workers; blocks++ {
+		for fileID := uint32(0); fileID < 20; fileID++ {
+			want := int(fileID % workers)
+			got := affinityWorker(fileID, blocks, workers)
+			if got != want {
+				t.Errorf("affinityWorker(%d, %d, %d) = %d, want %d", fileID, blocks, workers, got, want)
+			}
+			// Stable across repeated calls -- no hidden state/counter.
+			if got2 := affinityWorker(fileID, blocks, workers); got2 != got {
+				t.Errorf("affinityWorker(%d, %d, %d) not stable: %d then %d", fileID, blocks, workers, got, got2)
+			}
+		}
+	}
+
+	// blocks > workers: never routed, always shared.
+	for _, blocks := range []uint32{workers + 1, workers + 2, 1000} {
+		if got := affinityWorker(7, blocks, workers); got != -1 {
+			t.Errorf("affinityWorker(7, %d, %d) = %d, want -1", blocks, workers, got)
+		}
+	}
+
+	// workers <= 0: never routed, regardless of blocks.
+	for _, w := range []int{0, -1} {
+		if got := affinityWorker(3, 2, w); got != -1 {
+			t.Errorf("affinityWorker(3, 2, %d) = %d, want -1", w, got)
+		}
+	}
+}

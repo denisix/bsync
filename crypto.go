@@ -73,19 +73,14 @@ func encryptBlock(plaintext []byte) []byte {
 
 	aead := getAEAD()
 
-	// Generate random nonce
-	nonce := make([]byte, chacha20poly1305.NonceSize)
-	rand.Read(nonce)
-
-	// Encrypt (seal appends auth tag)
-	ciphertext := aead.Seal(nil, nonce, plaintext, nil)
-
-	// Return nonce + ciphertext
-	result := make([]byte, len(nonce)+len(ciphertext))
-	copy(result, nonce)
-	copy(result[len(nonce):], ciphertext)
-
-	return result
+	// One allocation for nonce + ciphertext + tag: the nonce is generated
+	// in place at the front and Seal appends the ciphertext directly after
+	// it. (Previously: a nonce alloc, a Seal alloc, and a third alloc plus
+	// a full memcpy to concatenate them -- per block.)
+	const ns = chacha20poly1305.NonceSize
+	out := make([]byte, ns, ns+len(plaintext)+aead.Overhead())
+	rand.Read(out[:ns])
+	return aead.Seal(out, out[:ns], plaintext, nil)
 }
 
 // decryptBlock decrypts ChaCha20-Poly1305 encrypted data

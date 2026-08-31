@@ -206,8 +206,9 @@ func TestByteBudgetOversizedRequestNotDeadlocked(t *testing.T) {
 // --- TreeReader ---
 
 // buildTreeFixture writes n files of the given size under dir and returns
-// FileEntry values for them (Kind, Size, BlockSize, Blocks set; AbsPath
-// pointing at the real file), plus the raw content of each for comparison.
+// FileEntry values for them (Kind, Size, BlockSize, Blocks set; RelPath is
+// just the base name, so a TreeReader rooted at dir opens the real file),
+// plus the raw content of each for comparison.
 func buildTreeFixture(t *testing.T, dir string, sizes []int, seed int64) ([]*FileEntry, [][]byte) {
 	t.Helper()
 	entries := make([]*FileEntry, len(sizes))
@@ -227,7 +228,6 @@ func buildTreeFixture(t *testing.T, dir string, sizes []int, seed int64) ([]*Fil
 		entries[i] = &FileEntry{
 			ID:        uint32(i),
 			RelPath:   name,
-			AbsPath:   path,
 			Size:      uint64(sz),
 			Kind:      KindFile,
 			BlockSize: bs,
@@ -255,7 +255,7 @@ func TestTreeReaderReadsAllFilesInOrder(t *testing.T) {
 		sess.AddFile(fe)
 	}
 
-	tr := NewTreeReader(feedEntries(entries), sess, 8192)
+	tr := NewTreeReader(dir, feedEntries(entries), sess, 8192)
 	tr.Start()
 
 	got := make(map[uint32][]byte)
@@ -300,9 +300,9 @@ func TestTreeReaderSkipsDirsSkippedAndEmptyEntries(t *testing.T) {
 		{ID: 0, RelPath: "adir", Kind: KindDir},
 		{ID: 1, RelPath: "skipped", Kind: KindSkipped},
 		{ID: 2, RelPath: "empty.txt", Kind: KindFile, Size: 0},
-		{ID: 3, RelPath: fileEntries[0].RelPath, AbsPath: fileEntries[0].AbsPath, Kind: KindFile, Size: fileEntries[0].Size, BlockSize: fileEntries[0].BlockSize},
+		{ID: 3, RelPath: fileEntries[0].RelPath, Kind: KindFile, Size: fileEntries[0].Size, BlockSize: fileEntries[0].BlockSize},
 	}
-	tr := NewTreeReader(feedEntries(entries), nil, 4096)
+	tr := NewTreeReader(dir, feedEntries(entries), nil, 4096)
 	tr.Start()
 	var n int
 	var sawFileID uint32 = 9999
@@ -326,13 +326,13 @@ func TestTreeReaderOpenFailureRecordsSessionFailureAndContinues(t *testing.T) {
 	dir := t.TempDir()
 	entries, contents := buildTreeFixture(t, dir, []int{50, 50}, 32)
 	// Point the first entry at a nonexistent path.
-	entries[0].AbsPath = filepath.Join(dir, "does-not-exist.bin")
+	entries[0].RelPath = "does-not-exist.bin"
 
 	sess := NewSyncSession()
 	for _, fe := range entries {
 		sess.AddFile(fe)
 	}
-	tr := NewTreeReader(feedEntries(entries), sess, 4096)
+	tr := NewTreeReader(dir, feedEntries(entries), sess, 4096)
 	tr.Start()
 
 	var got []byte
@@ -369,7 +369,7 @@ func TestTreeReaderSkipsAlreadyFailedFile(t *testing.T) {
 	}
 	sess.failFile(0, errors.New("pre-marked failed"))
 
-	tr := NewTreeReader(feedEntries(entries), sess, 4096)
+	tr := NewTreeReader(dir, feedEntries(entries), sess, 4096)
 	tr.Start()
 	var sawFileID uint32 = 9999
 	var count int
@@ -396,7 +396,7 @@ func TestPrecomputeTreeBlocksPopulatesFields(t *testing.T) {
 		sess.AddFile(fe)
 	}
 
-	tr := NewTreeReader(feedEntries(entries), sess, 1<<20)
+	tr := NewTreeReader(dir, feedEntries(entries), sess, 1<<20)
 	tr.Start()
 
 	out := make(chan PrecomputedBlock, 16)
@@ -451,13 +451,124 @@ func TestPrecomputeTreeBlocksPopulatesFields(t *testing.T) {
 	}
 }
 
+// TestPrecomputeTreeBlocksRoutesSmallFilesToOneWorker proves the routing
+// contract precomputeTreeBlocksRouted adds on top of precomputeTreeBlocks:
+// a file with Blocks <= workers has every one of its blocks delivered on
+// exactly one dedicated channel (never on shared), while a file with more
+// blocks than workers is delivered entirely on shared (never on any
+// dedicated channel) -- exactly affinityWorker's contract, exercised
+// end-to-end through the real hashing goroutines rather than called
+// directly.
+func TestPrecomputeTreeBlocksRoutesSmallFilesToOneWorker(t *testing.T) {
+	const workers = 4
+	dir := t.TempDir()
+	// f00: 8202 bytes -> 3 blocks (<=workers, routed). f01: 4097 bytes ->
+	// 2 blocks (<=workers, routed). f02: 40960 bytes -> 10 blocks
+	// (>workers, must stay on shared).
+	entries, contents := buildTreeFixture(t, dir, []int{4096*2 + 10, 4096 + 1, 4096 * 10}, 50)
+	sess := NewSyncSession()
+	for _, fe := range entries {
+		sess.AddFile(fe)
+	}
+
+	tr := NewTreeReader(dir, feedEntries(entries), sess, 1<<20)
+	tr.Start()
+
+	shared := make(chan PrecomputedBlock, 16)
+	dedChans := make([]chan PrecomputedBlock, workers)
+	sendDed := make([]chan<- PrecomputedBlock, workers)
+	for i := range dedChans {
+		dedChans[i] = make(chan PrecomputedBlock, 16)
+		sendDed[i] = dedChans[i]
+	}
+	precomputeTreeBlocksRouted(tr, sess, shared, sendDed, workers, true)
+
+	// Drain all workers+1 channels concurrently, tagging each block with
+	// which channel it arrived on ("shared" or a dedicated index).
+	type tagged struct {
+		pb  PrecomputedBlock
+		src string
+	}
+	results := make(chan tagged, 256)
+	var drainWG sync.WaitGroup
+	drainWG.Add(1)
+	go func() {
+		defer drainWG.Done()
+		for pb := range shared {
+			results <- tagged{pb, "shared"}
+		}
+	}()
+	for i, ch := range dedChans {
+		drainWG.Add(1)
+		go func(i int, ch <-chan PrecomputedBlock) {
+			defer drainWG.Done()
+			for pb := range ch {
+				results <- tagged{pb, fmt.Sprintf("dedicated[%d]", i)}
+			}
+		}(i, ch)
+	}
+	go func() {
+		drainWG.Wait()
+		close(results)
+	}()
+
+	seenSrc := map[uint32]map[string]bool{}      // FileID -> set of sources its blocks arrived on
+	seenBlocks := map[uint32]map[uint32][]byte{} // FileID -> BlockIdx -> data
+	for r := range results {
+		fe := sess.FileByID(r.pb.FileID)
+		if fe == nil {
+			t.Fatalf("PrecomputedBlock references unknown FileID %d", r.pb.FileID)
+		}
+		if seenSrc[r.pb.FileID] == nil {
+			seenSrc[r.pb.FileID] = map[string]bool{}
+			seenBlocks[r.pb.FileID] = map[uint32][]byte{}
+		}
+		seenSrc[r.pb.FileID][r.src] = true
+		seenBlocks[r.pb.FileID][r.pb.BlockIdx] = append([]byte(nil), r.pb.Data...)
+		r.pb.Release()
+	}
+
+	for _, fe := range entries {
+		wantWorker := affinityWorker(fe.ID, fe.Blocks, workers)
+		srcs := seenSrc[fe.ID]
+		if len(srcs) != 1 {
+			t.Errorf("FileID %d (blocks=%d): blocks arrived on %d distinct sources %v, want exactly 1", fe.ID, fe.Blocks, len(srcs), srcs)
+			continue
+		}
+		var gotSrc string
+		for s := range srcs {
+			gotSrc = s
+		}
+		wantSrc := "shared"
+		if wantWorker >= 0 {
+			wantSrc = fmt.Sprintf("dedicated[%d]", wantWorker)
+		}
+		if gotSrc != wantSrc {
+			t.Errorf("FileID %d (blocks=%d): arrived on %s, want %s", fe.ID, fe.Blocks, gotSrc, wantSrc)
+		}
+
+		var reassembled []byte
+		for idx := uint32(0); idx < fe.Blocks; idx++ {
+			chunk, ok := seenBlocks[fe.ID][idx]
+			if !ok {
+				t.Errorf("FileID %d: block %d never arrived", fe.ID, idx)
+				continue
+			}
+			reassembled = append(reassembled, chunk...)
+		}
+		if !bytes.Equal(reassembled, contents[fe.ID]) {
+			t.Errorf("FileID %d: reassembled content mismatch", fe.ID)
+		}
+	}
+}
+
 func TestPrecomputeTreeBlocksHashMatchesDirectComputation(t *testing.T) {
 	dir := t.TempDir()
 	entries, contents := buildTreeFixture(t, dir, []int{4096}, 41)
 	sess := NewSyncSession()
 	sess.AddFile(entries[0])
 
-	tr := NewTreeReader(feedEntries(entries), sess, 1<<20)
+	tr := NewTreeReader(dir, feedEntries(entries), sess, 1<<20)
 	tr.Start()
 	out := make(chan PrecomputedBlock, 4)
 	precomputeTreeBlocks(tr, sess, out, 1, true)
@@ -481,11 +592,11 @@ func TestPrecomputeTreeBlocksReleaseNeverPanicsOnCompressedOrZero(t *testing.T) 
 		t.Fatal(err)
 	}
 	entries := []*FileEntry{
-		{ID: 0, RelPath: "zero.bin", AbsPath: zeroPath, Kind: KindFile, Size: 4096, BlockSize: 4096},
+		{ID: 0, RelPath: "zero.bin", Kind: KindFile, Size: 4096, BlockSize: 4096},
 	}
 	sess := NewSyncSession()
 	sess.AddFile(entries[0])
-	tr := NewTreeReader(feedEntries(entries), sess, 1<<20)
+	tr := NewTreeReader(dir, feedEntries(entries), sess, 1<<20)
 	tr.Start()
 	out := make(chan PrecomputedBlock, 4)
 	precomputeTreeBlocks(tr, sess, out, 1, false)

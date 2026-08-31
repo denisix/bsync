@@ -187,8 +187,11 @@ func copyBinaryToRemote(sshTarget, sshPort string) (string, error) {
 // -w; unlike blockSize/skipIdx/quiet/noCompress, this was never forwarded
 // at all before directory mode needed it to size startDirServer's fd
 // budget and worker-facing connection handling correctly, not just the
-// legacy path's OrderedWriter reorder window.
-func startRemoteSSH(targetPath, port string, blockSize, skipIdx uint32, quiet bool, noCompress bool, dirMode bool, workers int) (*exec.Cmd, error) {
+// legacy path's OrderedWriter reorder window. memLimitMB forwards -memlimit
+// (0 = not set): the destination is typically the side under the most
+// per-entry memory pressure on a large tree, so it gets the same safety
+// valve the local process was given.
+func startRemoteSSH(targetPath, port string, blockSize, skipIdx uint32, quiet bool, noCompress bool, dirMode bool, workers int, memLimitMB uint64) (*exec.Cmd, error) {
 	// split sshTarget "user@host:/remote/path" -> "user@host" and "/remote/path"
 	user, host, sshPort, file := parseSSHTarget(targetPath)
 
@@ -212,6 +215,9 @@ func startRemoteSSH(targetPath, port string, blockSize, skipIdx uint32, quiet bo
 		}
 		if dirMode {
 			args = append(args, "-R")
+		}
+		if memLimitMB > 0 {
+			args = append(args, "-memlimit", strconv.FormatUint(memLimitMB, 10))
 		}
 		// Pass encryption key if enabled
 		if IsEncryptionEnabled() {
@@ -277,6 +283,10 @@ func startRemoteSSH(targetPath, port string, blockSize, skipIdx uint32, quiet bo
 
 	if dirMode {
 		remoteArgs = append(remoteArgs, "-R")
+	}
+
+	if memLimitMB > 0 {
+		remoteArgs = append(remoteArgs, "-memlimit", strconv.FormatUint(memLimitMB, 10))
 	}
 
 	// Pass encryption key if enabled

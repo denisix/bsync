@@ -30,7 +30,35 @@ var (
 
 	// Visualization
 	cliVisualizer *Visualizer
+
+	// lastStatsLogNs rate-limits printStats's Log call (see statsLogInterval).
+	lastStatsLogNs atomic.Int64
 )
+
+// statsLogInterval caps how often printStats/serverPrintStats actually emit
+// a line. Every call still updates the shared counters (diffs/totCompSize/
+// totOrigSize) under the lock -- only the Log formatting and write, the
+// expensive and highly contended part, is throttled. Every block still
+// updates the counters; only the terminal noise is capped, at roughly the
+// rate a human eye reads it anyway.
+const statsLogInterval = 50 * time.Millisecond
+
+// statsShouldLog reports whether enough time has passed since the last
+// printStats/serverPrintStats line, and if so claims this call as the one
+// that logs (so concurrent callers don't all pass at once). last is the
+// block index; force always logs (used for the final block, so a transfer
+// never ends on a stale progress line).
+func statsShouldLog(force bool) bool {
+	if force {
+		return true
+	}
+	now := time.Now().UnixNano()
+	last := lastStatsLogNs.Load()
+	if now-last < int64(statsLogInterval) {
+		return false
+	}
+	return lastStatsLogNs.CompareAndSwap(last, now)
+}
 
 // ETA, stats
 func printStats(job BlockJob, indicator string, diff, bytes uint32) {
@@ -52,6 +80,10 @@ func printStats(job BlockJob, indicator string, diff, bytes uint32) {
 	localComp := totCompSize
 	localOrig := totOrigSize
 	mu.Unlock()
+
+	if !statsShouldLog(job.blockIdx >= lastBlockNum) {
+		return
+	}
 
 	currentBlockSize := atomic.LoadUint32(&blockSize)
 	blockMb := float64(currentBlockSize) / float64(mb1)
@@ -210,9 +242,12 @@ func startClient(file *os.File, serverAddress string, skipIdx uint32, fileSize u
 	if cliVisualizer != nil {
 		cliVisualizer.RenderFinal()
 	}
-	// Brief margin to flush the DONE message; the caller's sshCmd.Wait()
-	// already blocks until the server has fully finished.
-	time.Sleep(doneFlushDelay)
+	// The server closes this connection as soon as it has read DONE, so wait
+	// for that close (normally sub-millisecond) instead of sleeping a fixed
+	// margin; doneFlushDelay only bounds the wait if the server never does.
+	// The caller's sshCmd.Wait() separately blocks until the server has
+	// fully finished.
+	conn.AwaitClose(doneFlushDelay)
 	return nil
 }
 
@@ -345,11 +380,8 @@ func processPrecomputedBlock(conn *AutoReconnectTCP, block PrecomputedBlock, blo
 		return fmt.Errorf("pack data: %w", err1)
 	}
 
-	if err := connWrite(conn, msg2); err != nil {
-		return fmt.Errorf("send data header: %w", err)
-	}
-	if err := connWrite(conn, dataToSend); err != nil {
-		return fmt.Errorf("send data payload: %w", err)
+	if err := connWriteFrame(conn, msg2, dataToSend); err != nil {
+		return fmt.Errorf("send data block: %w", err)
 	}
 	if err := waitForBlockAck(conn, block.BlockIdx); err != nil {
 		return fmt.Errorf("ack data: %w", err)

@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	rtdebug "runtime/debug" // aliased: this package already has a bool var named debug (server.go's -debug logging flag)
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -58,6 +59,25 @@ func pickHighPort() string {
 	return strconv.Itoa(10001 + rand.Intn(50000))
 }
 
+// dirOnlyFlags are the flags that only mean anything in directory-tree mode.
+// A single list, rather than a validation branch per flag, so adding one
+// cannot silently skip the check -- and so a test can assert the whole set
+// (see TestDirOnlyFlagsRejectedInSingleFileMode).
+var dirOnlyFlags = []string{"exclude", "quick-check", "ignore-times", "delete", "links", "specials"}
+
+// firstDirOnlyFlagUsed returns the first directory-only flag the user
+// actually PASSED, or "" if none. Keyed on what was passed rather than on the
+// flags' values: quick-check now defaults to true, so testing its value here
+// would reject every single-file transfer.
+func firstDirOnlyFlagUsed(setFlags map[string]bool) string {
+	for _, name := range dirOnlyFlags {
+		if setFlags[name] {
+			return name
+		}
+	}
+	return ""
+}
+
 func main() {
 	var device string
 	var remoteAddr string
@@ -79,6 +99,12 @@ func main() {
 	var suppressProgressFlag bool
 	var forceDirMode bool
 	var excludeFlag string
+	var quickCheck bool
+	var ignoreTimes bool
+	var deleteFlag bool
+	var syncLinks bool
+	var syncSpecials bool
+	var memLimitMB uint64
 
 	flag.BoolVar(&listAllDrives, "a", false, "list available drives and partitions")
 	flag.StringVar(&device, "f", "/dev/zero", "specify file or device, i.e. '/dev/vda'")
@@ -103,12 +129,57 @@ func main() {
 	flag.BoolVar(&visual, "v", false, "enable visual block-by-block progress display")
 	flag.BoolVar(&forceDirMode, "R", false, "force recursive directory-tree mode (auto-detected from -f when it's already a directory)")
 	flag.StringVar(&excludeFlag, "exclude", "", "comma-separated glob patterns to skip in directory mode (matched against each entry's full relative path and its base name)")
+	flag.BoolVar(&quickCheck, "quick-check", true, "directory mode only: skip a file entirely if the destination already has the same size and modification time (second precision), like rsync's quick check; on by default -- use -ignore-times to compare every block instead")
+	flag.BoolVar(&ignoreTimes, "ignore-times", false, "directory mode only: never skip a file on matching size+modification time; compare every block of every file (like rsync's -I). Slower, but catches a file rewritten within the same second at the same size")
+	flag.BoolVar(&deleteFlag, "delete", false, "directory mode only: before syncing, remove destination files/directories not present in the source (like rsync's --delete-before); excluded and symlinked/special-file paths are protected, not removed")
+	flag.BoolVar(&syncLinks, "links", false, "directory mode only: recreate source symlinks at the destination with identical target paths (like rsync -l); without it symlinks are skipped")
+	flag.BoolVar(&syncSpecials, "specials", false, "directory mode only: recreate source FIFOs (named pipes) and unix sockets at the destination (like rsync --specials); device nodes are still skipped, and without it all special files are skipped")
+	flag.Uint64Var(&memLimitMB, "memlimit", 0, "soft memory limit in MB for this process (0 = off; the GOMEMLIMIT environment variable is honored either way). A safety valve against an unexpectedly large tree, NOT a fix for a large live heap -- against one of those it makes the GC work harder rather than freeing memory that's still genuinely in use")
 
 	flag.Parse() // after declaring flags we need to call it
+
+	// Applied as early as possible, before any allocation-heavy path
+	// branches below. debug.SetMemoryLimit is a SOFT ceiling: the GC works
+	// harder as the heap approaches it, and only refuses to grow past it if
+	// it can -- it is a safety valve against an unexpectedly large tree,
+	// not a substitute for the structural fixes that keep steady-state
+	// memory bounded in the first place. Applying it against a genuinely
+	// large live heap produces a GC death spiral (throughput collapses
+	// while memory stays high) rather than relief, so this is deliberately
+	// opt-in (default 0 = off) rather than a derived default. Go already
+	// honors the GOMEMLIMIT environment variable natively regardless of
+	// this flag, so operators have that escape hatch even without it.
+	if memLimitMB > 0 {
+		rtdebug.SetMemoryLimit(int64(memLimitMB) << 20)
+		Log("soft memory limit set to %d MB\n", memLimitMB)
+	}
+
+	// Which flags the user actually PASSED. quick-check now defaults to true,
+	// so the "directory mode only" validation below can no longer test its
+	// value -- that would reject every single-file transfer. Only an explicit
+	// mention is an error there.
+	setFlags := map[string]bool{}
+	flag.Visit(func(f *flag.Flag) { setFlags[f.Name] = true })
+
+	// -ignore-times is the opt-out: it wins over -quick-check however the two
+	// are combined, so a script that passes both gets the conservative
+	// (compare-everything) behavior it asked for.
+	if ignoreTimes {
+		quickCheck = false
+	}
 
 	if listAllDrives {
 		listDrives()
 		return
+	}
+
+	// BSYNC_CPUPROFILE=<path> writes a CPU profile covering the whole
+	// transfer, for `go tool pprof`. Env var rather than a flag: it is a
+	// developer tool, and -t forwards flags to the remote side, where a
+	// profile path would be meaningless. Best-effort -- a profile that
+	// cannot be started must never abort a transfer.
+	if stop := startCPUProfile(os.Getenv("BSYNC_CPUPROFILE")); stop != nil {
+		defer stop()
 	}
 
 	// Set compression level
@@ -126,6 +197,10 @@ func main() {
 		Err("Block size must be between 1 and %d bytes\n", ^uint32(0))
 	}
 	blockSize = uint32(bSize)
+	// The zstd window is derived from blockSize (see zstdWindowSize), and
+	// SetCompressionLevel ran above, before blockSize was known. Rebuild the
+	// encoder pool now that both inputs are final.
+	resetEncoderPool()
 	if workers == 0 {
 		Err("Worker count must be at least 1\n")
 	}
@@ -165,8 +240,10 @@ func main() {
 		if visual {
 			Err("directory mode does not support -v (visual block-grid display); its own progress line is always shown instead\n")
 		}
-	} else if excludeFlag != "" {
-		Err("-exclude is only supported in directory mode (-R or a directory -f target)\n")
+	} else {
+		if name := firstDirOnlyFlagUsed(setFlags); name != "" {
+			Err("-%s is only supported in directory mode (-R or a directory -f target)\n", name)
+		}
 	}
 	excludePatterns := parseExcludePatterns(excludeFlag)
 
@@ -338,7 +415,7 @@ func main() {
 			if sshTarget != "" {
 				Log("launching remote server via SSH: %s\n", sshTarget)
 				var err error
-				sshCmd, err = startRemoteSSH(sshTarget, port, blockSize, uint32(skipIdx), quiet, noCompress, true, int(workers))
+				sshCmd, err = startRemoteSSH(sshTarget, port, blockSize, uint32(skipIdx), quiet, noCompress, true, int(workers), memLimitMB)
 				if err != nil {
 					Err("Error: SSH launch failed: %s\n", err)
 					return
@@ -346,7 +423,7 @@ func main() {
 				defer sshCmd.Wait()
 			}
 
-			sess, err := startDirClient(device, remoteAddr, blockSize, noCompress, int(workers), excludePatterns)
+			sess, err := startDirClient(device, remoteAddr, blockSize, noCompress, int(workers), excludePatterns, quickCheck, deleteFlag, syncLinks, syncSpecials)
 			if err != nil {
 				if sshCmd != nil {
 					sshCmd.Process.Kill()
@@ -358,7 +435,7 @@ func main() {
 			if sess.FailedCount() > 0 {
 				Log("synced with %d failed file(s); see earlier log lines for details\n", sess.FailedCount())
 			} else {
-				Log("directory sync complete: %d files, %s\n", sess.FileCount(), formatBytesShort(sess.TotalBytes()))
+				Log("directory sync complete: %d files, %s\n", sess.FileCount(), sess.TransferSummary())
 			}
 
 			if sshCmd != nil {
@@ -383,7 +460,7 @@ func main() {
 			if sshTarget != "" {
 				Log("launching remote server via SSH: %s\n", sshTarget)
 				var err error
-				sshCmd, err = startRemoteSSH(sshTarget, port, blockSize, uint32(skipIdx), quiet, noCompress, false, int(workers))
+				sshCmd, err = startRemoteSSH(sshTarget, port, blockSize, uint32(skipIdx), quiet, noCompress, false, int(workers), memLimitMB)
 				if err != nil {
 					Err("Error: SSH launch failed: %s\n", err)
 					return
@@ -438,12 +515,14 @@ func main() {
 			TuneHDDReadAhead(device) // Raise HDD read-ahead (best-effort)
 
 			fileSize := getDeviceSize(file)
+			// No checksum precompute here: a download source never compares
+			// hashes (the client writes every block it receives), and the
+			// precompute pass used to run a SECOND full sequential read of
+			// the device concurrently with the serving reader -- two seek
+			// streams on one spindle -- while the serving loop blocked on
+			// its (discarded) result. The cache is passed empty only to keep
+			// startServerUpload's signature shared with the tests.
 			checksumCache := NewChecksumCache(0)
-			if fileSize > 0 {
-				lastBlockNum := uint32((fileSize - 1) / uint64(blockSize))
-				checksumCache = NewChecksumCache(lastBlockNum)
-				go precomputeChecksums(file, blockSize, lastBlockNum, checksumCache, uint32(skipIdx), int(workers))
-			}
 
 			if err := startServerUpload(file, bindIp, port, fileSize, checksumCache, int(workers), noCompress); err != nil {
 				Err("download source failed: %s\n", err)

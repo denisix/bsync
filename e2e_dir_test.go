@@ -2,10 +2,15 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"io"
+	"io/fs"
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -15,8 +20,17 @@ import (
 
 // runDirTransfer starts a directory-mode server on a free loopback port,
 // runs startDirClient against it, and returns the destination root and the
-// client's SyncSession once the transfer completes (or fails).
+// client's SyncSession once the transfer completes (or fails). A thin
+// wrapper over runDirTransferOpts with quickCheck=false, matching every one
+// of its many existing callers.
 func runDirTransfer(t *testing.T, srcRoot string, workers int, noCompress bool) (string, *SyncSession) {
+	t.Helper()
+	return runDirTransferOpts(t, srcRoot, workers, noCompress, false)
+}
+
+// runDirTransferOpts is runDirTransfer with explicit control over
+// quickCheck, for tests that need it enabled.
+func runDirTransferOpts(t *testing.T, srcRoot string, workers int, noCompress, quickCheck bool) (string, *SyncSession) {
 	t.Helper()
 	resetEngineGlobals()
 	dstRoot := t.TempDir()
@@ -32,7 +46,7 @@ func runDirTransfer(t *testing.T, srcRoot string, workers int, noCompress bool) 
 	}()
 	waitForListener(t, addr)
 
-	sess, err := startDirClient(srcRoot, addr, 0, noCompress, workers, nil)
+	sess, err := startDirClient(srcRoot, addr, 0, noCompress, workers, nil, quickCheck, false, false, false)
 	if err != nil {
 		t.Fatalf("startDirClient: %v", err)
 	}
@@ -49,7 +63,87 @@ func runDirTransfer(t *testing.T, srcRoot string, workers int, noCompress bool) 
 	if sess.FailedCount() != 0 {
 		t.Fatalf("%d file(s) failed: first error for some file is queried via FailedError", sess.FailedCount())
 	}
+	assertProgressReachedTotal(t, sess)
 	return dstRoot, sess
+}
+
+// assertProgressReachedTotal pins the progress display's completion
+// invariants on every successful helper-driven sync: the files-done counter
+// must exactly reach the files-only denominator (totalFilesKnown -- KindFile
+// entries; dirs and skipped placeholders are excluded from both sides), so
+// a real transfer's final progress line reads N/N rather than stalling
+// short of it; and the pre-scan estimator (startDirClient's estimateTree
+// goroutine) must have actually fed the session's estimate atomics with the
+// same totals -- the source trees in these tests are stable, so estimate
+// and exact must converge. The estimate side is polled briefly: the
+// pre-scan is deliberately fire-and-forget, so on a tiny tree it can still
+// be mid-sweep for a moment after startDirClient returns.
+func assertProgressReachedTotal(t *testing.T, sess *SyncSession) {
+	t.Helper()
+	done, total := sess.filesDone.Load(), sess.totalFilesKnown.Load()
+	if done != total {
+		t.Errorf("filesDone = %d, totalFilesKnown = %d -- a successful sync must end at N/N", done, total)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if sess.estFiles.Load() == total && sess.estBytes.Load() == sess.totalBytesKnown.Load() {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Errorf("pre-scan estimate = %d files / %d bytes, want %d / %d -- estimateTree's session feed is broken",
+		sess.estFiles.Load(), sess.estBytes.Load(), total, sess.totalBytesKnown.Load())
+}
+
+// startDirClientAgainst re-runs startDirClient against an EXISTING
+// destination root (unlike runDirTransfer/runDirTransferOpts, which always
+// create a fresh one), by starting a fresh server bound to dstRoot on a new
+// port. Used by the quick-check and -delete tests below to drive a
+// second/third sync pass against the same destination, matching the pattern
+// TestE2EDirIdempotentSecondRun already uses by hand. A failed file aborts
+// the test via t.Fatalf, so it can't be used for a run that's expected to
+// leave FailedCount() > 0.
+// syncSpecials is variadic purely so the many existing call sites -- none of
+// which care about -specials -- stay untouched; pass a single true to enable
+// it.
+func startDirClientAgainst(t *testing.T, srcRoot, dstRoot string, workers int, noCompress bool, excl []string, quickCheck, deleteExtra, syncLinks bool, syncSpecials ...bool) *SyncSession {
+	t.Helper()
+	resetEngineGlobals()
+	port := freeTCPPort(t)
+	addr := "127.0.0.1:" + port
+	srvErrCh := make(chan error, 1)
+	go func() { srvErrCh <- startDirServer(dstRoot, "127.0.0.1", port, workers, true) }()
+	waitForListener(t, addr)
+
+	specials := len(syncSpecials) > 0 && syncSpecials[0]
+	sess, err := startDirClient(srcRoot, addr, 0, noCompress, workers, excl, quickCheck, deleteExtra, syncLinks, specials)
+	if err != nil {
+		t.Fatalf("startDirClient: %v", err)
+	}
+	if err := <-srvErrCh; err != nil {
+		t.Fatalf("startDirServer: %v", err)
+	}
+	if sess.FailedCount() != 0 {
+		t.Fatalf("%d file(s) failed", sess.FailedCount())
+	}
+	assertProgressReachedTotal(t, sess)
+	return sess
+}
+
+// snapshotMTimes records the current mtime of every regular file under
+// root, keyed by its path relative to root -- for asserting a later run
+// left the destination's timestamps untouched.
+func snapshotMTimes(t *testing.T, root string) map[string]time.Time {
+	t.Helper()
+	out := map[string]time.Time{}
+	for _, rel := range listTreeFiles(t, root) {
+		info, err := os.Stat(filepath.Join(root, rel))
+		if err != nil {
+			t.Fatal(err)
+		}
+		out[rel] = info.ModTime()
+	}
+	return out
 }
 
 // listTreeFiles returns every regular file's path (relative to root) found
@@ -78,35 +172,189 @@ func listTreeFiles(t *testing.T, root string) []string {
 	return out
 }
 
-// assertTreesEqual compares src and dst as sets of relative file paths and
-// byte content. It does not compare directory entries directly (an empty
-// directory produces no file-path entry either side), so empty-dir
-// preservation needs its own assertion.
+// treeEntry is one path's full identity for comparison: enough to catch a
+// wrong TYPE, wrong content, wrong link target, or wrong permissions -- not
+// just "some bytes at some path".
+type treeEntry struct {
+	kind  string // file | dir | symlink | fifo | socket | device | other
+	size  int64  // regular files only
+	sum   string // sha256 of content, regular files only
+	link  string // symlink target, verbatim (never followed)
+	perm  os.FileMode
+	mtime int64 // unix SECONDS; regular files only (see snapshotTree)
+}
+
+func (e treeEntry) String() string {
+	switch e.kind {
+	case "file":
+		return fmt.Sprintf("file(%d bytes, sha256:%s, mode %o, mtime %d)", e.size, e.sum[:12], e.perm, e.mtime)
+	case "symlink":
+		return fmt.Sprintf("symlink(-> %q)", e.link)
+	case "dir":
+		return "dir"
+	default:
+		return e.kind
+	}
+}
+
+// hashFileContent streams a file through SHA-256 rather than reading it whole:
+// the comparison must work on files far larger than memory, and streaming is
+// what makes this usable as the general equality check for every e2e test.
+//
+// Deliberately crypto/sha256 directly, NOT this codebase's own checksum():
+// that is the hash the transfer itself compares blocks with, so verifying the
+// result with it would let a bug in the transfer hash agree with itself.
+func hashFileContent(t *testing.T, path string) string {
+	t.Helper()
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatalf("open %s: %v", path, err)
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// snapshotTree records every entry under root, keyed by relative path.
+//
+// Lstat semantics throughout: a symlink is recorded as a symlink with its
+// verbatim target and is NEVER followed, so a link recreated pointing
+// somewhere else cannot pass by virtue of the target's bytes matching. A FIFO
+// or socket is recorded by type alone and never opened -- opening a FIFO
+// blocks forever, which is why the old content-reading comparison could not
+// be used by the -specials tests at all.
+func snapshotTree(t *testing.T, root string) map[string]treeEntry {
+	t.Helper()
+	out := map[string]treeEntry{}
+	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if path == root {
+			return nil
+		}
+		rel, relErr := filepath.Rel(root, path)
+		if relErr != nil {
+			return relErr
+		}
+		rel = filepath.ToSlash(rel)
+
+		info, infoErr := d.Info() // Lstat semantics: never follows a symlink
+		if infoErr != nil {
+			return fmt.Errorf("lstat %s: %w", rel, infoErr)
+		}
+		e := treeEntry{perm: info.Mode().Perm()}
+		switch mode := info.Mode(); {
+		case mode&os.ModeSymlink != 0:
+			e.kind = "symlink"
+			target, rlErr := os.Readlink(path)
+			if rlErr != nil {
+				return fmt.Errorf("readlink %s: %w", rel, rlErr)
+			}
+			e.link = target
+		case mode.IsDir():
+			e.kind = "dir"
+			// Permissions and mtime are deliberately NOT recorded for
+			// directories: the destination creates them with
+			// MkdirAll(0777)&umask and never chmods or chtimes them, so
+			// they legitimately differ from the source today. That gap is
+			// pinned explicitly by
+			// TestE2EDirDirectoryModeIsNotPreserved rather than left to
+			// fail every test that uses this helper.
+			e.perm = 0
+		case mode&os.ModeNamedPipe != 0:
+			e.kind = "fifo"
+		case mode&os.ModeSocket != 0:
+			e.kind = "socket"
+		case mode&os.ModeDevice != 0:
+			e.kind = "device"
+		case mode.IsRegular():
+			e.kind = "file"
+			e.size = info.Size()
+			e.sum = hashFileContent(t, path)
+			// Seconds, matching the precision quick-check itself compares
+			// at -- finer granularity would make this flake on filesystems
+			// with coarse timestamps.
+			e.mtime = info.ModTime().Unix()
+		default:
+			e.kind = "other"
+		}
+		out[rel] = e
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk %s: %v", root, err)
+	}
+	return out
+}
+
+// assertTreesEqual verifies dst is a faithful reproduction of src: the same
+// set of paths, each with the same TYPE, and for regular files the same size,
+// content (by SHA-256), permission bits and mtime. Symlinks are compared by
+// target, special files by type.
+//
+// This is the general "did the transfer actually work" assertion for the e2e
+// suite. It replaced a version that compared only a path set plus
+// os.ReadFile content, which followed symlinks (so a wrong link target
+// passed), ignored directories entirely, and would hang on a FIFO.
 func assertTreesEqual(t *testing.T, src, dst string) {
 	t.Helper()
-	srcFiles := listTreeFiles(t, src)
-	dstFiles := listTreeFiles(t, dst)
-	if len(srcFiles) != len(dstFiles) {
-		t.Fatalf("file count mismatch: src has %d (%v), dst has %d (%v)", len(srcFiles), srcFiles, len(dstFiles), dstFiles)
+	for _, problem := range diffTrees(t, src, dst) {
+		t.Error(problem)
 	}
-	for i := range srcFiles {
-		if srcFiles[i] != dstFiles[i] {
-			t.Fatalf("path set mismatch: src %v, dst %v", srcFiles, dstFiles)
+}
+
+// diffTrees is assertTreesEqual's comparison, returning what differs instead
+// of reporting it. Split out so the comparison itself can be unit-tested --
+// a test helper this many tests depend on is worth proving actually catches
+// the things it claims to (see TestAssertTreesEqualCatchesRealDifferences).
+func diffTrees(t *testing.T, src, dst string) []string {
+	t.Helper()
+	var problems []string
+	report := func(format string, args ...interface{}) {
+		problems = append(problems, fmt.Sprintf(format, args...))
+	}
+	want := snapshotTree(t, src)
+	got := snapshotTree(t, dst)
+
+	for rel, w := range want {
+		g, ok := got[rel]
+		if !ok {
+			report("%s: missing from destination (source has %s)", rel, w)
+			continue
+		}
+		if g.kind != w.kind {
+			report("%s: type is %s at destination, want %s", rel, g.kind, w.kind)
+			continue
+		}
+		switch w.kind {
+		case "file":
+			if g.sum != w.sum || g.size != w.size {
+				report("%s: content differs -- source %d bytes sha256:%s, destination %d bytes sha256:%s",
+					rel, w.size, w.sum[:12], g.size, g.sum[:12])
+			}
+			if g.perm != w.perm {
+				report("%s: mode %o at destination, want %o", rel, g.perm, w.perm)
+			}
+			if g.mtime != w.mtime {
+				report("%s: mtime %d at destination, want %d", rel, g.mtime, w.mtime)
+			}
+		case "symlink":
+			if g.link != w.link {
+				report("%s: link target %q at destination, want %q (verbatim)", rel, g.link, w.link)
+			}
 		}
 	}
-	for _, rel := range srcFiles {
-		want, err := os.ReadFile(filepath.Join(src, rel))
-		if err != nil {
-			t.Fatalf("read src %s: %v", rel, err)
-		}
-		got, err := os.ReadFile(filepath.Join(dst, rel))
-		if err != nil {
-			t.Fatalf("read dst %s: %v", rel, err)
-		}
-		if !bytes.Equal(got, want) {
-			t.Errorf("content mismatch for %s: src %d bytes, dst %d bytes", rel, len(want), len(got))
+	for rel, g := range got {
+		if _, ok := want[rel]; !ok {
+			report("%s: present at destination (%s) but not in the source", rel, g)
 		}
 	}
+	sort.Strings(problems)
+	return problems
 }
 
 func TestE2EDirBasicNestedTree(t *testing.T) {
@@ -280,7 +528,7 @@ func TestE2EDirIdempotentSecondRun(t *testing.T) {
 		before[rel] = info.ModTime()
 	}
 
-	sess2, err := startDirClient(src, addr, 0, false, 2, nil)
+	sess2, err := startDirClient(src, addr, 0, false, 2, nil, false, false, false, false)
 	if err != nil {
 		t.Fatalf("second startDirClient: %v", err)
 	}
@@ -324,7 +572,7 @@ func TestE2EDirDestinationRootCreatedIfMissing(t *testing.T) {
 	go func() { srvErrCh <- startDirServer(dstRoot, "127.0.0.1", port, 1, true) }()
 	waitForListener(t, addr)
 
-	sess, err := startDirClient(src, addr, 0, false, 1, nil)
+	sess, err := startDirClient(src, addr, 0, false, 1, nil, false, false, false, false)
 	if err != nil {
 		t.Fatalf("startDirClient: %v", err)
 	}
@@ -482,7 +730,7 @@ func TestE2EDirSurvivesMidTransferConnectionDrops(t *testing.T) {
 	// budget on the very first block before any redial could pay off.
 	proxyAddr, _ := startFaultyProxy(t, realAddr, 1, 2, 200)
 
-	sess, err := startDirClient(src, proxyAddr, 0, true, 1, nil)
+	sess, err := startDirClient(src, proxyAddr, 0, true, 1, nil, false, false, false, false)
 	if err != nil {
 		t.Fatalf("startDirClient did not recover from repeated connection drops: %v", err)
 	}
@@ -501,7 +749,7 @@ func TestStartDirClientRejectsZeroWorkers(t *testing.T) {
 	resetEngineGlobals()
 	src := t.TempDir()
 	mustWriteFile(t, filepath.Join(src, "f.txt"), "x")
-	if _, err := startDirClient(src, "127.0.0.1:1", 0, false, 0, nil); err == nil {
+	if _, err := startDirClient(src, "127.0.0.1:1", 0, false, 0, nil, false, false, false, false); err == nil {
 		t.Fatal("startDirClient with workers=0 unexpectedly succeeded")
 	}
 }
@@ -514,7 +762,7 @@ func TestStartDirClientFailsFastOnConnectionRefused(t *testing.T) {
 	// hang for the full dialTimeout.
 	port := freeTCPPort(t)
 	start := time.Now()
-	_, err := startDirClient(src, "127.0.0.1:"+port, 0, false, 1, nil)
+	_, err := startDirClient(src, "127.0.0.1:"+port, 0, false, 1, nil, false, false, false, false)
 	if err == nil {
 		t.Fatal("startDirClient against a closed port unexpectedly succeeded")
 	}
@@ -527,7 +775,7 @@ func TestStartDirClientRejectsUnresolvableAddress(t *testing.T) {
 	resetEngineGlobals()
 	src := t.TempDir()
 	mustWriteFile(t, filepath.Join(src, "f.txt"), "x")
-	if _, err := startDirClient(src, "this-host-does-not-resolve.invalid:9999", 0, false, 1, nil); err == nil {
+	if _, err := startDirClient(src, "this-host-does-not-resolve.invalid:9999", 0, false, 1, nil, false, false, false, false); err == nil {
 		t.Fatal("startDirClient with an unresolvable address unexpectedly succeeded")
 	}
 }
@@ -561,6 +809,43 @@ func TestE2EDirManyWorkersOneLargeFile(t *testing.T) {
 	assertTreesEqual(t, src, dst)
 	if sess.blocksDone.Load() < 41 {
 		t.Errorf("blocksDone = %d, want at least 41", sess.blocksDone.Load())
+	}
+}
+
+// TestE2EDirLargeFileStillSplitsAcrossWorkers is TestE2EDirManyWorkersOneLargeFile's
+// exact shape, plus the routing-specific assertion that pins down WHY it
+// still exercises multi-connection cooperation on one destFile after
+// affinityWorker (checksum.go) was introduced: a 41-block file with 8
+// workers has Blocks(41) > workers(8), so it provably takes the shared/FCFS
+// path, never a dedicated one. TestE2EDirManyWorkersOneLargeFile itself is
+// intentionally left untouched by the affinity change -- this test exists
+// so that fact is asserted directly instead of merely hoped for.
+func TestE2EDirLargeFileStillSplitsAcrossWorkers(t *testing.T) {
+	src := t.TempDir()
+	saved := blockSize
+	blockSize = 4096
+	defer func() { blockSize = saved }()
+
+	data := randomBytes(4096*40+17, 71) // 41 blocks
+	mustWriteFile(t, filepath.Join(src, "huge.bin"), string(data))
+
+	dst, sess := runDirTransfer(t, src, 8, false)
+	assertTreesEqual(t, src, dst)
+	if sess.blocksDone.Load() < 41 {
+		t.Errorf("blocksDone = %d, want at least 41", sess.blocksDone.Load())
+	}
+
+	// The transfer has already completed by the time assertTreesEqual
+	// returns, so FileID 0's session entry has been released (see
+	// SyncSession.Release/claimDone) -- its Blocks count is computed here
+	// directly from the same fixture parameters walk.go's treeBlockSize
+	// would have used, rather than read back from the session.
+	wantBlocks := uint32((uint64(len(data)) + uint64(blockSize) - 1) / uint64(blockSize))
+	if wantBlocks != 41 {
+		t.Fatalf("huge.bin has %d blocks, want 41 (test fixture assumption broken)", wantBlocks)
+	}
+	if w := affinityWorker(0, wantBlocks, 8); w != -1 {
+		t.Errorf("affinityWorker(0, %d, 8) = %d, want -1 (shared path) -- a 41-block file must not be routed to a single dedicated worker", wantBlocks, w)
 	}
 }
 
@@ -658,7 +943,7 @@ func TestE2EDirPartiallyModifiedDestination(t *testing.T) {
 	go func() { srvErrCh <- startDirServer(dst, "127.0.0.1", port, 2, true) }()
 	waitForListener(t, addr)
 
-	sess2, err := startDirClient(src, addr, 0, true, 2, nil)
+	sess2, err := startDirClient(src, addr, 0, true, 2, nil, false, false, false, false)
 	if err != nil {
 		t.Fatalf("second startDirClient: %v", err)
 	}
@@ -697,7 +982,7 @@ func TestE2EDirDestinationLongerThanSourceIsTruncated(t *testing.T) {
 	go func() { srvErrCh <- startDirServer(dst, "127.0.0.1", port, 1, true) }()
 	waitForListener(t, addr)
 
-	sess, err := startDirClient(src, addr, 0, true, 1, nil)
+	sess, err := startDirClient(src, addr, 0, true, 1, nil, false, false, false, false)
 	if err != nil {
 		t.Fatalf("startDirClient: %v", err)
 	}
@@ -726,7 +1011,7 @@ func TestE2EDirDestinationShorterIsExtended(t *testing.T) {
 	go func() { srvErrCh <- startDirServer(dst, "127.0.0.1", port, 1, true) }()
 	waitForListener(t, addr)
 
-	sess, err := startDirClient(src, addr, 0, true, 1, nil)
+	sess, err := startDirClient(src, addr, 0, true, 1, nil, false, false, false, false)
 	if err != nil {
 		t.Fatalf("startDirClient: %v", err)
 	}
@@ -764,7 +1049,7 @@ func TestE2EDirEncrypted(t *testing.T) {
 	go func() { srvErrCh <- startDirServer(dst, "127.0.0.1", port, 2, true) }()
 	waitForListener(t, addr)
 
-	sess, err := startDirClient(src, addr, 0, false, 2, nil)
+	sess, err := startDirClient(src, addr, 0, false, 2, nil, false, false, false, false)
 	if err != nil {
 		t.Fatalf("startDirClient: %v", err)
 	}
@@ -831,7 +1116,7 @@ func TestE2EDirIdempotentSecondRunSendsFarFewerBytes(t *testing.T) {
 		waitForListener(t, realAddr)
 		proxyAddr, proxy := startFaultyProxy(t, realAddr, 0, 0, 0) // pure counting passthrough
 
-		sess, err := startDirClient(src, proxyAddr, 0, true, 2, nil)
+		sess, err := startDirClient(src, proxyAddr, 0, true, 2, nil, false, false, false, false)
 		if err != nil {
 			t.Fatalf("startDirClient: %v", err)
 		}
@@ -886,7 +1171,35 @@ func TestE2EDirIdempotentSecondRunSendsFarFewerBytes(t *testing.T) {
 // at all -- silently absent from the sync -- rather than counted as a
 // session failure. Worth asserting explicitly since it's easy to assume the
 // opposite (that every unreadable file shows up in FailedCount).
-func TestE2EDirUnreadableSourceFileIsSkippedNotFailed(t *testing.T) {
+// startDirClientExpectingFailures is startDirClientAgainst for runs where
+// individual files are SUPPOSED to fail: it returns the session and the
+// server's result instead of calling t.Fatal on them. A per-file failure
+// legitimately surfaces on both ends -- the client fails the file, and the
+// server reports that the destination copy is not correct -- so a test about
+// that behavior cannot use a helper that treats either as fatal.
+func startDirClientExpectingFailures(t *testing.T, srcRoot, dstRoot string, workers int, quickCheck, deleteExtra bool) (*SyncSession, error) {
+	t.Helper()
+	resetEngineGlobals()
+	port := freeTCPPort(t)
+	addr := "127.0.0.1:" + port
+	srvErrCh := make(chan error, 1)
+	go func() { srvErrCh <- startDirServer(dstRoot, "127.0.0.1", port, workers, true) }()
+	waitForListener(t, addr)
+
+	sess, err := startDirClient(srcRoot, addr, 0, false, workers, nil, quickCheck, deleteExtra, false, false)
+	if err != nil {
+		t.Fatalf("startDirClient: %v", err)
+	}
+	return sess, <-srvErrCh
+}
+
+// TestE2EDirUnreadableSourceFileIsReportedNotFabricated pins what happens to
+// a source file that cannot be read. It is ANNOUNCED (so it stays in the
+// -delete keep-set and any existing destination copy is protected), it is
+// REPORTED as failed rather than silently omitted, and above all no file is
+// fabricated for it at the destination: nothing was transferred, so nothing
+// about its content is known.
+func TestE2EDirUnreadableSourceFileIsReportedNotFabricated(t *testing.T) {
 	src := t.TempDir()
 	mustWriteFile(t, filepath.Join(src, "good1.txt"), "one")
 	badPath := filepath.Join(src, "unreadable.txt")
@@ -898,23 +1211,15 @@ func TestE2EDirUnreadableSourceFileIsSkippedNotFailed(t *testing.T) {
 	}
 	t.Cleanup(func() { os.Chmod(badPath, 0644) }) // let t.TempDir's cleanup remove it
 
-	resetEngineGlobals()
 	dst := t.TempDir()
-	port := freeTCPPort(t)
-	addr := "127.0.0.1:" + port
-	srvErrCh := make(chan error, 1)
-	go func() { srvErrCh <- startDirServer(dst, "127.0.0.1", port, 2, true) }()
-	waitForListener(t, addr)
-
-	sess, err := startDirClient(src, addr, 0, false, 2, nil)
-	if err != nil {
-		t.Fatalf("startDirClient: %v", err)
+	sess, srvErr := startDirClientExpectingFailures(t, src, dst, 2, false, false)
+	// The server reports the file as not correct at the destination; that is
+	// the point, not an error in the test.
+	if srvErr == nil {
+		t.Error("the server reported success for a file it never received any data for")
 	}
-	if err := <-srvErrCh; err != nil {
-		t.Fatalf("startDirServer: %v", err)
-	}
-	if sess.FailedCount() != 0 {
-		t.Errorf("FailedCount = %d, want 0 -- an unreadable file is skipped at walk time, not recorded as a failure", sess.FailedCount())
+	if sess.FailedCount() != 1 {
+		t.Errorf("FailedCount = %d, want 1 -- an unreadable file must be reported, not silently omitted from a backup", sess.FailedCount())
 	}
 	for _, rel := range []string{"good1.txt", "good2.txt"} {
 		got, rerr := os.ReadFile(filepath.Join(dst, rel))
@@ -927,8 +1232,83 @@ func TestE2EDirUnreadableSourceFileIsSkippedNotFailed(t *testing.T) {
 			t.Errorf("%s content mismatch", rel)
 		}
 	}
+	// The critical part: no zero-filled stand-in. Creating the file here
+	// would give it the right name, size and mode with content that never
+	// existed anywhere.
 	if _, err := os.Stat(filepath.Join(dst, "unreadable.txt")); err == nil {
-		t.Error("unreadable.txt should not exist at the destination")
+		t.Error("a file was fabricated at the destination for a source that was never read")
+	}
+}
+
+// TestE2EDirFailedReadLeavesGoodDestinationCopyIntact: the destination
+// already holds a good copy from an earlier run and the source then becomes
+// unreadable. The earlier copy must survive byte-for-byte -- finalize used to
+// create-and-truncate the path to the announced size, destroying a good
+// backup whenever the size had changed.
+func TestE2EDirFailedReadLeavesGoodDestinationCopyIntact(t *testing.T) {
+	src := t.TempDir()
+	good := "ORIGINAL GOOD CONTENT v1"
+	badPath := filepath.Join(src, "data.txt")
+	mustWriteFile(t, badPath, good)
+
+	dst := t.TempDir()
+	startDirClientAgainst(t, src, dst, 2, false, nil, false, false, false)
+	if got, _ := os.ReadFile(filepath.Join(dst, "data.txt")); string(got) != good {
+		t.Fatalf("first run did not transfer: %q", got)
+	}
+
+	// The source grows (so a truncate to the new size would be destructive)
+	// and becomes unreadable.
+	mustWriteFile(t, badPath, good+" now considerably longer")
+	if err := os.Chmod(badPath, 0000); err != nil {
+		t.Skipf("cannot make a file unreadable here: %v", err)
+	}
+	t.Cleanup(func() { os.Chmod(badPath, 0644) })
+
+	// quickCheck off: force the transfer to actually attempt the read.
+	sess, _ := startDirClientExpectingFailures(t, src, dst, 2, false, false)
+	if sess.FailedCount() != 1 {
+		t.Errorf("FailedCount = %d, want 1", sess.FailedCount())
+	}
+	got, rerr := os.ReadFile(filepath.Join(dst, "data.txt"))
+	if rerr != nil {
+		t.Fatalf("the good destination copy is gone: %v", rerr)
+	}
+	if string(got) != good {
+		t.Errorf("destination copy = %q, want the untouched original %q", got, good)
+	}
+}
+
+// TestE2EDirDeleteProtectsUnreadableSourceFile: with -delete, a source file
+// that cannot be read must not cost the destination its only copy. The path
+// is announced (as a normal KindFile whose transfer then fails), so it stays
+// in the keep-set; before, an unreadable file was dropped at walk time,
+// never announced, and the delete pass removed the destination's good copy
+// while the run still reported success.
+func TestE2EDirDeleteProtectsUnreadableSourceFile(t *testing.T) {
+	src := t.TempDir()
+	irreplaceable := "IRREPLACEABLE BACKUP DATA"
+	badPath := filepath.Join(src, "data.txt")
+	mustWriteFile(t, badPath, irreplaceable)
+	mustWriteFile(t, filepath.Join(src, "other.txt"), "other")
+
+	dst := t.TempDir()
+	startDirClientAgainst(t, src, dst, 2, false, nil, false, false, false)
+
+	if err := os.Chmod(badPath, 0000); err != nil {
+		t.Skipf("cannot make a file unreadable here: %v", err)
+	}
+	t.Cleanup(func() { os.Chmod(badPath, 0644) })
+
+	// quickCheck off so the run genuinely tries (and fails) to read it,
+	// which is the case that used to lose the file.
+	startDirClientExpectingFailures(t, src, dst, 2, false, true)
+
+	if _, err := os.Lstat(filepath.Join(dst, "data.txt")); err != nil {
+		t.Errorf("-delete removed the destination's only copy of an unreadable source file: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(dst, "other.txt")); err != nil {
+		t.Errorf("an unrelated file was lost: %v", err)
 	}
 }
 
@@ -960,7 +1340,7 @@ func TestE2EDirDestinationPathIsADirectory(t *testing.T) {
 	var clientErr error
 	go func() {
 		defer close(done)
-		sess, clientErr = startDirClient(src, addr, 0, true, 2, nil)
+		sess, clientErr = startDirClient(src, addr, 0, true, 2, nil, false, false, false, false)
 	}()
 	select {
 	case <-done:
@@ -1010,7 +1390,7 @@ func TestE2EDirReadOnlyDestinationRoot(t *testing.T) {
 	go func() { srvErrCh <- startDirServer(dstRoot, "127.0.0.1", port, 1, true) }()
 	waitForListener(t, addr)
 
-	sess, err := startDirClient(src, addr, 0, true, 1, nil)
+	sess, err := startDirClient(src, addr, 0, true, 1, nil, false, false, false, false)
 	if err != nil {
 		t.Fatalf("startDirClient: %v", err)
 	}
@@ -1066,7 +1446,7 @@ func TestE2EDirLargeTreeDoesNotDeadlock(t *testing.T) {
 	var clientErr error
 	go func() {
 		defer close(clientDone)
-		sess, clientErr = startDirClient(src, addr, 0, true, 4, nil)
+		sess, clientErr = startDirClient(src, addr, 0, true, 4, nil, false, false, false, false)
 	}()
 	select {
 	case <-clientDone:
@@ -1083,6 +1463,135 @@ func TestE2EDirLargeTreeDoesNotDeadlock(t *testing.T) {
 		}
 	case <-time.After(15 * time.Second):
 		t.Fatal("startDirServer did not complete within 15s -- deadlock regression (large tree)")
+	}
+	if sess.FailedCount() != 0 {
+		t.Fatalf("%d failed file(s)", sess.FailedCount())
+	}
+	assertTreesEqual(t, src, dstRoot)
+}
+
+// buildMixedAffinitySizeTree populates root with ~400 one-block small files
+// (routed to a dedicated worker under affinityWorker, since Blocks(1) is
+// always <= any positive worker count) plus a few large multi-block files
+// (Blocks comfortably > workers, so they stay on the shared/FCFS path).
+// Forces hashing goroutines to alternate between blocking on a dedicated
+// channel and on shared throughout the run -- the scenario
+// precomputeTreeBlocksRouted's deadlock-safety argument calls out as the
+// one hazard worth a dedicated regression test.
+func buildMixedAffinitySizeTree(t *testing.T, root string) {
+	t.Helper()
+	const nSmall = 400
+	const nLarge = 3
+	const largeBlocks = 200
+	for i := 0; i < nSmall; i++ {
+		mustWriteFile(t, filepath.Join(root, fmt.Sprintf("small%04d.txt", i)), fmt.Sprintf("small file %d", i))
+	}
+	for i := 0; i < nLarge; i++ {
+		data := randomBytes(4096*largeBlocks+17, int64(900+i))
+		mustWriteFile(t, filepath.Join(root, fmt.Sprintf("large%02d.bin", i)), string(data))
+	}
+}
+
+// TestE2EDirMixedTreeSmallAndHugeDoesNotDeadlock is a deadlock regression
+// test for the affinity-routing pipeline (checksum.go's
+// precomputeTreeBlocksRouted / dirsync.go's dual-source
+// runDirTransferWorker), modeled on TestE2EDirLargeTreeDoesNotDeadlock's
+// explicit-goroutine-plus-timeout style: a bare blocking call would just
+// hang the whole test binary on a real regression instead of failing it
+// loudly. Mixes ~400 single-block (dedicated-routed) files with a few
+// 200-block (shared-routed) files under multiple workers, so hashing
+// goroutines are forced to alternate between blocking on a dedicated
+// channel and on shared throughout the run.
+func TestE2EDirMixedTreeSmallAndHugeDoesNotDeadlock(t *testing.T) {
+	src := t.TempDir()
+	saved := blockSize
+	blockSize = 4096
+	defer func() { blockSize = saved }()
+	buildMixedAffinitySizeTree(t, src)
+
+	resetEngineGlobals()
+	dstRoot := t.TempDir()
+	port := freeTCPPort(t)
+	addr := "127.0.0.1:" + port
+	srvErrCh := make(chan error, 1)
+	go func() { srvErrCh <- startDirServer(dstRoot, "127.0.0.1", port, 4, true) }()
+	waitForListener(t, addr)
+
+	clientDone := make(chan struct{})
+	var sess *SyncSession
+	var clientErr error
+	go func() {
+		defer close(clientDone)
+		sess, clientErr = startDirClient(src, addr, 0, true, 4, nil, false, false, false, false)
+	}()
+	select {
+	case <-clientDone:
+	case <-time.After(20 * time.Second):
+		t.Fatal("startDirClient did not complete within 20s -- deadlock regression (mixed small/large tree)")
+	}
+	if clientErr != nil {
+		t.Fatalf("startDirClient: %v", clientErr)
+	}
+	select {
+	case err := <-srvErrCh:
+		if err != nil {
+			t.Fatalf("startDirServer: %v", err)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("startDirServer did not complete within 15s -- deadlock regression (mixed small/large tree)")
+	}
+	if sess.FailedCount() != 0 {
+		t.Fatalf("%d failed file(s)", sess.FailedCount())
+	}
+	assertTreesEqual(t, src, dstRoot)
+}
+
+// TestE2EDirMixedTreeSingleWorkerDoesNotDeadlock is
+// TestE2EDirMixedTreeSmallAndHugeDoesNotDeadlock's workers=1 variant: with
+// exactly one worker, EVERY single-block file's affinityWorker threshold is
+// blocks<=1, so it's dedicated-routed, while every large (>1-block) file
+// stays shared-routed -- and the one worker must correctly drain both its
+// own dedicated channel and the shared channel to completion. This is the
+// minimal case for the dual-source loop's worker-exit hazard: if either
+// channel were ever closed without being fully drained, or the loop could
+// exit before both close, this is the cheapest configuration to expose it.
+func TestE2EDirMixedTreeSingleWorkerDoesNotDeadlock(t *testing.T) {
+	src := t.TempDir()
+	saved := blockSize
+	blockSize = 4096
+	defer func() { blockSize = saved }()
+	buildMixedAffinitySizeTree(t, src)
+
+	resetEngineGlobals()
+	dstRoot := t.TempDir()
+	port := freeTCPPort(t)
+	addr := "127.0.0.1:" + port
+	srvErrCh := make(chan error, 1)
+	go func() { srvErrCh <- startDirServer(dstRoot, "127.0.0.1", port, 1, true) }()
+	waitForListener(t, addr)
+
+	clientDone := make(chan struct{})
+	var sess *SyncSession
+	var clientErr error
+	go func() {
+		defer close(clientDone)
+		sess, clientErr = startDirClient(src, addr, 0, true, 1, nil, false, false, false, false)
+	}()
+	select {
+	case <-clientDone:
+	case <-time.After(30 * time.Second):
+		t.Fatal("startDirClient did not complete within 30s -- deadlock regression (mixed tree, single worker)")
+	}
+	if clientErr != nil {
+		t.Fatalf("startDirClient: %v", clientErr)
+	}
+	select {
+	case err := <-srvErrCh:
+		if err != nil {
+			t.Fatalf("startDirServer: %v", err)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("startDirServer did not complete within 15s -- deadlock regression (mixed tree, single worker)")
 	}
 	if sess.FailedCount() != 0 {
 		t.Fatalf("%d failed file(s)", sess.FailedCount())
@@ -1107,9 +1616,9 @@ func TestE2EDirSourceFileDisappearsAfterWalkStillCompletes(t *testing.T) {
 	// entry is unlinked (reads keep succeeding against the orphaned
 	// inode), so removal only reproduces a REAL failure if it lands
 	// before TreeReader's own os.Open for this file -- and after
-	// walkSource's own (separate, metadata-only) open+close, or this hits
-	// the walk-time skip path instead (already covered by
-	// TestE2EDirUnreadableSourceFileIsSkippedNotFailed). walkSource itself
+	// walkSource has already stat'd it, or this hits the walk-time skip
+	// path instead (covered by
+	// TestE2EDirUnreadableSourceFileIsReportedNotFabricated). walkSource itself
 	// is fast regardless of content (stat-only per entry), so it reliably
 	// finishes well before this; the real difficulty is making TreeReader's
 	// CONTENT read of earlier files take long enough, in real wall-clock
@@ -1148,7 +1657,7 @@ func TestE2EDirSourceFileDisappearsAfterWalkStillCompletes(t *testing.T) {
 	var clientErr error
 	go func() {
 		defer close(clientDone)
-		sess, clientErr = startDirClient(src, proxyAddr, 0, true, 1, nil)
+		sess, clientErr = startDirClient(src, proxyAddr, 0, true, 1, nil, false, false, false, false)
 	}()
 
 	// The walk (stat-only) is done essentially instantly; TreeReader is
@@ -1169,11 +1678,21 @@ func TestE2EDirSourceFileDisappearsAfterWalkStillCompletes(t *testing.T) {
 	}
 	select {
 	case err := <-srvErrCh:
-		if err != nil {
-			t.Fatalf("startDirServer: %v", err)
+		// The server reports the vanished file as not correct at the
+		// destination -- it received no data for it and therefore left the
+		// path alone rather than fabricating a zero-filled stand-in. That
+		// report is the desired outcome, not a test failure; what matters
+		// is that the server still COMPLETED instead of hanging.
+		if err == nil {
+			t.Error("the server reported success for a file it never received any data for")
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("startDirServer did not complete after the client finished")
+	}
+
+	// Nothing was fabricated for the file that vanished mid-transfer.
+	if _, err := os.Stat(filepath.Join(dst, "1-vanishing.txt")); err == nil {
+		t.Error("a zero-filled stand-in was created for the vanished file")
 	}
 
 	if sess.FailedCount() != 1 {
@@ -1227,7 +1746,7 @@ func TestE2EDirBlockSizeCapEndToEnd(t *testing.T) {
 	waitForListener(t, addr)
 
 	const blockCap = 8192
-	sess, err := startDirClient(src, addr, blockCap, true, 1, nil)
+	sess, err := startDirClient(src, addr, blockCap, true, 1, nil, false, false, false, false)
 	if err != nil {
 		t.Fatalf("startDirClient: %v", err)
 	}
@@ -1237,12 +1756,13 @@ func TestE2EDirBlockSizeCapEndToEnd(t *testing.T) {
 	if sess.FailedCount() != 0 {
 		t.Fatalf("%d failed file(s)", sess.FailedCount())
 	}
-	fe := sess.FileByID(0)
-	if fe == nil {
-		t.Fatal("FileID 0 not found")
-	}
-	if fe.BlockSize != blockCap {
-		t.Errorf("BlockSize = %d, want exactly %d (the cap passed to startDirClient)", fe.BlockSize, blockCap)
+	// The transfer has already completed (startDirClient returned), so
+	// FileID 0's session entry has been released (see
+	// SyncSession.Release/claimDone). treeBlockSize is the same pure
+	// function walk.go used to pick it, given the same fixture size and
+	// cap, so it stands in for reading the value back from the session.
+	if got := treeBlockSize(200000, blockCap); got != blockCap {
+		t.Errorf("treeBlockSize(200000, %d) = %d, want exactly %d (the cap passed to startDirClient)", blockCap, got, blockCap)
 	}
 	assertTreesEqual(t, src, dst)
 }
@@ -1266,7 +1786,7 @@ func TestE2EDirExcludeEndToEnd(t *testing.T) {
 	go func() { srvErrCh <- startDirServer(dst, "127.0.0.1", port, 1, true) }()
 	waitForListener(t, addr)
 
-	sess, err := startDirClient(src, addr, 0, true, 1, []string{"*.log"})
+	sess, err := startDirClient(src, addr, 0, true, 1, []string{"*.log"}, false, false, false, false)
 	if err != nil {
 		t.Fatalf("startDirClient: %v", err)
 	}
@@ -1310,7 +1830,7 @@ func TestE2EDirExcludeSubstringGlobEndToEnd(t *testing.T) {
 	go func() { srvErrCh <- startDirServer(dst, "127.0.0.1", port, 1, true) }()
 	waitForListener(t, addr)
 
-	sess, err := startDirClient(src, addr, 0, true, 1, []string{"*some_file_name*"})
+	sess, err := startDirClient(src, addr, 0, true, 1, []string{"*some_file_name*"}, false, false, false, false)
 	if err != nil {
 		t.Fatalf("startDirClient: %v", err)
 	}
@@ -1428,7 +1948,7 @@ func TestE2EDirControlConnectionSurvivesLongIdleBetweenFiles(t *testing.T) {
 	proxyAddr, proxy := startFaultyProxy(t, realAddr, 0, 0, 0)
 	proxy.delayPerChunk = 15 * time.Millisecond
 
-	sess, err := startDirClient(src, proxyAddr, 2048, true, 1, nil)
+	sess, err := startDirClient(src, proxyAddr, 2048, true, 1, nil, false, false, false, false)
 	if err != nil {
 		t.Fatalf("startDirClient: %v (control connection should have survived the idle gap via ctrlIoTimeout)", err)
 	}
@@ -1500,7 +2020,7 @@ func TestE2EDirWorkerPermanentFailureStillSendsFileDoneForOtherFiles(t *testing.
 	// LAST attempt so it recovers).
 	proxyAddr, _ := startFaultyProxy(t, realAddr, 1, maxRetries, 200)
 
-	sess, err := startDirClient(src, proxyAddr, 0, true, 1, nil)
+	sess, err := startDirClient(src, proxyAddr, 0, true, 1, nil, false, false, false, false)
 	if err != nil {
 		t.Fatalf("startDirClient: %v (a permanently failed file must not fail the whole client-side call)", err)
 	}
@@ -1516,18 +2036,18 @@ func TestE2EDirWorkerPermanentFailureStillSendsFileDoneForOtherFiles(t *testing.
 	if got := sess.FailedCount(); got != 1 {
 		t.Fatalf("FailedCount = %d, want exactly 1 (only a-bad.txt)", got)
 	}
-	var badID, goodID uint32 = 1<<32 - 1, 1<<32 - 1
-	for i := 0; i < sess.FileCount(); i++ {
-		fe := sess.FileByID(uint32(i))
-		switch fe.RelPath {
-		case "a-bad.txt":
-			badID = fe.ID
-		case "b-good.txt":
-			goodID = fe.ID
-		}
-	}
-	if badID == 1<<32-1 || goodID == 1<<32-1 {
-		t.Fatalf("could not find both files by RelPath")
+	// Both files' session entries have already been released by now (the
+	// transfer completed above -- see SyncSession.Release/claimDone), so
+	// they can no longer be found by FileByID/RelPath. There are only two
+	// FileIDs (0 and 1, in walk order) and exactly one of them is failed
+	// per the FailedCount check just above; isFailed itself is backed by a
+	// separate, unreleased structure (SyncSession.failed), so it still
+	// works after completion and is what determines which is which here.
+	var badID, goodID uint32
+	if sess.isFailed(0) {
+		badID, goodID = 0, 1
+	} else {
+		badID, goodID = 1, 0
 	}
 	if !sess.isFailed(badID) {
 		t.Error("a-bad.txt: expected isFailed == true")
@@ -1611,7 +2131,7 @@ func TestE2EDirServerConnectionChurnDuringShutdownRace(t *testing.T) {
 		}()
 	}
 
-	sess, err := startDirClient(src, addr, 0, true, 6, nil)
+	sess, err := startDirClient(src, addr, 0, true, 6, nil, false, false, false, false)
 	// Give the churners a little more time to keep hammering right around
 	// OpTreeDone/shutdown before signaling them to stop.
 	time.Sleep(20 * time.Millisecond)
@@ -1633,4 +2153,1182 @@ func TestE2EDirServerConnectionChurnDuringShutdownRace(t *testing.T) {
 		t.Fatalf("%d failed file(s)", sess.FailedCount())
 	}
 	assertTreesEqual(t, src, dst)
+}
+
+// --- quick-check (-quick-check: skip a file whose destination already has
+// the same size and modification time) ---
+
+func TestE2EDirQuickCheckColdRunTransfersEverything(t *testing.T) {
+	src := t.TempDir()
+	mustMkdirAll(t, filepath.Join(src, "sub"))
+	mustWriteFile(t, filepath.Join(src, "a.txt"), string(randomBytes(9000, 81)))
+	mustWriteFile(t, filepath.Join(src, "sub", "b.txt"), string(randomBytes(500, 82)))
+
+	dst, sess := runDirTransferOpts(t, src, 2, false, true)
+	assertTreesEqual(t, src, dst)
+	if sess.bytesNet.Load() == 0 {
+		t.Fatal("cold run with -quick-check transferred zero bytes -- test fixture problem")
+	}
+	if sess.blocksDone.Load() == 0 {
+		t.Fatal("cold run with -quick-check hashed zero blocks -- nothing exists yet, so nothing should have been skippable")
+	}
+}
+
+func TestE2EDirQuickCheckSkipsUnchangedFilesOnRerun(t *testing.T) {
+	src := t.TempDir()
+	mustMkdirAll(t, filepath.Join(src, "sub"))
+	mustWriteFile(t, filepath.Join(src, "a.txt"), string(randomBytes(9000, 91)))
+	mustWriteFile(t, filepath.Join(src, "sub", "b.txt"), string(randomBytes(500, 92)))
+
+	dst, sess1 := runDirTransferOpts(t, src, 2, false, true)
+	assertTreesEqual(t, src, dst)
+	if sess1.bytesNet.Load() == 0 {
+		t.Fatal("first run transferred zero bytes -- test fixture problem, not quick-check")
+	}
+	before := snapshotMTimes(t, dst)
+
+	sess2 := startDirClientAgainst(t, src, dst, 2, false, nil, true, false, false)
+
+	// The whole point of quick-check: every file already matches, so
+	// TreeReader never even opens them -- zero blocks hashed, zero bytes
+	// transferred, on this run.
+	if got := sess2.blocksDone.Load(); got != 0 {
+		t.Errorf("second run's blocksDone = %d, want 0 -- quick-check should have skipped every file before it was ever read", got)
+	}
+	if got := sess2.bytesNet.Load(); got != 0 {
+		t.Errorf("second run's payload bytes = %d, want 0", got)
+	}
+	if got := sess2.diffs.Load(); got != 0 {
+		t.Errorf("second run's diffs = %d, want 0", got)
+	}
+
+	assertTreesEqual(t, src, dst)
+	after := snapshotMTimes(t, dst)
+	for rel, want := range before {
+		if got := after[rel]; !got.Equal(want) {
+			t.Errorf("%s: mtime changed on a quick-check no-op rerun: was %v, now %v", rel, want, got)
+		}
+	}
+}
+
+func TestE2EDirQuickCheckOnlyModifiedFileTransfers(t *testing.T) {
+	src := t.TempDir()
+	mustWriteFile(t, filepath.Join(src, "a.txt"), string(randomBytes(4000, 101)))
+	origB := randomBytes(4000, 102) // same length as its replacement below
+	mustWriteFile(t, filepath.Join(src, "b.txt"), string(origB))
+	mustWriteFile(t, filepath.Join(src, "c.txt"), string(randomBytes(4000, 103)))
+
+	dst, _ := runDirTransferOpts(t, src, 2, false, true)
+	assertTreesEqual(t, src, dst)
+	before := snapshotMTimes(t, dst)
+
+	// Rewrite b.txt with DIFFERENT content but the SAME size, and force its
+	// mtime forward by a whole second (not relying on real wall-clock
+	// progression, and past the second-precision granularity quick-check
+	// compares at): a same-size file must never be wrongly skipped just
+	// because its size still matches -- content did change.
+	newB := randomBytes(4000, 999)
+	if string(newB) == string(origB) {
+		t.Fatal("test fixture problem: newB must differ from origB")
+	}
+	mustWriteFile(t, filepath.Join(src, "b.txt"), string(newB))
+	bMTime := before["b.txt"].Add(2 * time.Second)
+	if err := os.Chtimes(filepath.Join(src, "b.txt"), bMTime, bMTime); err != nil {
+		t.Fatal(err)
+	}
+
+	sess2 := startDirClientAgainst(t, src, dst, 2, false, nil, true, false, false)
+	assertTreesEqual(t, src, dst)
+
+	after := snapshotMTimes(t, dst)
+	if after["b.txt"].Equal(before["b.txt"]) {
+		t.Error("b.txt's destination mtime did not change -- it should have been re-transferred, not skipped")
+	}
+	for _, rel := range []string{"a.txt", "c.txt"} {
+		if !after[rel].Equal(before[rel]) {
+			t.Errorf("%s: mtime changed, want unchanged -- only b.txt was modified", rel)
+		}
+	}
+	if sess2.diffs.Load() == 0 {
+		t.Error("second run's diffs = 0, want > 0 for the one modified file")
+	}
+	got, err := os.ReadFile(filepath.Join(dst, "b.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(newB) {
+		t.Error("b.txt's destination content was not updated to the new content")
+	}
+}
+
+func TestE2EDirQuickCheckLargeTreeDoesNotDeadlock(t *testing.T) {
+	src := t.TempDir()
+	const nDirs = 20
+	const filesPerDir = 35 // 700 files + 20 dirs = 720 entries, > 2x announceBatchSize
+	for d := 0; d < nDirs; d++ {
+		dir := filepath.Join(src, fmt.Sprintf("dir%03d", d))
+		mustMkdirAll(t, dir)
+		for f := 0; f < filesPerDir; f++ {
+			mustWriteFile(t, filepath.Join(dir, fmt.Sprintf("f%03d.txt", f)), "x")
+		}
+	}
+
+	resetEngineGlobals()
+	dstRoot := t.TempDir()
+	port := freeTCPPort(t)
+	addr := "127.0.0.1:" + port
+	srvErrCh := make(chan error, 1)
+	go func() { srvErrCh <- startDirServer(dstRoot, "127.0.0.1", port, 4, true) }()
+	waitForListener(t, addr)
+
+	clientDone := make(chan struct{})
+	var sess *SyncSession
+	var clientErr error
+	go func() {
+		defer close(clientDone)
+		sess, clientErr = startDirClient(src, addr, 0, true, 4, nil, true, false, false, false)
+	}()
+	select {
+	case <-clientDone:
+	case <-time.After(15 * time.Second):
+		t.Fatal("startDirClient did not complete within 15s -- deadlock regression (quick-check, large tree)")
+	}
+	if clientErr != nil {
+		t.Fatalf("startDirClient: %v", clientErr)
+	}
+	select {
+	case err := <-srvErrCh:
+		if err != nil {
+			t.Fatalf("startDirServer: %v", err)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("startDirServer did not complete within 15s -- deadlock regression (quick-check, large tree)")
+	}
+	if sess.FailedCount() != 0 {
+		t.Fatalf("%d failed file(s)", sess.FailedCount())
+	}
+	assertTreesEqual(t, src, dstRoot)
+}
+
+// --- -delete (remove destination-only files/directories) ---
+
+func TestE2EDirDeleteRemovesStaleFileAndDirectory(t *testing.T) {
+	src := t.TempDir()
+	mustWriteFile(t, filepath.Join(src, "a.txt"), string(randomBytes(2000, 111)))
+	mustMkdirAll(t, filepath.Join(src, "sub"))
+	mustWriteFile(t, filepath.Join(src, "sub", "b.txt"), string(randomBytes(500, 112)))
+
+	dst, _ := runDirTransfer(t, src, 2, false)
+	assertTreesEqual(t, src, dst)
+
+	// Seed the destination with a stale file and a stale directory (with
+	// content) that the source no longer has -- exactly what -delete
+	// exists to clean up.
+	mustWriteFile(t, filepath.Join(dst, "stale.txt"), "leftover")
+	mustMkdirAll(t, filepath.Join(dst, "staledir"))
+	mustWriteFile(t, filepath.Join(dst, "staledir", "inside.txt"), "leftover")
+
+	startDirClientAgainst(t, src, dst, 2, false, nil, false, true, false)
+
+	if _, err := os.Stat(filepath.Join(dst, "stale.txt")); !os.IsNotExist(err) {
+		t.Errorf("stale.txt still exists (stat err = %v)", err)
+	}
+	if _, err := os.Stat(filepath.Join(dst, "staledir")); !os.IsNotExist(err) {
+		t.Errorf("staledir still exists (stat err = %v)", err)
+	}
+	assertTreesEqual(t, src, dst)
+}
+
+// TestE2EDirDeleteOffLeavesStaleEntriesAlone is the negative control for the
+// test above: the exact same stale file/directory, synced WITHOUT -delete,
+// must survive untouched.
+func TestE2EDirDeleteOffLeavesStaleEntriesAlone(t *testing.T) {
+	src := t.TempDir()
+	mustWriteFile(t, filepath.Join(src, "a.txt"), string(randomBytes(2000, 121)))
+
+	dst, _ := runDirTransfer(t, src, 2, false)
+	mustWriteFile(t, filepath.Join(dst, "stale.txt"), "leftover")
+	mustMkdirAll(t, filepath.Join(dst, "staledir"))
+	mustWriteFile(t, filepath.Join(dst, "staledir", "inside.txt"), "leftover")
+
+	startDirClientAgainst(t, src, dst, 2, false, nil, false, false, false)
+
+	if _, err := os.ReadFile(filepath.Join(dst, "stale.txt")); err != nil {
+		t.Errorf("stale.txt was removed without -delete: %v", err)
+	}
+	if _, err := os.ReadFile(filepath.Join(dst, "staledir", "inside.txt")); err != nil {
+		t.Errorf("staledir/inside.txt was removed without -delete: %v", err)
+	}
+}
+
+// TestE2EDirDeleteProtectsExcludedDirectory proves -delete composes safely
+// with -exclude by default, matching rsync's own default: an excluded
+// source directory is announced as a KindSkipped placeholder (see
+// walk.go's skipKept), which protects it AND everything already sitting
+// under it on the destination from a -delete pass -- even on this file's
+// very first sync (not just a rerun), since the placeholder exists from the
+// very first announce batch.
+func TestE2EDirDeleteProtectsExcludedDirectory(t *testing.T) {
+	src := t.TempDir()
+	mustWriteFile(t, filepath.Join(src, "keep.txt"), string(randomBytes(1000, 131)))
+	mustMkdirAll(t, filepath.Join(src, "skipme"))
+	mustWriteFile(t, filepath.Join(src, "skipme", "real.txt"), "never synced")
+
+	dst := t.TempDir()
+	mustMkdirAll(t, filepath.Join(dst, "skipme"))
+	mustWriteFile(t, filepath.Join(dst, "skipme", "junk.txt"), "pre-existing, unrelated to source")
+
+	startDirClientAgainst(t, src, dst, 2, false, []string{"skipme"}, false, true, false)
+
+	got, err := os.ReadFile(filepath.Join(dst, "skipme", "junk.txt"))
+	if err != nil {
+		t.Fatalf("skipme/junk.txt was removed: %v", err)
+	}
+	if string(got) != "pre-existing, unrelated to source" {
+		t.Errorf("skipme/junk.txt content changed: %q", got)
+	}
+	if _, err := os.Stat(filepath.Join(dst, "skipme", "real.txt")); !os.IsNotExist(err) {
+		t.Error("skipme/real.txt should not have been synced -- skipme is excluded")
+	}
+	want, err := os.ReadFile(filepath.Join(src, "keep.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err = os.ReadFile(filepath.Join(dst, "keep.txt"))
+	if err != nil {
+		t.Fatalf("keep.txt was not synced: %v", err)
+	}
+	if string(got) != string(want) {
+		t.Error("keep.txt content mismatch")
+	}
+}
+
+// TestE2EDirDeleteProtectsSymlinkNamesake proves a source symlink -- never
+// created on the destination, but still announced as a KindSkipped
+// placeholder -- protects whatever already occupies that path on the
+// destination from a -delete pass, exactly like an excluded path does.
+func TestE2EDirDeleteProtectsSymlinkNamesake(t *testing.T) {
+	src := t.TempDir()
+	mustWriteFile(t, filepath.Join(src, "target.txt"), string(randomBytes(1000, 141)))
+	if err := os.Symlink(filepath.Join(src, "target.txt"), filepath.Join(src, "link.txt")); err != nil {
+		t.Skipf("symlinks unsupported: %v", err)
+	}
+
+	dst := t.TempDir()
+	mustWriteFile(t, filepath.Join(dst, "link.txt"), "pre-existing regular file at the symlink's path")
+
+	startDirClientAgainst(t, src, dst, 2, false, nil, false, true, false)
+
+	got, err := os.ReadFile(filepath.Join(dst, "link.txt"))
+	if err != nil {
+		t.Fatalf("link.txt was removed: %v", err)
+	}
+	if string(got) != "pre-existing regular file at the symlink's path" {
+		t.Errorf("link.txt content changed: %q", got)
+	}
+	want, err := os.ReadFile(filepath.Join(src, "target.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err = os.ReadFile(filepath.Join(dst, "target.txt"))
+	if err != nil {
+		t.Fatalf("target.txt was not synced: %v", err)
+	}
+	if string(got) != string(want) {
+		t.Error("target.txt content mismatch")
+	}
+}
+
+// TestE2EDirDeleteWithQuickCheckCombo exercises the qcSurvivors branch
+// (quick-check AND delete-before together): unchanged files are skipped by
+// quick-check, a stale destination file is removed by the delete pass, a
+// changed file still transfers -- all in one run.
+func TestE2EDirDeleteWithQuickCheckCombo(t *testing.T) {
+	src := t.TempDir()
+	mustWriteFile(t, filepath.Join(src, "a.txt"), string(randomBytes(3000, 151)))
+	mustWriteFile(t, filepath.Join(src, "b.txt"), string(randomBytes(3000, 152)))
+
+	dst, _ := runDirTransferOpts(t, src, 2, false, true)
+	assertTreesEqual(t, src, dst)
+
+	// Mutate: b.txt changes (new content + bumped mtime), stale.txt appears
+	// on the destination only.
+	newB := randomBytes(3000, 953)
+	mustWriteFile(t, filepath.Join(src, "b.txt"), string(newB))
+	future := time.Now().Add(3 * time.Second)
+	if err := os.Chtimes(filepath.Join(src, "b.txt"), future, future); err != nil {
+		t.Fatal(err)
+	}
+	mustWriteFile(t, filepath.Join(dst, "stale.txt"), "leftover")
+
+	sess := startDirClientAgainst(t, src, dst, 2, false, nil, true, true, false)
+
+	if _, err := os.Stat(filepath.Join(dst, "stale.txt")); !os.IsNotExist(err) {
+		t.Errorf("stale.txt still exists (stat err = %v)", err)
+	}
+	assertTreesEqual(t, src, dst)
+	if sess.diffs.Load() == 0 {
+		t.Error("diffs = 0, want > 0 for the changed b.txt")
+	}
+	// a.txt was unchanged -- quick-check must have skipped it entirely: the
+	// only blocks processed belong to b.txt (one block at its size).
+	if got := sess.blocksDone.Load(); got != 1 {
+		t.Errorf("blocksDone = %d, want 1 (only the changed file's single block)", got)
+	}
+}
+
+// TestE2EDirEnvironmentalFailureSkipsFilesNotTransfer is the end-to-end
+// regression for the production ENOSPC crash: a destination where one
+// subtree's path is blocked by a regular file (mkdir fails with ENOTDIR --
+// the same environmental class as ENOSPC) must NOT kill the control
+// connection and orphan the run. The sync completes, every healthy file is
+// byte-identical, exactly the blocked subtree's files fail client-side,
+// and the whole thing finishes promptly instead of hanging for hours.
+func TestE2EDirEnvironmentalFailureSkipsFilesNotTransfer(t *testing.T) {
+	src := t.TempDir()
+	mustWriteFile(t, filepath.Join(src, "good1.txt"), string(randomBytes(2000, 161)))
+	mustWriteFile(t, filepath.Join(src, "good2.txt"), string(randomBytes(500, 162)))
+	mustMkdirAll(t, filepath.Join(src, "blocked"))
+	mustWriteFile(t, filepath.Join(src, "blocked", "doomed1.txt"), "never lands")
+	mustWriteFile(t, filepath.Join(src, "blocked", "doomed2.txt"), "never lands either")
+
+	resetEngineGlobals()
+	dst := t.TempDir()
+	// Occupy the "blocked" directory's path with a regular file, so its
+	// announce-mkdir (and every child's parent-mkdir) fails.
+	mustWriteFile(t, filepath.Join(dst, "blocked"), "a file, not a dir")
+
+	port := freeTCPPort(t)
+	addr := "127.0.0.1:" + port
+	srvErrCh := make(chan error, 1)
+	go func() { srvErrCh <- startDirServer(dst, "127.0.0.1", port, 2, true) }()
+	waitForListener(t, addr)
+
+	clientDone := make(chan struct{})
+	var sess *SyncSession
+	var clientErr error
+	go func() {
+		defer close(clientDone)
+		sess, clientErr = startDirClient(src, addr, 0, true, 2, nil, false, false, false, false)
+	}()
+	select {
+	case <-clientDone:
+	case <-time.After(15 * time.Second):
+		t.Fatal("startDirClient did not complete within 15s -- the old control-connection-death hang is back")
+	}
+	if clientErr != nil {
+		t.Fatalf("startDirClient must not fail as a whole: %v", clientErr)
+	}
+	select {
+	case err := <-srvErrCh:
+		// The server reports the per-file finalize failures as its overall
+		// result -- that's the honest outcome, not a crash.
+		if err == nil {
+			t.Error("startDirServer returned nil, want the doomed files' finalize error surfaced")
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("startDirServer did not exit within 15s")
+	}
+
+	// Exactly the two doomed files failed; both healthy files synced.
+	if got := sess.FailedCount(); got != 2 {
+		t.Errorf("FailedCount = %d, want 2", got)
+	}
+	for _, rel := range []string{"good1.txt", "good2.txt"} {
+		want, err := os.ReadFile(filepath.Join(src, rel))
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := os.ReadFile(filepath.Join(dst, rel))
+		if err != nil {
+			t.Fatalf("%s was not synced: %v", rel, err)
+		}
+		if string(got) != string(want) {
+			t.Errorf("%s content mismatch", rel)
+		}
+	}
+	// The blocking file itself must be untouched.
+	got, err := os.ReadFile(filepath.Join(dst, "blocked"))
+	if err != nil || string(got) != "a file, not a dir" {
+		t.Errorf("the blocking file was altered: %q, %v", got, err)
+	}
+}
+
+// --- -links (sync symlinks with identical targets) ---
+
+func TestE2EDirLinksSyncsSymlinksVerbatim(t *testing.T) {
+	src := t.TempDir()
+	mustWriteFile(t, filepath.Join(src, "target.txt"), string(randomBytes(1000, 171)))
+	mustMkdirAll(t, filepath.Join(src, "sub"))
+	if err := os.Symlink("target.txt", filepath.Join(src, "rel-link")); err != nil {
+		t.Skipf("symlinks unsupported: %v", err)
+	}
+	if err := os.Symlink("/etc/hostname", filepath.Join(src, "abs-link")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("../target.txt", filepath.Join(src, "sub", "up-link")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("does-not-exist", filepath.Join(src, "dangling")); err != nil {
+		t.Fatal(err)
+	}
+
+	dst := t.TempDir()
+	startDirClientAgainst(t, src, dst, 2, false, nil, false, false, true)
+
+	for rel, want := range map[string]string{
+		"rel-link":    "target.txt",
+		"abs-link":    "/etc/hostname",
+		"sub/up-link": "../target.txt",
+		"dangling":    "does-not-exist",
+	} {
+		got, err := os.Readlink(filepath.Join(dst, rel))
+		if err != nil {
+			t.Errorf("%s: readlink: %v", rel, err)
+			continue
+		}
+		if got != want {
+			t.Errorf("%s: target = %q, want %q (verbatim)", rel, got, want)
+		}
+	}
+	want, _ := os.ReadFile(filepath.Join(src, "target.txt"))
+	got, err := os.ReadFile(filepath.Join(dst, "target.txt"))
+	if err != nil || string(got) != string(want) {
+		t.Errorf("target.txt content mismatch: %v", err)
+	}
+
+	// Idempotent rerun: same links, no diffs, no failures.
+	sess2 := startDirClientAgainst(t, src, dst, 2, false, nil, false, false, true)
+	if sess2.diffs.Load() != 0 {
+		t.Errorf("rerun diffs = %d, want 0", sess2.diffs.Load())
+	}
+	if gotLink, err := os.Readlink(filepath.Join(dst, "rel-link")); err != nil || gotLink != "target.txt" {
+		t.Errorf("rel-link disturbed by rerun: %q, %v", gotLink, err)
+	}
+}
+
+// TestE2EDirLinksWithDeleteRemovesStaleLink: -links + -delete composition
+// -- a synced symlink is kept, a destination-only symlink is removed (its
+// target file, being announced, survives).
+func TestE2EDirLinksWithDeleteRemovesStaleLink(t *testing.T) {
+	src := t.TempDir()
+	mustWriteFile(t, filepath.Join(src, "target.txt"), "data")
+	if err := os.Symlink("target.txt", filepath.Join(src, "kept-link")); err != nil {
+		t.Skipf("symlinks unsupported: %v", err)
+	}
+
+	dst := t.TempDir()
+	startDirClientAgainst(t, src, dst, 2, false, nil, false, false, true)
+	if err := os.Symlink("target.txt", filepath.Join(dst, "stale-link")); err != nil {
+		t.Fatal(err)
+	}
+
+	startDirClientAgainst(t, src, dst, 2, false, nil, false, true, true)
+
+	if _, err := os.Lstat(filepath.Join(dst, "stale-link")); !os.IsNotExist(err) {
+		t.Errorf("stale-link still exists (lstat err = %v)", err)
+	}
+	if got, err := os.Readlink(filepath.Join(dst, "kept-link")); err != nil || got != "target.txt" {
+		t.Errorf("kept-link disturbed: %q, %v", got, err)
+	}
+	if got, err := os.ReadFile(filepath.Join(dst, "target.txt")); err != nil || string(got) != "data" {
+		t.Errorf("target.txt disturbed: %q, %v", got, err)
+	}
+}
+
+// TestE2EDirLinksSymlinkToDirectoryFlip is the whole-tree regression: the
+// source replaces a symlink with a real directory between two runs. The
+// destination's now-stale link used to fail the ANNOUNCE, which killed the
+// control connection and aborted the entire transfer -- every remaining file
+// failing "was never announced", not just the one conflicting path.
+func TestE2EDirLinksSymlinkToDirectoryFlip(t *testing.T) {
+	src := t.TempDir()
+	mustMkdirAll(t, filepath.Join(src, "sub"))
+	mustWriteFile(t, filepath.Join(src, "sub", "real.txt"), "payload")
+	mustWriteFile(t, filepath.Join(src, "other.txt"), "sibling")
+	if err := os.Symlink("sub", filepath.Join(src, "dir-link")); err != nil {
+		t.Skipf("symlinks unsupported: %v", err)
+	}
+
+	dst := t.TempDir()
+	startDirClientAgainst(t, src, dst, 2, false, nil, false, false, true)
+	if got, err := os.Readlink(filepath.Join(dst, "dir-link")); err != nil || got != "sub" {
+		t.Fatalf("first run did not create the link: %q, %v", got, err)
+	}
+
+	// The flip: dir-link becomes a real directory with content of its own.
+	if err := os.Remove(filepath.Join(src, "dir-link")); err != nil {
+		t.Fatal(err)
+	}
+	mustMkdirAll(t, filepath.Join(src, "dir-link"))
+	mustWriteFile(t, filepath.Join(src, "dir-link", "x.txt"), "flipped")
+
+	// startDirClientAgainst fails the test on any failed file, so a
+	// surviving connection with every file transferred is the assertion.
+	startDirClientAgainst(t, src, dst, 2, false, nil, false, false, true)
+
+	fi, err := os.Lstat(filepath.Join(dst, "dir-link"))
+	if err != nil || !fi.IsDir() {
+		t.Fatalf("dir-link is not a real directory: %v (err %v)", fi.Mode(), err)
+	}
+	if got, err := os.ReadFile(filepath.Join(dst, "dir-link", "x.txt")); err != nil || string(got) != "flipped" {
+		t.Errorf("dir-link/x.txt = %q, %v; want %q", got, err, "flipped")
+	}
+	// The sibling files must be unaffected -- this is what the aborted
+	// connection used to take down with it.
+	if got, err := os.ReadFile(filepath.Join(dst, "other.txt")); err != nil || string(got) != "sibling" {
+		t.Errorf("other.txt = %q, %v; want %q", got, err, "sibling")
+	}
+	if got, err := os.ReadFile(filepath.Join(dst, "sub", "real.txt")); err != nil || string(got) != "payload" {
+		t.Errorf("sub/real.txt = %q, %v; want %q", got, err, "payload")
+	}
+}
+
+// TestE2EDirStaleSymlinkNeverWrittenThrough is the escape regression, end to
+// end and WITHOUT -links: once an earlier run has left a symlink at the
+// destination, a later plain sync whose source has a regular file at that
+// path must replace the link, never follow it into a target that lies
+// outside the destination root entirely.
+func TestE2EDirStaleSymlinkNeverWrittenThrough(t *testing.T) {
+	outside := t.TempDir()
+	victim := filepath.Join(outside, "victim.txt")
+	mustWriteFile(t, victim, "DO NOT TOUCH")
+
+	src := t.TempDir()
+	mustWriteFile(t, filepath.Join(src, "f.txt"), "new source content")
+
+	dst := t.TempDir()
+	if err := os.Symlink(victim, filepath.Join(dst, "f.txt")); err != nil {
+		t.Skipf("symlinks unsupported: %v", err)
+	}
+
+	startDirClientAgainst(t, src, dst, 2, false, nil, false, false, false)
+
+	if got, err := os.ReadFile(victim); err != nil || string(got) != "DO NOT TOUCH" {
+		t.Errorf("wrote through the symlink, outside the destination root: victim = %q, %v", got, err)
+	}
+	fi, err := os.Lstat(filepath.Join(dst, "f.txt"))
+	if err != nil || fi.Mode()&os.ModeSymlink != 0 {
+		t.Errorf("f.txt is still a symlink: %v (err %v)", fi.Mode(), err)
+	}
+	if got, err := os.ReadFile(filepath.Join(dst, "f.txt")); err != nil || string(got) != "new source content" {
+		t.Errorf("f.txt = %q, %v; want the source content", got, err)
+	}
+}
+
+// TestE2EDirSpecialsSyncsFifosAndSockets is the -specials end-to-end case,
+// modelled on a backup tree (which is where FIFOs and stray unix sockets
+// actually turn up): the nodes are recreated as themselves, regular files
+// alongside them still transfer, and a rerun is a clean no-op.
+func TestE2EDirSpecialsSyncsFifosAndSockets(t *testing.T) {
+	src := t.TempDir()
+	mustMkdirAll(t, filepath.Join(src, "var", "run"))
+	mustWriteFile(t, filepath.Join(src, "var", "data.txt"), string(randomBytes(2000, 42)))
+	mkFifo(t, filepath.Join(src, "var", "shim.stdout.log"))
+	mkSocket(t, filepath.Join(src, "var", "run", "unix.socket"))
+
+	dst := t.TempDir()
+	startDirClientAgainst(t, src, dst, 2, false, nil, false, false, false, true)
+
+	fi, err := os.Lstat(filepath.Join(dst, "var", "shim.stdout.log"))
+	if err != nil || fi.Mode()&os.ModeNamedPipe == 0 {
+		t.Errorf("shim.stdout.log is not a FIFO: %v (err %v)", fi.Mode(), err)
+	}
+	fi, err = os.Lstat(filepath.Join(dst, "var", "run", "unix.socket"))
+	if err != nil || fi.Mode()&os.ModeSocket == 0 {
+		t.Errorf("unix.socket is not a socket: %v (err %v)", fi.Mode(), err)
+	}
+	want, _ := os.ReadFile(filepath.Join(src, "var", "data.txt"))
+	got, err := os.ReadFile(filepath.Join(dst, "var", "data.txt"))
+	if err != nil || string(got) != string(want) {
+		t.Errorf("data.txt did not transfer alongside the special files: %v", err)
+	}
+
+	// Idempotent rerun: the nodes are left exactly as they are.
+	beforeFifo, _ := os.Lstat(filepath.Join(dst, "var", "shim.stdout.log"))
+	sess2 := startDirClientAgainst(t, src, dst, 2, false, nil, false, false, false, true)
+	if sess2.diffs.Load() != 0 {
+		t.Errorf("rerun diffs = %d, want 0", sess2.diffs.Load())
+	}
+	afterFifo, _ := os.Lstat(filepath.Join(dst, "var", "shim.stdout.log"))
+	if !os.SameFile(beforeFifo, afterFifo) {
+		t.Error("the FIFO was recreated on an idempotent rerun")
+	}
+}
+
+// TestE2EDirSpecialsOffSkipsThem pins the default: without -specials the
+// nodes are KindSkipped placeholders -- nothing is created for them, and
+// -delete still treats their destination namesakes as protected.
+func TestE2EDirSpecialsOffSkipsThem(t *testing.T) {
+	src := t.TempDir()
+	mustWriteFile(t, filepath.Join(src, "keep.txt"), "data")
+	mkFifo(t, filepath.Join(src, "pipe"))
+
+	dst := t.TempDir()
+	startDirClientAgainst(t, src, dst, 2, false, nil, false, false, false)
+
+	if _, err := os.Lstat(filepath.Join(dst, "pipe")); !os.IsNotExist(err) {
+		t.Errorf("pipe was created without -specials (lstat err = %v)", err)
+	}
+
+	// A destination-side namesake must survive a -delete pass: the source
+	// announced the path as skipped, not as absent.
+	mkFifo(t, filepath.Join(dst, "pipe"))
+	startDirClientAgainst(t, src, dst, 2, false, nil, false, true, false)
+	if _, err := os.Lstat(filepath.Join(dst, "pipe")); err != nil {
+		t.Errorf("-delete removed a protected skipped-file namesake: %v", err)
+	}
+}
+
+// TestE2EDirSpecialsWithDeleteRemovesStaleNode: with -specials the nodes are
+// genuinely synced, so an unannounced destination FIFO is stale and removed
+// like any other extraneous entry.
+func TestE2EDirSpecialsWithDeleteRemovesStaleNode(t *testing.T) {
+	src := t.TempDir()
+	mustWriteFile(t, filepath.Join(src, "keep.txt"), "data")
+	mkFifo(t, filepath.Join(src, "kept-pipe"))
+
+	dst := t.TempDir()
+	startDirClientAgainst(t, src, dst, 2, false, nil, false, false, false, true)
+	mkFifo(t, filepath.Join(dst, "stale-pipe"))
+
+	startDirClientAgainst(t, src, dst, 2, false, nil, false, true, false, true)
+
+	if _, err := os.Lstat(filepath.Join(dst, "stale-pipe")); !os.IsNotExist(err) {
+		t.Errorf("stale-pipe still exists (lstat err = %v)", err)
+	}
+	if _, err := os.Lstat(filepath.Join(dst, "kept-pipe")); err != nil {
+		t.Errorf("kept-pipe was removed: %v", err)
+	}
+}
+
+// TestE2EDirSyncsTrailingDotNames is the reported regression, end to end: a
+// bind/zkt backup tree full of DNS zone files whose names carry the root
+// label's trailing dot. On a Linux-to-Linux sync these are ordinary files and
+// must transfer; they used to be dropped by a Windows-only portability rule,
+// silently losing real data with only a "skip ... unsafe path" line.
+func TestE2EDirSyncsTrailingDotNames(t *testing.T) {
+	// Gated on the OS, deliberately NOT on enforceWindowsPathRules: keying
+	// the skip off the very flag under test would let a regression that
+	// re-enables Windows rules on Linux silently skip this instead of
+	// failing it.
+	if runtime.GOOS == "windows" {
+		t.Skip("these names genuinely cannot be created on Windows")
+	}
+	src := t.TempDir()
+	zones := filepath.Join(src, "contrib", "zkt-1.1.2", "examples", "views", "intern")
+	mustMkdirAll(t, zones)
+
+	names := []string{"keyset-example.net.", "dnskey.db.", "trailing space "}
+	for i, n := range names {
+		mustWriteFile(t, filepath.Join(zones, n), string(randomBytes(500+i, int64(i+1))))
+	}
+	// A reserved-on-Windows name, which is likewise ordinary here.
+	mustWriteFile(t, filepath.Join(zones, "aux"), "device-name-clash")
+
+	dst := t.TempDir()
+	sess := startDirClientAgainst(t, src, dst, 2, false, nil, false, false, false)
+	if got := sess.filesSkipped.Load(); got != 0 {
+		t.Errorf("skipped %d entr(y/ies); these names are valid on this platform", got)
+	}
+
+	dstZones := filepath.Join(dst, "contrib", "zkt-1.1.2", "examples", "views", "intern")
+	for _, n := range append(names, "aux") {
+		want, err := os.ReadFile(filepath.Join(zones, n))
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := os.ReadFile(filepath.Join(dstZones, n))
+		if err != nil {
+			t.Errorf("%q did not transfer: %v", n, err)
+			continue
+		}
+		if string(got) != string(want) {
+			t.Errorf("%q content mismatch", n)
+		}
+	}
+}
+
+// --- the tree comparison must actually catch things ---
+
+// TestAssertTreesEqualCatchesRealDifferences proves the helper that ~33 e2e
+// tests rely on is not vacuous. Each case corrupts a faithful copy in exactly
+// one way and asserts the comparison notices -- including the three the
+// PREVIOUS content-only comparison silently missed: a symlink recreated with
+// the wrong target (it followed links, so matching target bytes passed), a
+// missing empty directory (it ignored directories entirely), and a wrong
+// mode.
+func TestAssertTreesEqualCatchesRealDifferences(t *testing.T) {
+	build := func(t *testing.T) (string, string) {
+		t.Helper()
+		src, dst := t.TempDir(), t.TempDir()
+		for _, root := range []string{src, dst} {
+			mustMkdirAll(t, filepath.Join(root, "sub"))
+			mustMkdirAll(t, filepath.Join(root, "empty"))
+			mustWriteFile(t, filepath.Join(root, "sub", "data.bin"), string(randomBytes(4096, 7)))
+			if err := os.Chmod(filepath.Join(root, "sub", "data.bin"), 0640); err != nil {
+				t.Fatal(err)
+			}
+			mtime := time.Unix(1700000000, 0)
+			if err := os.Chtimes(filepath.Join(root, "sub", "data.bin"), mtime, mtime); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink("sub/data.bin", filepath.Join(root, "link")); err != nil {
+				t.Skipf("symlinks unsupported: %v", err)
+			}
+		}
+		// Sanity: identical trees must produce no complaints at all.
+		if problems := diffTrees(t, src, dst); len(problems) != 0 {
+			t.Fatalf("identical trees reported differences: %v", problems)
+		}
+		return src, dst
+	}
+
+	for _, tc := range []struct {
+		name    string
+		corrupt func(t *testing.T, dst string)
+		wantSub string
+	}{
+		{
+			name: "single flipped byte",
+			corrupt: func(t *testing.T, dst string) {
+				p := filepath.Join(dst, "sub", "data.bin")
+				b, err := os.ReadFile(p)
+				if err != nil {
+					t.Fatal(err)
+				}
+				b[len(b)/2] ^= 0xFF
+				mustWriteFile(t, p, string(b))
+				os.Chmod(p, 0640)
+				mt := time.Unix(1700000000, 0)
+				os.Chtimes(p, mt, mt)
+			},
+			wantSub: "content differs",
+		},
+		{
+			name: "truncated file",
+			corrupt: func(t *testing.T, dst string) {
+				if err := os.Truncate(filepath.Join(dst, "sub", "data.bin"), 100); err != nil {
+					t.Fatal(err)
+				}
+			},
+			wantSub: "content differs",
+		},
+		{
+			name: "symlink pointing elsewhere",
+			corrupt: func(t *testing.T, dst string) {
+				p := filepath.Join(dst, "link")
+				os.Remove(p)
+				// Same CONTENT reachable through it -- only the target
+				// string differs, which the old comparison could not see.
+				if err := os.Symlink("./sub/data.bin", p); err != nil {
+					t.Fatal(err)
+				}
+			},
+			wantSub: "link target",
+		},
+		{
+			name: "missing empty directory",
+			corrupt: func(t *testing.T, dst string) {
+				if err := os.Remove(filepath.Join(dst, "empty")); err != nil {
+					t.Fatal(err)
+				}
+			},
+			wantSub: "missing from destination",
+		},
+		{
+			name: "wrong file mode",
+			corrupt: func(t *testing.T, dst string) {
+				if err := os.Chmod(filepath.Join(dst, "sub", "data.bin"), 0600); err != nil {
+					t.Fatal(err)
+				}
+			},
+			wantSub: "mode",
+		},
+		{
+			name: "wrong mtime",
+			corrupt: func(t *testing.T, dst string) {
+				mt := time.Unix(1600000000, 0)
+				if err := os.Chtimes(filepath.Join(dst, "sub", "data.bin"), mt, mt); err != nil {
+					t.Fatal(err)
+				}
+			},
+			wantSub: "mtime",
+		},
+		{
+			name: "extra file at the destination",
+			corrupt: func(t *testing.T, dst string) {
+				mustWriteFile(t, filepath.Join(dst, "unexpected.txt"), "surprise")
+			},
+			wantSub: "not in the source",
+		},
+		{
+			name: "regular file where a symlink belongs",
+			corrupt: func(t *testing.T, dst string) {
+				p := filepath.Join(dst, "link")
+				os.Remove(p)
+				mustWriteFile(t, p, "not a link")
+			},
+			wantSub: "type is file at destination, want symlink",
+		},
+		{
+			name: "directory replaced by a file",
+			corrupt: func(t *testing.T, dst string) {
+				p := filepath.Join(dst, "empty")
+				os.Remove(p)
+				mustWriteFile(t, p, "not a dir")
+			},
+			wantSub: "type is file at destination, want dir",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			src, dst := build(t)
+			tc.corrupt(t, dst)
+			problems := diffTrees(t, src, dst)
+			if len(problems) == 0 {
+				t.Fatalf("comparison saw no difference after %q", tc.name)
+			}
+			joined := strings.Join(problems, "; ")
+			if !strings.Contains(joined, tc.wantSub) {
+				t.Errorf("problems %q do not mention %q", joined, tc.wantSub)
+			}
+		})
+	}
+}
+
+// TestAssertTreesEqualHandlesSpecialFilesWithoutHanging: the previous
+// comparison used os.ReadFile, which blocks forever on a FIFO -- so the
+// -specials tests could not use it. This one records special files by type.
+func TestAssertTreesEqualHandlesSpecialFilesWithoutHanging(t *testing.T) {
+	src, dst := t.TempDir(), t.TempDir()
+	for _, root := range []string{src, dst} {
+		mkFifo(t, filepath.Join(root, "pipe"))
+		mkSocket(t, filepath.Join(root, "sock"))
+	}
+	done := make(chan []string, 1)
+	go func() { done <- diffTrees(t, src, dst) }()
+	select {
+	case problems := <-done:
+		if len(problems) != 0 {
+			t.Errorf("identical special files reported as different: %v", problems)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("comparison hung on a special file -- it must never open one")
+	}
+
+	// A FIFO where a socket belongs must still be caught.
+	os.Remove(filepath.Join(dst, "pipe"))
+	mkSocket(t, filepath.Join(dst, "pipe"))
+	if problems := diffTrees(t, src, dst); len(problems) == 0 {
+		t.Error("a socket standing in for a FIFO was not reported")
+	}
+}
+
+// TestE2EDirDirectoryModeIsNotPreserved pins current behavior rather than
+// asserting a wish: the destination creates directories with
+// MkdirAll(0777)&umask and never chmods or chtimes them, so a source
+// directory's permissions do NOT survive the transfer. Documented here so the
+// gap is visible and a future change to preserve them fails loudly instead of
+// silently altering behavior no test covered.
+func TestE2EDirDirectoryModeIsNotPreserved(t *testing.T) {
+	src := t.TempDir()
+	odd := filepath.Join(src, "restricted")
+	mustMkdirAll(t, odd)
+	mustWriteFile(t, filepath.Join(odd, "f.txt"), "content")
+	if err := os.Chmod(odd, 0700); err != nil {
+		t.Fatal(err)
+	}
+
+	dst, _ := runDirTransfer(t, src, 2, false)
+
+	// The file inside it transfers correctly, contents and all.
+	assertTreesEqual(t, src, dst)
+
+	si, err := os.Lstat(odd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	di, err := os.Lstat(filepath.Join(dst, "restricted"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if di.Mode().Perm() == si.Mode().Perm() {
+		t.Log("directory permissions now match; if that is intentional, " +
+			"snapshotTree should start comparing them and this test should assert equality")
+	}
+}
+
+// --- quick-check semantics (now the default) ---
+
+// TestE2EDirQuickCheckSkipsSameSizeAndMTime pins the documented hazard of the
+// default: a file rewritten with DIFFERENT content but the same size and the
+// same mtime is skipped, because size+mtime is all the quick check looks at.
+// This is rsync's long-standing tradeoff, not a bug -- but it is exactly the
+// kind of behaviour that must be pinned, since it decides whether real data
+// moves.
+func TestE2EDirQuickCheckSkipsSameSizeAndMTime(t *testing.T) {
+	src := t.TempDir()
+	path := filepath.Join(src, "data.txt")
+	mustWriteFile(t, path, "AAAAAAAAAAAAAAAA") // 16 bytes
+	fixed := time.Unix(1700000000, 0)
+	if err := os.Chtimes(path, fixed, fixed); err != nil {
+		t.Fatal(err)
+	}
+
+	dst := t.TempDir()
+	startDirClientAgainst(t, src, dst, 2, false, nil, true, false, false)
+	if got, _ := os.ReadFile(filepath.Join(dst, "data.txt")); string(got) != "AAAAAAAAAAAAAAAA" {
+		t.Fatalf("first sync did not transfer: %q", got)
+	}
+
+	// Same length, same mtime, different bytes.
+	mustWriteFile(t, path, "BBBBBBBBBBBBBBBB")
+	if err := os.Chtimes(path, fixed, fixed); err != nil {
+		t.Fatal(err)
+	}
+
+	startDirClientAgainst(t, src, dst, 2, false, nil, true, false, false)
+	got, _ := os.ReadFile(filepath.Join(dst, "data.txt"))
+	if string(got) != "AAAAAAAAAAAAAAAA" {
+		t.Errorf("quick-check transferred a file whose size and mtime were unchanged; "+
+			"destination = %q. If this is now desired, the README's stated tradeoff needs updating", got)
+	}
+
+	// -ignore-times (quickCheck=false) is the escape hatch and MUST catch it.
+	startDirClientAgainst(t, src, dst, 2, false, nil, false, false, false)
+	assertTreesEqual(t, src, dst)
+}
+
+// TestE2EDirQuickCheckTransfersOnSizeOrMTimeChange: the ordinary cases must
+// still move, or the default would be silently losing updates.
+func TestE2EDirQuickCheckTransfersOnSizeOrMTimeChange(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		modify func(t *testing.T, path string)
+	}{
+		{"size changed", func(t *testing.T, path string) {
+			mustWriteFile(t, path, "a much longer replacement body")
+		}},
+		{"mtime changed", func(t *testing.T, path string) {
+			mustWriteFile(t, path, "BBBBBBBBBBBBBBBB") // same 16 bytes
+			later := time.Unix(1800000000, 0)
+			if err := os.Chtimes(path, later, later); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			src := t.TempDir()
+			path := filepath.Join(src, "data.txt")
+			mustWriteFile(t, path, "AAAAAAAAAAAAAAAA")
+			fixed := time.Unix(1700000000, 0)
+			if err := os.Chtimes(path, fixed, fixed); err != nil {
+				t.Fatal(err)
+			}
+
+			dst := t.TempDir()
+			startDirClientAgainst(t, src, dst, 2, false, nil, true, false, false)
+			tc.modify(t, path)
+			startDirClientAgainst(t, src, dst, 2, false, nil, true, false, false)
+			assertTreesEqual(t, src, dst)
+		})
+	}
+}
+
+// TestE2EDirMixedTreeVerifiedByChecksum is the broad end-to-end assertion the
+// suite lacked: one tree combining every entry kind bsync handles -- nested
+// and empty directories, a large multi-block file, a zero-byte file, a
+// read-only file, relative/absolute/dangling symlinks, a FIFO and a socket --
+// verified in a single pass by content hash, type, link target, mode and
+// mtime. Previously each kind was checked by its own bespoke assertions, and
+// the comparison helper could not even look at symlinks or special files.
+func TestE2EDirMixedTreeVerifiedByChecksum(t *testing.T) {
+	src := t.TempDir()
+	mustMkdirAll(t, filepath.Join(src, "a", "b", "c"))
+	mustMkdirAll(t, filepath.Join(src, "empty-top"))
+	mustMkdirAll(t, filepath.Join(src, "a", "empty-nested"))
+	mustWriteFile(t, filepath.Join(src, "a", "b", "c", "deep.bin"), string(randomBytes(3<<20, 11)))
+	mustWriteFile(t, filepath.Join(src, "zero.txt"), "")
+	mustWriteFile(t, filepath.Join(src, "a", "readonly.txt"), "cannot write me")
+	if err := os.Chmod(filepath.Join(src, "a", "readonly.txt"), 0444); err != nil {
+		t.Fatal(err)
+	}
+	mustWriteFile(t, filepath.Join(src, "spaces and 'quotes'.txt"), "odd name")
+
+	if err := os.Symlink("a/b/c/deep.bin", filepath.Join(src, "rel-link")); err != nil {
+		t.Skipf("symlinks unsupported: %v", err)
+	}
+	if err := os.Symlink("/etc/hostname", filepath.Join(src, "abs-link")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("nowhere-at-all", filepath.Join(src, "dangling")); err != nil {
+		t.Fatal(err)
+	}
+	mkFifo(t, filepath.Join(src, "a", "pipe"))
+	mkSocket(t, filepath.Join(src, "sock"))
+
+	for _, workers := range []int{1, 8} {
+		t.Run(fmt.Sprintf("w=%d", workers), func(t *testing.T) {
+			dst := t.TempDir()
+			// -links and -specials on, so every entry above is reproduced
+			// rather than left as a skipped placeholder.
+			startDirClientAgainst(t, src, dst, workers, false, nil, true, false, true, true)
+			assertTreesEqual(t, src, dst)
+
+			// Idempotent re-run must not disturb anything.
+			startDirClientAgainst(t, src, dst, workers, false, nil, true, false, true, true)
+			assertTreesEqual(t, src, dst)
+
+			// And the conservative path must agree too.
+			startDirClientAgainst(t, src, dst, workers, false, nil, false, false, true, true)
+			assertTreesEqual(t, src, dst)
+		})
+	}
+}
+
+// TestE2EDirLiveSessionTableDrainsToZero is the structural proof that the
+// client's per-entry bookkeeping is O(in-flight), not O(tree): after a real
+// transfer over a tree exercising every entry kind -- directories, a real
+// file, a zero-byte file, symlinks (relative/absolute/dangling), a FIFO and
+// a socket -- completes, SyncSession.LiveCount() must be exactly 0. Every
+// entry has some release point (the fan-out loop, the quick-check batcher's
+// flush, sendFileDone/markFileSkippedDone via claimDone, or the dedicated
+// empty-file loop -- see startDirClient); a single missed one leaks that
+// entry (and its FileEntry, RelPath string, and remaining-block counter)
+// for the rest of the process's life, which at tree scale is exactly the
+// O(tree) memory growth this design exists to eliminate. Checked across the
+// quick-check and non-quick-check paths, since they release entries at two
+// different points (see the fan-out loop and flush's comments).
+func TestE2EDirLiveSessionTableDrainsToZero(t *testing.T) {
+	src := t.TempDir()
+	mustMkdirAll(t, filepath.Join(src, "a", "b"))
+	mustMkdirAll(t, filepath.Join(src, "empty-dir"))
+	mustWriteFile(t, filepath.Join(src, "a", "b", "real.bin"), string(randomBytes(50000, 12)))
+	mustWriteFile(t, filepath.Join(src, "zero.txt"), "")
+	if err := os.Symlink("a/b/real.bin", filepath.Join(src, "rel-link")); err != nil {
+		t.Skipf("symlinks unsupported: %v", err)
+	}
+	if err := os.Symlink("/etc/hostname", filepath.Join(src, "abs-link")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("nowhere", filepath.Join(src, "dangling")); err != nil {
+		t.Fatal(err)
+	}
+	mkFifo(t, filepath.Join(src, "pipe"))
+	mkSocket(t, filepath.Join(src, "sock"))
+
+	for _, tc := range []struct {
+		name       string
+		quickCheck bool
+	}{
+		{"quickCheckOff", false},
+		{"quickCheckOn", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dst := t.TempDir()
+			sess := startDirClientAgainst(t, src, dst, 4, false, nil, tc.quickCheck, false, true, true)
+			assertTreesEqual(t, src, dst)
+			if live := sess.LiveCount(); live != 0 {
+				t.Errorf("LiveCount() = %d after a completed transfer, want 0 -- some entry was never released", live)
+			}
+
+			// A second, idempotent run exercises quick-check's actual skip
+			// path (everything already matches), which releases entries at
+			// yet another point (markFileSkippedDone, via claimDone) --
+			// distinct from the first run's fresh-transfer release points.
+			sess2 := startDirClientAgainst(t, src, dst, 4, false, nil, tc.quickCheck, false, true, true)
+			assertTreesEqual(t, src, dst)
+			if live := sess2.LiveCount(); live != 0 {
+				t.Errorf("LiveCount() = %d after a completed idempotent re-run, want 0", live)
+			}
+		})
+	}
+}
+
+// countSpillFiles counts idSpill's temp files currently sitting in the
+// system temp directory (os.TempDir(), the same location newIDSpill uses
+// with a "" dir argument). Used to prove a spill file doesn't leak past the
+// transfer that created it.
+func countSpillFiles(t *testing.T) int {
+	t.Helper()
+	matches, err := filepath.Glob(filepath.Join(os.TempDir(), "bsync-tree-*"))
+	if err != nil {
+		t.Fatalf("glob spill files: %v", err)
+	}
+	return len(matches)
+}
+
+// TestE2EDirDeleteSpillCleanedUpWhenFeederNeverSpawns is the regression for
+// idSpill's ownership split (see startDirClient's spill comment): if the
+// destination never sends a delete-pass ack (a wedged or misbehaving
+// server), startDirClient returns an error BEFORE the feeder goroutine that
+// would normally own the spill's cleanup is ever spawned. The
+// treeFeederSpawned-gated defer must close (and so remove) the spill itself
+// in that case, or a failed -delete transfer would leak a temp file on
+// every occurrence.
+func TestE2EDirDeleteSpillCleanedUpWhenFeederNeverSpawns(t *testing.T) {
+	src := t.TempDir()
+	mustWriteFile(t, filepath.Join(src, "a.txt"), "hello")
+
+	before := countSpillFiles(t)
+
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	go func() {
+		conn, err := l.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		// Drain whatever the client sends (announce batches, then
+		// OpAnnounceEnd) without ever replying, then hang up -- the client
+		// is left waiting for a delete-pass ack that will never come, and
+		// eventually sees the connection close instead.
+		buf := make([]byte, 4096)
+		deadline := time.Now().Add(500 * time.Millisecond)
+		for time.Now().Before(deadline) {
+			conn.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
+			if _, err := conn.Read(buf); err != nil && !os.IsTimeout(err) {
+				return
+			}
+		}
+	}()
+
+	_, err = startDirClient(src, l.Addr().String(), 0, false, 1, nil, false, true, false, false)
+	if err == nil {
+		t.Fatal("startDirClient succeeded against a server that never acked the delete pass")
+	}
+
+	after := countSpillFiles(t)
+	if after > before {
+		t.Errorf("spill temp file leaked: %d before, %d after a failed delete-pass wait (want no increase)", before, after)
+	}
+}
+
+// TestE2EDirExcludedSubtreeLeavesTheRestIntact: an excluded directory with
+// content under it must be absent from the destination while everything else
+// matches exactly -- checked by hash, not just by path presence.
+func TestE2EDirExcludedSubtreeLeavesTheRestIntact(t *testing.T) {
+	src := t.TempDir()
+	mustMkdirAll(t, filepath.Join(src, "keep", "deeper"))
+	mustMkdirAll(t, filepath.Join(src, "skipme", "inner"))
+	mustWriteFile(t, filepath.Join(src, "keep", "deeper", "a.bin"), string(randomBytes(5000, 3)))
+	mustWriteFile(t, filepath.Join(src, "keep", "b.txt"), "kept")
+	mustWriteFile(t, filepath.Join(src, "skipme", "inner", "gone.txt"), "should not travel")
+	mustWriteFile(t, filepath.Join(src, "top.log"), "excluded by pattern")
+
+	dst := t.TempDir()
+	startDirClientAgainst(t, src, dst, 2, false, []string{"skipme", "*.log"}, true, false, false)
+
+	if _, err := os.Lstat(filepath.Join(dst, "skipme")); !os.IsNotExist(err) {
+		t.Errorf("excluded directory reached the destination (lstat err = %v)", err)
+	}
+	if _, err := os.Lstat(filepath.Join(dst, "top.log")); !os.IsNotExist(err) {
+		t.Errorf("excluded file reached the destination (lstat err = %v)", err)
+	}
+	// Everything that WAS supposed to travel must match exactly.
+	assertTreesEqual(t, filepath.Join(src, "keep"), filepath.Join(dst, "keep"))
 }

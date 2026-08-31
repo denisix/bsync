@@ -4,44 +4,90 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"sync"
+	"sync/atomic"
 )
 
-// Reader buffer pool for reusing read buffers
-// Pool buffers are locked in memory on creation to prevent swap
-// Buffers use huge pages (MADV_HUGEPAGE) to reduce TLB misses
-var readerBufPool = sync.Pool{
-	New: func() interface{} {
-		// Pre-allocate with 10MB capacity for typical block size
-		buf := make([]byte, 0, 10*1024*1024)
-		// Lock the full capacity to prevent swap
-		TryLockBuffer(buf[:cap(buf)])
-		// Advise kernel to use huge pages (2MB) for better TLB utilization
-		AdviseHugePage(buf[:cap(buf)])
-		return buf
-	},
+// readerBufPools maps an exact buffer size to a pool of buffers with
+// cap() == that size. Keyed on the exact size, NOT a power-of-two size
+// class: -b (and therefore treeBlockSize's cap, walk.go) is routinely a
+// non-power-of-two like the 10 MiB default, and treeBlockSize returns that
+// cap verbatim for any file at or above it -- a power-of-two class would
+// round the single most common request up to 16 MiB, a 60% waste on
+// exactly the workload this exists to fix. The key space this program
+// actually produces is closed and small: treeBlockSize only ever returns
+// powers of two between minTreeBlock and capBS, plus capBS itself, so in
+// practice this holds on the order of ten entries.
+//
+// maxDistinctReaderBufSizes bounds it anyway, in case a future caller ever
+// passes sizes outside that closed set: past the cap, getReaderBuf/
+// putReaderBuf fall back to plain make/GC rather than growing the pool set
+// without limit.
+const maxDistinctReaderBufSizes = 64
+
+var (
+	readerBufPools  sync.Map // uint32 size -> *sync.Pool
+	readerBufPoolsN atomic.Int64
+)
+
+// Deliberately NOT mlock'd/MADV_HUGEPAGE'd (a previous version of this pool
+// was). mlock locks pages, not Go objects: nothing here ever called
+// munlock, and madvise(MADV_DONTNEED)/MADV_FREE both fail with EINVAL on a
+// VM_LOCKED range, so the Go runtime's scavenger could never return that
+// memory to the OS once touched -- RSS only ratcheted upward, worst as root
+// (the common case for a sync target), where RLIMIT_MEMLOCK does not stop
+// it. MADV_HUGEPAGE on many 10 MiB regions is also expensive on its own:
+// it feeds khugepaged/kcompactd compaction work system-wide, which is
+// consistent with the 29 hours of kcompactd0 CPU seen alongside this in
+// production. Sequential access is still advised per-file via
+// AdviseSequential (readOneFile), which has none of these costs.
+func readerBufPoolFor(size uint32) *sync.Pool {
+	if p, ok := readerBufPools.Load(size); ok {
+		return p.(*sync.Pool)
+	}
+	if readerBufPoolsN.Load() >= maxDistinctReaderBufSizes {
+		return nil // caller falls back to a plain, unpooled allocation
+	}
+	pool := &sync.Pool{New: func() interface{} {
+		return make([]byte, 0, size)
+	}}
+	actual, loaded := readerBufPools.LoadOrStore(size, pool)
+	if !loaded {
+		readerBufPoolsN.Add(1)
+	}
+	return actual.(*sync.Pool)
 }
 
-// getReaderBuf gets a buffer from the pool or allocates a new one
+// getReaderBuf gets a buffer of exactly size from its pool, or allocates
+// one directly if the pool set is already at its cap.
 func getReaderBuf(size uint32) []byte {
-	buf := readerBufPool.Get().([]byte)
+	pool := readerBufPoolFor(size)
+	if pool == nil {
+		return make([]byte, size)
+	}
+	buf := pool.Get().([]byte)
 	if cap(buf) < int(size) {
-		// Pool buffer too small, allocate new one (not returned to pool)
-		// New buffers are automatically locked
-		newBuf := make([]byte, size)
-		TryLockBuffer(newBuf)
-		return newBuf
+		return make([]byte, size) // shouldn't happen: New always makes cap==size
 	}
 	return buf[:size]
 }
 
-// putReaderBuf returns a buffer to the pool if it's appropriately sized
+// putReaderBuf returns buf to the pool for cap(buf) -- NOT len(buf).
+// Callers commonly pass a short final block (readFileBlocks reslices a
+// full-capacity buffer down to the bytes actually read), so keying on
+// length would silently create a pool per distinct trailing-block size and
+// blow through maxDistinctReaderBufSizes on an ordinary tree.
 func putReaderBuf(buf []byte) {
-	if cap(buf) <= 10*1024*1024 {
-		readerBufPool.Put(buf[:0])
+	c := cap(buf)
+	if c == 0 {
+		return
 	}
-	// Large buffers are GC'd instead of polluting the pool
-	// Note: munlock happens automatically when GC frees the memory
+	if pool := readerBufPoolFor(uint32(c)); pool != nil {
+		pool.Put(buf[:0])
+	}
+	// Pool set already at its cap for this size: let buf be GC'd rather
+	// than start tracking a size class with nowhere to put it back.
 }
 
 // FileBlock represents one block read from one file: its FileID (0 for the
@@ -62,6 +108,18 @@ type FileBlock struct {
 // need no changes: BlockData{BlockIdx: ..., Data: ...} still works exactly
 // as before, with FileID/Last/release simply left at their zero values.
 type BlockData = FileBlock
+
+// tinyFileAdviseThreshold gates the two per-file fadvise hints
+// (AdviseSequential in TreeReader.readOneFile, AdviseDontNeed in
+// readFileBlocks) on the file actually being worth advising the kernel
+// about. A handful of KB is one, maybe two blocks -- gone before the
+// kernel could act on either hint -- so below this size the syscall is
+// pure overhead, and AdviseDontNeed is actively counterproductive: it
+// evicts pages a same-second quick-check re-run would rather find still
+// cached. 1 MiB is comfortably above tree mode's block-size floor
+// (minTreeBlock, walk.go) so it only skips files that are genuinely tiny,
+// not merely below the block-size cap.
+const tinyFileAdviseThreshold = 1 << 20
 
 // readFileBlocks reads blocks [skipIdx..lastBlockNum] of file into out, in
 // ascending order, tagging each with fileID. It does not close out — the
@@ -111,7 +169,16 @@ func readFileBlocks(file *os.File, fileID uint32, blockSize uint32, fileSize uin
 
 		// We won't read this source range again; drop its clean page-cache
 		// pages so a large transfer doesn't evict useful read-ahead pages.
-		AdviseDontNeed(file, offset, int64(n))
+		// Skipped for a small file (fileSize is the WHOLE file this call is
+		// reading, not just this block): the fadvise syscall itself starts
+		// costing more than the eviction it prevents, and directory mode
+		// calls this once per file -- a large tree of KB-sized files paid
+		// one extra syscall per file for no benefit, while also evicting
+		// pages a same-second re-run (quick-check's stat, or a resync)
+		// would have wanted back in cache.
+		if fileSize >= tinyFileAdviseThreshold {
+			AdviseDontNeed(file, offset, int64(n))
+		}
 
 		fb := FileBlock{
 			FileID:   fileID,
@@ -245,6 +312,7 @@ func (b *byteBudget) release(n int64) {
 // every file in it, so it owns closing that channel itself — once, when its
 // input channel closes.
 type TreeReader struct {
+	root   string // joined with each FileEntry.RelPath to open it; see readOneFile
 	files  <-chan *FileEntry
 	out    chan FileBlock
 	sess   *SyncSession
@@ -271,21 +339,50 @@ type TreeReader struct {
 	onFileFailed func(fileID uint32, blocksEmitted uint32)
 }
 
-// NewTreeReader creates a TreeReader draining files. sess, if non-nil,
-// receives a failFile call for a file that can't be opened or read, and the
-// file is then skipped rather than aborting the whole tree. prefetchBytes
-// bounds how many bytes of unread block data may be in flight at once (see
+// NewTreeReader creates a TreeReader draining files. root is the source
+// walk root every entry's RelPath is relative to: a FileEntry no longer
+// carries its own absolute path (see readOneFile) -- retaining one per
+// entry cost a second, separately allocated copy of the whole tree's path
+// set (root + "/" + RelPath) for a string only ever needed for the handful
+// of files actually open at any instant. sess, if non-nil, receives a
+// failFile call for a file that can't be opened or read, and the file is
+// then skipped rather than aborting the whole tree. prefetchBytes bounds
+// how many bytes of unread block data may be in flight at once (see
 // byteBudget); <= 0 falls back to a small default.
-func NewTreeReader(files <-chan *FileEntry, sess *SyncSession, prefetchBytes int64) *TreeReader {
+func NewTreeReader(root string, files <-chan *FileEntry, sess *SyncSession, prefetchBytes int64) *TreeReader {
 	if prefetchBytes <= 0 {
 		prefetchBytes = int64(minTreeBlock) * 4
 	}
 	return &TreeReader{
+		root:   root,
 		files:  files,
-		out:    make(chan FileBlock, 4),
+		out:    make(chan FileBlock, treeReaderOutDepth(prefetchBytes)),
 		sess:   sess,
 		budget: newByteBudget(prefetchBytes),
 	}
+}
+
+// treeReaderOutDepth sizes tr.out (the channel between the single reading
+// goroutine and the parallel precompute workers draining it) from the same
+// byteBudget the reader already obeys, instead of the flat 4 it used to be
+// hardcoded to. byteBudget is what actually bounds bytes in flight -- the
+// channel is meant to be just a buffer -- but at minTreeBlock-sized blocks
+// (64 KiB, tree mode's floor) a depth of 4 meant only 256 KiB could ever be
+// mid-pipeline no matter how large prefetchBytes allowed, starving the
+// precompute workers and leaving the budget's real ceiling unreachable.
+// Sized in minTreeBlock units (the smallest block this pipeline carries) so
+// the channel can hold as many blocks as the budget could ever admit, and
+// clamped so a huge -w/-b combination doesn't turn "channel buffer" into a
+// multi-thousand-slot allocation for a resource byteBudget already governs.
+func treeReaderOutDepth(prefetchBytes int64) int {
+	d := int(prefetchBytes / int64(minTreeBlock))
+	if d < 16 {
+		return 16
+	}
+	if d > 512 {
+		return 512
+	}
+	return d
 }
 
 // Start begins reading in the background.
@@ -307,7 +404,12 @@ func (tr *TreeReader) Start() {
 }
 
 func (tr *TreeReader) readOneFile(fe *FileEntry) {
-	f, err := OpenFileNoAtime(fe.AbsPath, os.O_RDONLY, 0)
+	// RelPath is always '/'-separated (sanitizeRelPath's contract);
+	// filepath.FromSlash makes the join correct on Windows too, and
+	// filepath.Join (not concatenation) handles a root with or without a
+	// trailing separator identically.
+	abs := filepath.Join(tr.root, filepath.FromSlash(fe.RelPath))
+	f, err := OpenFileNoAtime(abs, os.O_RDONLY, 0)
 	if err != nil {
 		if tr.sess != nil {
 			tr.sess.failFile(fe.ID, fmt.Errorf("open %s: %w", fe.RelPath, err))
@@ -317,7 +419,13 @@ func (tr *TreeReader) readOneFile(fe *FileEntry) {
 		}
 		return
 	}
-	AdviseSequential(f)
+	// A sequential-access hint pays for itself on a file with more than a
+	// couple of blocks to read ahead of; below tinyFileAdviseThreshold it's
+	// one syscall spent readying an access pattern that's already over by
+	// the time it could matter.
+	if fe.Size >= tinyFileAdviseThreshold {
+		AdviseSequential(f)
+	}
 
 	acquire := func(size uint32) ([]byte, func()) {
 		n := int64(size)

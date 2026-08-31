@@ -23,6 +23,12 @@ test-stress:
 	CGO_ENABLED=0 go build -trimpath -o "$$tmp_bin" .; \
 	BSYNC_BIN="$$tmp_bin" bash ./test_stress.sh
 
+# Transfer-level benchmarks (bench_test.go): real client+server in-process
+# over loopback. Run before and after any performance change and compare with
+# `benchstat old.txt new.txt`.
+bench:
+	go test -run '^$$' -bench . -benchmem -count 3
+
 test-remote:
 	@test -n "$(REMOTE)" || { echo "usage: make test-remote REMOTE=user@host"; exit 2; }
 	@tmp_bin=$$(mktemp /tmp/bsync-remote-bin.XXXXXX); \

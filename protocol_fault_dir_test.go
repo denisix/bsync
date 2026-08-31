@@ -129,14 +129,28 @@ func TestDirHandleConnRejectsUnannouncedFileOpen(t *testing.T) {
 	expectHandlerError(t, errCh, "acquire file 999")
 }
 
+// prewriteDestFile creates a PRE-EXISTING destination file at root/name of
+// the given size, so a later Acquire reports created=false and the
+// unsolicited-write guard applies in full -- a file Acquire creates fresh
+// is deliberately exempt from it (see takePendingOrFresh and the
+// fresh-file acceptance tests below).
+func prewriteDestFile(t *testing.T, root, name string, size int) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(root, name), make([]byte, size), 0644); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestDirHandleConnRejectsUnsolicitedZeroWrite(t *testing.T) {
 	st := newTestDirServerState(t, 1)
 	if err := st.ft.Announce(AnnounceRec{FileID: 1, Kind: KindFile, Path: "f.txt", FileSize: 4096}); err != nil {
 		t.Fatal(err)
 	}
+	prewriteDestFile(t, st.ft.root, "f.txt", 4096)
 	client, errCh := runDirHandleConn(t, st)
 
-	// Open the file, but send a zero-write WITHOUT a preceding OpBlockCheck.
+	// Open the (pre-existing) file, but send a zero-write WITHOUT a
+	// preceding OpBlockCheck.
 	writeDirMsg(t, client, &Msg{Op: uint8(OpFileOpen), FileID: 1, BlockSize: 4096})
 	if _, err := readDirMsg(client); err != nil {
 		t.Fatalf("read file-open ack: %v", err)
@@ -150,6 +164,7 @@ func TestDirHandleConnRejectsUnsolicitedDataWrite(t *testing.T) {
 	if err := st.ft.Announce(AnnounceRec{FileID: 1, Kind: KindFile, Path: "f.txt", FileSize: 4096}); err != nil {
 		t.Fatal(err)
 	}
+	prewriteDestFile(t, st.ft.root, "f.txt", 4096)
 	client, errCh := runDirHandleConn(t, st)
 	writeDirMsg(t, client, &Msg{Op: uint8(OpFileOpen), FileID: 1, BlockSize: 4096})
 	if _, err := readDirMsg(client); err != nil {
@@ -160,6 +175,95 @@ func TestDirHandleConnRejectsUnsolicitedDataWrite(t *testing.T) {
 	// fire.
 	writeDirMsg(t, client, &Msg{Op: uint8(OpBlockData), FileID: 1, BlockIdx: 0, BlockSize: 4096, FileSize: 4096, DataSize: 100})
 	expectHandlerError(t, errCh, "unsolicited")
+}
+
+// TestDirHandleConnAcceptsCheckLessWritesForCreatedFile is the fresh-file
+// fast path's server half: a file Acquire created fresh (empty at creation,
+// truncated straight to its announced size) accepts OpBlockData with NO
+// preceding OpBlockCheck -- the client deliberately skips that round trip
+// for created files (see processDirBlock) -- and the write lands correctly.
+// The rejection tests above pin the other half of the contract: the guard
+// stays fully intact for a pre-existing file.
+func TestDirHandleConnAcceptsCheckLessWritesForCreatedFile(t *testing.T) {
+	st := newTestDirServerState(t, 1)
+	if err := st.ft.Announce(AnnounceRec{FileID: 1, Kind: KindFile, Path: "f.txt", FileSize: 8, Mode: 0644}); err != nil {
+		t.Fatal(err)
+	}
+	client, errCh := runDirHandleConn(t, st)
+
+	writeDirMsg(t, client, &Msg{Op: uint8(OpFileOpen), FileID: 1, BlockSize: 4})
+	ack, err := readDirMsg(client)
+	if err != nil {
+		t.Fatalf("read file-open ack: %v", err)
+	}
+	if ack.Flags&FlagCreated == 0 {
+		t.Fatal("expected FlagCreated on the open ack for a nonexistent destination file")
+	}
+
+	// Block 1 straight away, no OpBlockCheck -- must be accepted and acked.
+	payload := []byte("WXYZ")
+	writeDirMsg(t, client, &Msg{Op: uint8(OpBlockData), FileID: 1, BlockIdx: 1, BlockSize: 4, FileSize: 8, DataSize: uint32(len(payload))})
+	if _, err := client.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+	wAck, err := readDirMsg(client)
+	if err != nil {
+		t.Fatalf("read write ack: %v", err)
+	}
+	if Op(wAck.Op) != OpAck || wAck.BlockIdx != 1 {
+		t.Fatalf("write ack = op %d idx %d, want OpAck idx 1", wAck.Op, wAck.BlockIdx)
+	}
+
+	// An out-of-bounds check-less write must STILL be rejected -- the
+	// created-fresh exemption bypasses only the pending-checksum guard,
+	// never the bounds validation.
+	writeDirMsg(t, client, &Msg{Op: uint8(OpBlockData), FileID: 1, BlockIdx: 9, BlockSize: 4, FileSize: 8, DataSize: 4})
+	expectHandlerError(t, errCh, "invalid data block")
+
+	// Block 0 was never written: created files are truncated to full size at
+	// Acquire, so it reads back as zeros -- exactly what the client's
+	// zero-block elision relies on.
+	got, err := os.ReadFile(filepath.Join(st.ft.root, "f.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := append(make([]byte, 4), payload...)
+	if !bytes.Equal(got, want) {
+		t.Fatalf("dest content = %q, want %q", got, want)
+	}
+}
+
+// TestDirHandleConnAcceptsCheckLessZeroWriteForCreatedFile mirrors the data
+// case above for OpBlockZero: the production client never sends a zero
+// write for a created file at all (the destination hole already reads as
+// zeros), but the server-side exemption is per-write-op, so the protocol
+// contract -- accepted for created, rejected for pre-existing -- is pinned
+// for both opcodes.
+func TestDirHandleConnAcceptsCheckLessZeroWriteForCreatedFile(t *testing.T) {
+	st := newTestDirServerState(t, 1)
+	if err := st.ft.Announce(AnnounceRec{FileID: 1, Kind: KindFile, Path: "f.txt", FileSize: 8, Mode: 0644}); err != nil {
+		t.Fatal(err)
+	}
+	client, errCh := runDirHandleConn(t, st)
+
+	writeDirMsg(t, client, &Msg{Op: uint8(OpFileOpen), FileID: 1, BlockSize: 4})
+	if _, err := readDirMsg(client); err != nil {
+		t.Fatalf("read file-open ack: %v", err)
+	}
+	writeDirMsg(t, client, &Msg{Op: uint8(OpBlockZero), FileID: 1, BlockIdx: 0, BlockSize: 4, FileSize: 8})
+	wAck, err := readDirMsg(client)
+	if err != nil {
+		t.Fatalf("read zero-write ack: %v", err)
+	}
+	if Op(wAck.Op) != OpAck || wAck.BlockIdx != 0 {
+		t.Fatalf("zero-write ack = op %d idx %d, want OpAck idx 0", wAck.Op, wAck.BlockIdx)
+	}
+	client.Close()
+	select {
+	case <-errCh:
+	case <-time.After(3 * time.Second):
+		t.Fatal("dirHandleConn did not return in time")
+	}
 }
 
 func TestDirHandleConnRejectsBlockWriteWithoutFileOpen(t *testing.T) {
@@ -295,6 +399,302 @@ func TestDirHandleConnAnnounceRejectsAbsolutePathOverTheWire(t *testing.T) {
 		t.Fatal(err)
 	}
 	expectHandlerError(t, errCh, "unsafe path")
+}
+
+// TestDirHandleConnSurvivesEnvironmentalAnnounceFailure is the regression
+// test for the production crash where one full-disk mkdir killed the
+// control connection and orphaned a multi-hour transfer: a batch carrying
+// one mkdir-doomed record (parent path occupied by a regular file --
+// ENOTDIR, same class as ENOSPC) and one good record must leave the
+// CONNECTION alive, register both entries, keep the good one fully
+// transferable, and complete OpAnnounceEnd/OpTreeDone normally; the
+// failure surfaces via FirstFinalizeErr, not a dead socket.
+func TestDirHandleConnSurvivesEnvironmentalAnnounceFailure(t *testing.T) {
+	st := newTestDirServerState(t, 1)
+	if err := os.WriteFile(filepath.Join(st.ft.root, "blocked"), []byte("x"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	client, errCh := runDirHandleConn(t, st)
+
+	trailer, err := encodeAnnounceBatch([]AnnounceRec{
+		{FileID: 1, Kind: KindFile, Path: "blocked/doomed.txt", FileSize: 4, Mode: 0644},
+		{FileID: 2, Kind: KindFile, Path: "good.txt", FileSize: 4, Mode: 0644},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeDirMsg(t, client, &Msg{Op: uint8(OpAnnounce), DataSize: uint32(len(trailer))})
+	if _, err := client.Write(trailer); err != nil {
+		t.Fatal(err)
+	}
+
+	// The connection must still be alive: transfer the good file on it.
+	writeDirMsg(t, client, &Msg{Op: uint8(OpFileOpen), FileID: 2, BlockSize: 4})
+	ack, err := readDirMsg(client)
+	if err != nil {
+		t.Fatalf("read file-open ack for the good file (connection died on the doomed record?): %v", err)
+	}
+	if Op(ack.Op) != OpFileAck {
+		t.Fatalf("file-open reply = op %d, want OpFileAck", ack.Op)
+	}
+	payload := []byte("GOOD")
+	writeDirMsg(t, client, &Msg{Op: uint8(OpBlockData), FileID: 2, BlockIdx: 0, BlockSize: 4, FileSize: 4, DataSize: 4})
+	if _, err := client.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+	if wAck, err := readDirMsg(client); err != nil || Op(wAck.Op) != OpAck {
+		t.Fatalf("write ack: %v (op %v)", err, wAck)
+	}
+	writeDirMsg(t, client, &Msg{Op: uint8(OpFileClose), FileID: 2})
+	writeDirMsg(t, client, &Msg{Op: uint8(OpFileDone), FileID: 2})
+	writeDirMsg(t, client, &Msg{Op: uint8(OpFileDone), FileID: 1}) // the doomed one: must be a harmless no-op
+	writeDirMsg(t, client, &Msg{Op: uint8(OpAnnounceEnd), BlockIdx: 2})
+	writeDirMsg(t, client, &Msg{Op: uint8(OpTreeDone), BlockIdx: 2})
+	treeAck, err := readDirMsg(client)
+	if err != nil {
+		t.Fatalf("read tree ack: %v", err)
+	}
+	if Op(treeAck.Op) != OpTreeAck {
+		t.Fatalf("tree reply = op %d, want OpTreeAck", treeAck.Op)
+	}
+	client.Close()
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Errorf("dirHandleConn returned an error: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("dirHandleConn did not return in time")
+	}
+
+	got, err := os.ReadFile(filepath.Join(st.ft.root, "good.txt"))
+	if err != nil || string(got) != "GOOD" {
+		t.Errorf("good.txt = %q, %v -- the healthy file must have synced normally", got, err)
+	}
+	if st.ft.FirstFinalizeErr() == nil {
+		t.Error("FirstFinalizeErr must surface the doomed record's mkdir failure")
+	}
+}
+
+// TestDirHandleConnDeleteRunsAtAnnounceEndBeforeAnyTransfer pins the
+// delete-BEFORE-transfer ordering on the wire: the stale destination file
+// is gone by the time OpAnnounceEndAck arrives -- i.e. before the client
+// has sent a single OpFileOpen -- and the ack's BlockIdx reports the
+// removal count.
+func TestDirHandleConnDeleteRunsAtAnnounceEndBeforeAnyTransfer(t *testing.T) {
+	st := newTestDirServerState(t, 1)
+	if err := os.WriteFile(filepath.Join(st.ft.root, "stale.txt"), []byte("old"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	client, errCh := runDirHandleConn(t, st)
+
+	trailer, err := encodeAnnounceBatch([]AnnounceRec{
+		{FileID: 1, Kind: KindFile, Path: "keep.txt", FileSize: 4, Mode: 0644},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeDirMsg(t, client, &Msg{Op: uint8(OpAnnounce), DataSize: uint32(len(trailer))})
+	if _, err := client.Write(trailer); err != nil {
+		t.Fatal(err)
+	}
+	writeDirMsg(t, client, &Msg{Op: uint8(OpAnnounceEnd), Flags: FlagDelete, BlockIdx: 1})
+	ack, err := readDirMsg(client)
+	if err != nil {
+		t.Fatalf("read announce-end ack: %v", err)
+	}
+	if Op(ack.Op) != OpAnnounceEndAck {
+		t.Fatalf("announce-end reply = op %d, want OpAnnounceEndAck", ack.Op)
+	}
+	if ack.BlockIdx != 1 {
+		t.Errorf("ack.BlockIdx = %d, want 1 (one removed entry)", ack.BlockIdx)
+	}
+	// The stale file is ALREADY gone -- no OpFileOpen has been sent yet.
+	if _, err := os.Stat(filepath.Join(st.ft.root, "stale.txt")); !os.IsNotExist(err) {
+		t.Errorf("stale.txt still exists at announce-end-ack time (stat err = %v)", err)
+	}
+	client.Close()
+	select {
+	case <-errCh:
+	case <-time.After(3 * time.Second):
+		t.Fatal("dirHandleConn did not return in time")
+	}
+}
+
+// TestDirHandleConnDeleteRefusedOnCountMismatch pins the delete pass's
+// safety gate: a claimed entry count that doesn't match what the server
+// actually announced (a truncated announce stream) must refuse the delete
+// -- every unheard entry's destination path would look extraneous -- and
+// leave the destination untouched.
+func TestDirHandleConnDeleteRefusedOnCountMismatch(t *testing.T) {
+	st := newTestDirServerState(t, 1)
+	if err := os.WriteFile(filepath.Join(st.ft.root, "stale.txt"), []byte("old"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	client, errCh := runDirHandleConn(t, st)
+
+	trailer, err := encodeAnnounceBatch([]AnnounceRec{
+		{FileID: 1, Kind: KindFile, Path: "keep.txt", FileSize: 4, Mode: 0644},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeDirMsg(t, client, &Msg{Op: uint8(OpAnnounce), DataSize: uint32(len(trailer))})
+	if _, err := client.Write(trailer); err != nil {
+		t.Fatal(err)
+	}
+	// Claim 5 entries; the server saw 1.
+	writeDirMsg(t, client, &Msg{Op: uint8(OpAnnounceEnd), Flags: FlagDelete, BlockIdx: 5})
+	drainDirError(t, client)
+	expectHandlerError(t, errCh, "delete pass refused")
+	if _, err := os.Stat(filepath.Join(st.ft.root, "stale.txt")); err != nil {
+		t.Errorf("stale.txt was touched despite the refused delete pass: %v", err)
+	}
+}
+
+func TestDirHandleConnAnnounceQuickCheckAck(t *testing.T) {
+	st := newTestDirServerState(t, 1)
+	client, errCh := runDirHandleConn(t, st)
+
+	// File 1 already matches on the destination -- expected in the ack's
+	// skip list. File 2 does not (wrong size) -- expected to be absent.
+	// File 3 is a directory -- quick-check never applies to it, and it must
+	// not appear in the skip list either (only KindFile entries can be
+	// skipped).
+	match := []byte("same content")
+	mtime := time.Unix(1700000000, 0)
+	if err := os.MkdirAll(filepath.Join(st.ft.root), 0777); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(st.ft.root, "match.txt"), match, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(filepath.Join(st.ft.root, "match.txt"), mtime, mtime); err != nil {
+		t.Fatal(err)
+	}
+
+	trailer, err := encodeAnnounceBatch([]AnnounceRec{
+		{FileID: 1, Kind: KindFile, Path: "match.txt", FileSize: uint64(len(match)), Mode: 0644, MTimeSec: mtime.Unix()},
+		{FileID: 2, Kind: KindFile, Path: "differ.txt", FileSize: 999, Mode: 0644, MTimeSec: mtime.Unix()},
+		{FileID: 3, Kind: KindDir, Path: "adir", Mode: 0755},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeDirMsg(t, client, &Msg{Op: uint8(OpAnnounce), Flags: FlagQuickCheck, DataSize: uint32(len(trailer))})
+	if _, err := client.Write(trailer); err != nil {
+		t.Fatal(err)
+	}
+
+	ack, err := readDirMsg(client)
+	if err != nil {
+		t.Fatalf("read ack: %v", err)
+	}
+	if Op(ack.Op) != OpAnnounceAck {
+		t.Fatalf("ack op = %d, want OpAnnounceAck", ack.Op)
+	}
+	ackTrailer := make([]byte, ack.DataSize)
+	if _, err := io.ReadFull(client, ackTrailer); err != nil {
+		t.Fatalf("read ack trailer: %v", err)
+	}
+	skipped, err := decodeSkipList(ackTrailer)
+	if err != nil {
+		t.Fatalf("decode skip list: %v", err)
+	}
+	if len(skipped) != 1 || skipped[0] != 1 {
+		t.Errorf("skip list = %v, want [1]", skipped)
+	}
+
+	// The connection must still be alive and usable afterward -- e.g. for
+	// OpAnnounceEnd/OpTreeDone -- rather than left desynced by the ack.
+	writeDirMsg(t, client, &Msg{Op: uint8(OpAnnounceEnd), BlockIdx: 3})
+	client.Close()
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Errorf("dirHandleConn returned an error on clean close: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("dirHandleConn did not return in time")
+	}
+}
+
+func TestDirHandleConnAnnounceQuickCheckAckEmptySkipList(t *testing.T) {
+	st := newTestDirServerState(t, 1)
+	client, errCh := runDirHandleConn(t, st)
+	trailer, err := encodeAnnounceBatch([]AnnounceRec{
+		{FileID: 1, Kind: KindFile, Path: "new.txt", FileSize: 10, Mode: 0644, MTimeSec: 1700000000},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeDirMsg(t, client, &Msg{Op: uint8(OpAnnounce), Flags: FlagQuickCheck, DataSize: uint32(len(trailer))})
+	if _, err := client.Write(trailer); err != nil {
+		t.Fatal(err)
+	}
+	ack, err := readDirMsg(client)
+	if err != nil {
+		t.Fatalf("read ack: %v", err)
+	}
+	if Op(ack.Op) != OpAnnounceAck {
+		t.Fatalf("ack op = %d, want OpAnnounceAck", ack.Op)
+	}
+	ackTrailer := make([]byte, ack.DataSize)
+	if _, err := io.ReadFull(client, ackTrailer); err != nil {
+		t.Fatalf("read ack trailer: %v", err)
+	}
+	skipped, err := decodeSkipList(ackTrailer)
+	if err != nil {
+		t.Fatalf("decode skip list: %v", err)
+	}
+	if len(skipped) != 0 {
+		t.Errorf("skip list = %v, want empty", skipped)
+	}
+	client.Close()
+	select {
+	case <-errCh:
+	case <-time.After(3 * time.Second):
+		t.Fatal("dirHandleConn did not return in time")
+	}
+}
+
+func TestDirHandleConnAnnounceWithoutQuickCheckSendsNoAck(t *testing.T) {
+	st := newTestDirServerState(t, 1)
+	client, errCh := runDirHandleConn(t, st)
+	// A KindDir entry, not KindFile: it is auto-finalized at announce time
+	// regardless of quick-check, so OpTreeDone below can complete
+	// immediately without a matching OpFileOpen/block exchange -- keeping
+	// this test purely about "did an ack sneak onto the wire", not about
+	// driving a full file transfer.
+	trailer, err := encodeAnnounceBatch([]AnnounceRec{
+		{FileID: 1, Kind: KindDir, Path: "adir", Mode: 0755},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeDirMsg(t, client, &Msg{Op: uint8(OpAnnounce), DataSize: uint32(len(trailer))})
+	if _, err := client.Write(trailer); err != nil {
+		t.Fatal(err)
+	}
+	// No reply should be forthcoming; OpAnnounceEnd must be the very next
+	// frame the server produces nothing for, and a subsequent read (via
+	// OpTreeDone below) must see exactly the expected ack, not a stray
+	// leftover OpAnnounceAck from this batch.
+	writeDirMsg(t, client, &Msg{Op: uint8(OpAnnounceEnd), BlockIdx: 1})
+	writeDirMsg(t, client, &Msg{Op: uint8(OpTreeDone), BlockIdx: 1})
+	ack, err := readDirMsg(client)
+	if err != nil {
+		t.Fatalf("read tree ack: %v", err)
+	}
+	if Op(ack.Op) != OpTreeAck {
+		t.Fatalf("first reply on the wire = op %d, want OpTreeAck (no stray OpAnnounceAck)", ack.Op)
+	}
+	client.Close()
+	select {
+	case <-errCh:
+	case <-time.After(3 * time.Second):
+		t.Fatal("dirHandleConn did not return in time")
+	}
 }
 
 func TestDirHandleConnFullExchangeWritesCorrectContent(t *testing.T) {

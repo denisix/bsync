@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bufio"
+	"errors"
 	"fmt"
 	"net"
 	"time"
@@ -29,15 +31,27 @@ const (
 // TCP buffer size, can be overridden by auto-tuning
 var tcpBufferSize int = 4 * 1024 * 1024 // Default 4MB
 
+// errPermanent marks a failure that retrying can never fix: a
+// deterministic peer-state rejection (e.g. the server refusing OpFileOpen
+// for a file it has already finalized or failed at announce time), as
+// opposed to a transient network fault. An attempt that wraps its error
+// with %w-errPermanent makes withRetry return it immediately instead of
+// burning maxRetries attempts plus backoff on an outcome that cannot
+// change -- which matters enormously when MANY entries are doomed at once
+// (a full destination disk failing thousands of files would otherwise cost
+// ~3s of retry churn EACH).
+var errPermanent = errors.New("permanent failure")
+
 // withRetry calls attempt up to maxRetries times total, with a linear
 // backoff (retry*1s) between attempts, and returns the last error (nil once
-// attempt succeeds). Before every attempt after the first, it calls onRetry
-// (if non-nil) with the retry number and the previous attempt's error, so a
-// caller can reset its own per-attempt state (closing/redialing a
-// connection, clearing a "currently bound to X" flag) before trying again —
-// exactly the shape both the legacy single-file client's block-transfer
-// retry loop and the directory-tree transfer worker's retry loop needed
-// independently, differing only in what that per-attempt state actually is.
+// attempt succeeds; immediately if it wraps errPermanent — see above).
+// Before every attempt after the first, it calls onRetry (if non-nil) with
+// the retry number and the previous attempt's error, so a caller can reset
+// its own per-attempt state (closing/redialing a connection, clearing a
+// "currently bound to X" flag) before trying again — exactly the shape both
+// the legacy single-file client's block-transfer retry loop and the
+// directory-tree transfer worker's retry loop needed independently,
+// differing only in what that per-attempt state actually is.
 func withRetry(attempt func(retry int) error, onRetry func(retry int, lastErr error)) error {
 	var lastErr error
 	for retry := 0; retry < maxRetries; retry++ {
@@ -49,6 +63,9 @@ func withRetry(attempt func(retry int) error, onRetry func(retry int, lastErr er
 		}
 		if lastErr = attempt(retry); lastErr == nil {
 			return nil
+		}
+		if errors.Is(lastErr, errPermanent) {
+			return lastErr
 		}
 	}
 	return lastErr
@@ -93,6 +110,7 @@ func connWrite(conn net.Conn, data []byte) error {
 type AutoReconnectTCP struct {
 	addr *net.TCPAddr
 	conn *net.TCPConn
+	br   *bufio.Reader // wraps conn; replaced on every (re)dial, see Read
 
 	// frameBroken records that the most recent Write wrote some bytes
 	// (n > 0) and then failed, so a redial happened mid-frame. It is purely
@@ -141,6 +159,7 @@ func (a *AutoReconnectTCP) connect() error {
 		return err
 	}
 	a.conn = c.(*net.TCPConn)
+	a.br = bufio.NewReaderSize(a.conn, connReadBufSize)
 	a.conn.SetKeepAlive(true)
 	a.conn.SetKeepAlivePeriod(keepAlivePeriod)
 	// Increase TCP buffers for better throughput on fast networks
@@ -180,20 +199,77 @@ func (a *AutoReconnectTCP) handleErr(err error) {
 	if a.conn != nil {
 		a.conn.Close()
 		a.conn = nil
+		a.br = nil
 	}
 }
 
+// connReadBufSize is the bufio.Reader size for a client connection. Replies
+// are tiny (header + digest + ack ≈ 112 bytes per block), so a small buffer
+// is enough; large payloads on the download path are read with io.ReadFull
+// straight through it and never copied twice for being bigger than this.
+const connReadBufSize = 4096
+
+// connWriteFrame sends one protocol frame -- a header followed by its
+// payload -- coalescing the two into a single write when the payload is
+// small. Header and payload were always two separate conn.Write calls, i.e.
+// two syscalls and, on the wire, often two segments; for the 16-byte digest
+// reply and for small-file blocks in directory mode that doubled the
+// per-frame cost for nothing. Above frameCoalesceMax the copy would cost
+// more than the syscall it saves, so large payloads keep the two writes.
+func connWriteFrame(conn net.Conn, hdr, payload []byte) error {
+	if len(payload) == 0 {
+		return connWrite(conn, hdr)
+	}
+	if len(payload) <= frameCoalesceMax {
+		buf := make([]byte, 0, len(hdr)+len(payload))
+		buf = append(buf, hdr...)
+		buf = append(buf, payload...)
+		return connWrite(conn, buf)
+	}
+	if err := connWrite(conn, hdr); err != nil {
+		return err
+	}
+	return connWrite(conn, payload)
+}
+
+const frameCoalesceMax = 64 * 1024
+
+// Read returns bytes from the connection through a per-connection
+// bufio.Reader: the protocol's replies are several small frames in a row (a
+// 48-byte header, a 16-byte digest, a 48-byte ack), and reading them through
+// bare conn.Read cost one syscall each. The buffer belongs to exactly one
+// physical connection and is dropped with it on any error (handleErr), so a
+// redial can never replay bytes from a dead connection -- and since every
+// exchange on a connection is strictly request/response, the buffer never
+// holds anything the caller is not about to read.
 func (a *AutoReconnectTCP) Read(b []byte) (int, error) {
 	if err := a.connect(); err != nil {
 		return 0, err
 	}
 	a.conn.SetReadDeadline(time.Now().Add(ioTimeout))
-	n, err := a.conn.Read(b)
+	n, err := a.br.Read(b)
 	if err != nil {
 		a.handleErr(err)
 		return 0, err
 	}
 	return n, nil
+}
+
+// AwaitClose waits up to d for the peer to close the connection (a read
+// that returns EOF), then closes this side. It is how the client lets the
+// server consume its final frame before tearing down, without a fixed
+// sleep: the server closes as soon as it has processed DONE, so this
+// normally returns almost immediately. Any other outcome -- a timeout, an
+// unexpected byte, an error -- is treated the same way; nothing depends on
+// it beyond bounding the wait.
+func (a *AutoReconnectTCP) AwaitClose(d time.Duration) {
+	if a.conn == nil {
+		return
+	}
+	a.conn.SetReadDeadline(time.Now().Add(d))
+	var scratch [1]byte
+	a.br.Read(scratch[:])
+	a.handleErr(nil)
 }
 
 func (a *AutoReconnectTCP) Write(b []byte) (int, error) {

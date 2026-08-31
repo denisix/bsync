@@ -2,41 +2,35 @@
 
 🚀 **Efficient block-level synchronization tool for large data transfer between servers**
 
-`bsync` transfers data between block devices or files block-by-block. In upload mode it compares destination checksums and transmits only changed blocks; in download mode it streams source blocks to the local destination. It is currently supported on Linux.
+`bsync` transfers data between block devices or files block-by-block. In upload mode it compares destination checksums and transmits only changed blocks; in download mode it streams source blocks to the local destination. Builds and runs on Linux and macOS; Windows is supported as a client for block-device/volume sources (see [WINDOWS.md](WINDOWS.md)).
 
 ## ✨ Features
 
-- **Smart Upload**: Upload mode only transfers blocks that differ (checksum-based)
-- **Zero Block Support**: Omits zero payloads on the network while correctly clearing stale destination data
-- **Compression**: Built-in zstd compression with configurable levels (fast/default/better/best)
-- **Encryption**: Optional ChaCha20-Poly1305 encryption for SSH-automated transfers
-- **SSH Integration**: Automatic remote server deployment via SSH
-- **Multi-worker Support**: Parallel processing with HDD-friendly sequential source reads and ordered destination writes
-- **Resume Capability**: Skip blocks to resume interrupted transfers
-- **Progress Visualization**: Win98 Defragmenter-style real-time grid display with ANSI-colored blocks for compressed (blue), non-compressed (orange), zero (grey), and skipped (green) transfers, plus speed and ETA on both sender and receiver
-- **Download Mode**: Transfer from server to client (reverse direction)
-- **IP Binding**: Bind server to specific network interface
-- **Connection Robustness**: TCP keep-alive, per-operation deadlines, acknowledged upload writes, and upload retry with reconnect
+- **Smart Upload**: only transfers blocks that differ (SHA-256, hardware-accelerated on ARMv8/x86)
+- **Zero Block Support**: omits zero payloads on the network while correctly clearing stale destination data
+- **Compression**: built-in zstd, configurable levels (fast/default/better/best)
+- **Encryption**: optional ChaCha20-Poly1305 for SSH-automated transfers
+- **SSH Integration**: automatic remote server deployment
+- **Directory-Tree Sync**: recursive push with exclude patterns, quick-check, `--delete`, symlinks, specials
+- **Multi-worker Support**: HDD-friendly sequential source reads and ordered destination writes
+- **Resume Capability**: skip blocks to resume interrupted transfers
+- **Progress Visualization**: Win98 Defragmenter-style real-time grid, speed and ETA on both ends
+- **Download Mode**: transfer from server to client (reverse direction)
+- **Connection Robustness**: keep-alive, per-operation deadlines, acknowledged + retried upload writes
 
 ## 🛠️ Installation
 
 ```bash
-make          # Linux binary
+make          # binary for the current OS/arch
 make windows  # Windows binary (bsync.exe)
+make release  # cross-compiled linux/{amd64,arm64}, windows/amd64, darwin/{amd64,arm64} into dist/
 ```
 
-Copy the `bsync` binary (Linux) or `bsync.exe` (Windows) to your source and destination servers. Both binaries must be built from the same source commit for protocol compatibility.
+Copy the resulting binary to source and destination. Both endpoints must be built from the same source commit — the binary protocol (`ver0.06`) is not forward/backward compatible.
 
 ## 📖 Usage
 
-### Basic Operation
-
-In normal upload mode:
-- **Server mode**: Receives data (destination)
-- **Client mode**: Sends data (source)
-
-With `-d`, the direction reverses: the server reads the source and the client
-writes the destination.
+Upload mode (default): server receives, client sends. `-d` reverses it: server reads the source, client writes the destination.
 
 ### Command Line Options
 
@@ -45,7 +39,7 @@ writes the destination.
 | `-a` | List drives where supported; on Linux prints `lsblk` guidance | false |
 | `-f` | File or device path (e.g., `/dev/vda`) | `/dev/zero` |
 | `-r` | Remote server address (`host:port`) | - |
-| `-b` | Block size in bytes (decimal integer) | 10485760 (10MB) |
+| `-b` | Block size in bytes | 10485760 (10MB) |
 | `-s` | Skip blocks (for resume) | 0 |
 | `-p` | Server port | 8080 |
 | `-i` | Bind to specific IP address | `0.0.0.0` |
@@ -57,286 +51,148 @@ writes the destination.
 | `-w` | Number of workers | 1 |
 | `-prefetch` | Prefetch queue depth; `0` selects `workers*4` | 0 |
 | `-auto` | Auto-tune parameters for direct client upload (`-r` only) | false |
-| `-q` | Quiet mode (no output) | false |
-| `-d` | Download mode: transfer from server to client | false |
-| `-P` | Suppress server-side progress output (set automatically via `-t`) | false |
-| `-R` | Force recursive directory-tree mode (auto-detected from `-f` when it's already a directory) | false |
-| `-exclude` | Comma-separated glob patterns to skip in directory mode, matched against each entry's relative path and base name (e.g. `-exclude "*.log,*tmp*"`) | - |
+| `-q` | Quiet mode | false |
+| `-d` | Download mode (server → client) | false |
+| `-v` | Win98-style visual progress grid | false |
+| `-R` | Force directory-tree mode (auto-detected when `-f` is a directory) | false |
+| `-exclude` | Comma-separated glob patterns, matched against relative path and base name | - |
+| `-quick-check` | Directory mode: skip a file (no read/hash) if size+mtime already match | **true** |
+| `-ignore-times` | Directory mode: never skip on size+mtime — compare every block (rsync `-I`) | false |
+| `-delete` | Directory mode: remove destination entries not in the source, before transfer (rsync `--delete-before`) | false |
+| `-links` | Directory mode: recreate source symlinks with identical targets (rsync `-l`) | false |
+| `-specials` | Directory mode: recreate FIFOs/sockets (rsync `--specials`); device nodes still skipped | false |
+| `-memlimit` | Soft memory limit in MB (`0` = off); safety valve, not a heap fix. Forwarded via `-t` | 0 |
 
-`-K` is an internal/manual input for a shared 32-byte hexadecimal key. Direct
-network encryption requires the same key on both endpoints; for normal use,
-prefer `-e` with SSH mode (`-t`).
+`-K`: internal/manual 32-byte hex key for direct network encryption; normally prefer `-e` with `-t`.
 
 ### Directory-Tree Mode
 
-Passing a directory to `-f` (or forcing it with `-R`) switches to recursive
-directory-tree sync: `bsync` walks the source tree and syncs every file and
-empty directory to the destination, upload/push only. `-exclude` patterns are
-shell globs (`*`, `?`, `[...]`) checked against both an entry's full relative
-path and its base name — `*` does not cross `/`, so `-exclude "node_modules"`
-prunes any directory named `node_modules` at any depth, and
-`-exclude "*.log,*tmp*"` skips every `.log` file and anything with `tmp`
-anywhere in its name.
+`-f` a directory (or force with `-R`) walks the source and syncs every file and empty directory, push only:
 
 ```bash
 ./bsync -f /data/src -t user@host:/data/dst -w 8 -exclude "*.log,node_modules,*tmp*"
 ```
 
+- **`-exclude`**: shell globs (`*`, `?`, `[...]`) checked against both relative path and base name; `*` never crosses `/`, so `node_modules` prunes any dir by that name at any depth.
+- **Quick check** (default): skips a file entirely — no open/read/hash, no round trip — when destination size and mtime (whole seconds) already match. A stale permission is still corrected. Measured: 3 000 unchanged files over loopback, 2.17s → 0.07s; over a simulated 20ms link, 500 files, 23.4s → 0.21s. Trusts size+mtime like rsync's default; `-ignore-times` compares every block instead.
+- **`-delete`** (rsync `--delete-before`): once the whole tree is announced — before any content transfers — sweeps the destination for anything not in the source and removes it (files and directories). Refuses to run if the announced count doesn't match the client's claim, so a truncated stream can't trigger deletion. Excluded paths and un-synced types (symlinks without `-links`, specials without `-specials`, device nodes always) are protected, contents included. Every removal is logged; transfer waits for the walk to finish only when `-delete` is set.
+- **`-links`** (rsync `-l`): recreates symlinks with identical targets (relative stays relative, dangling stays dangling); retargets a wrong link, replaces a regular file, refuses over a directory. The reverse — source replaces a link with real content — always removes the stale destination link rather than writing through it, with or without `-links`. Without `-links`, symlinks are skipped and protected from `-delete`.
+- **`-specials`** (rsync `--specials`): recreates FIFOs/sockets via `mkfifo`/`mknod` at announce time (no block traffic, no root needed); leaves a correct-type node alone, replaces a wrong-type one. Device nodes are never synced.
+- **Path safety**: traversal, absolute/UNC/drive-prefixed paths, NUL bytes, backslashes are always refused. Windows-only-invalid names (reserved device names, trailing dot/space) are refused only when the **destination** is Windows — an ordinary Linux file like `example.net.` fails cleanly for that one entry rather than being silently dropped.
+- **Skip logging**: a bounded tail per distinct reason, then one aggregated line (`skipped 4213 path(s): 4198 unsupported file type, 15 excluded`).
+
 ## 🔄 Examples
 
-### 1. Local Network Transfer
-
-**Destination server:**
 ```bash
+# Local network transfer (start destination, then source)
 ./bsync -f /dev/shm/test-dst -p 8080
-```
-
-**Source server:**
-```bash
 ./bsync -b 209715200 -f /dev/shm/test-src -r 192.168.1.100:8080
-```
 
-### 2. SSH-Automated Transfer
-
-**Single command (automatically starts remote server):**
-```bash
+# SSH-automated (starts the remote server for you)
 ./bsync -b 209715200 -f /dev/shm/test-src -t user@remote-server:/dev/shm/test-dst
-```
 
-### 3. Encrypted Transfer
-
-**Secure transfer with auto-generated encryption key:**
-```bash
+# Encrypted (SSH mode only -- key generated and shared automatically)
 ./bsync -e -f /dev/shm/test-src -t user@remote-server:/dev/shm/test-dst
-```
 
-The `-e` flag enables ChaCha20-Poly1305 encryption in `-t` SSH mode. A 32-byte key is auto-generated and passed to the remote server through SSH. Direct `-r`/`-p` mode does not auto-negotiate a key and rejects `-e` without an explicitly shared internal key.
-
-### 4. High-Performance Transfer
-
-**Multi-worker (4 workers) transfer with custom block size:**
-```bash
+# Multi-worker, large blocks
 ./bsync -b 524288000 -w 4 -f /dev/sda -r remote-server:8080
-```
 
-### 5. Compression Levels
-
-**Fast compression for CPU-limited systems:**
-```bash
+# Compression level
 ./bsync -L fast -f /dev/shm/test-src -t user@remote-server:/dev/shm/test-dst
-```
 
-The `-L` flag controls compression level:
-- `fast`: Fastest compression, larger output (~25x faster, ~10% larger)
-- `default`: Balanced speed and ratio
-- `better`: Better compression ratio, slower
-- `best`: Best compression ratio, slowest (~2-5x slower, ~10-15% smaller)
-
-### 6. Resume Interrupted Transfer
-
-**Skip first 10 blocks to resume:**
-```bash
+# Resume: skip the first 10 blocks (only if already correct at the destination)
 ./bsync -f /dev/sda -r remote-server:8080 -s 10
-```
 
-`-s N` does not verify or transfer skipped blocks. Use it only when all blocks
-before `N` are already correct at the destination.
-
-### 7. Quiet Mode for Scripts
-
-```bash
+# Quiet (scripts) / local sync without compression
 ./bsync -f /dev/sda -r remote-server:8080 -q
-```
-
-### 8. Local File Sync
-
-```bash
 ./bsync -n -f /tmp/src.img -t /tmp/dst.img
-```
 
-### 9. Download Mode (Server → Client)
-
-**Source server:**
-```bash
+# Download mode (-d: server reads source, client writes destination)
 ./bsync -f /dev/shm/test-src -p 8080 -d
-```
-
-**Client (download mode):**
-```bash
 ./bsync -f /dev/shm/test-dst -r 192.168.1.100:8080 -d
-```
+./bsync -f /dev/shm/test-dst -t user@remote-server:/dev/shm/test-src -d   # SSH-automated
 
-**SSH-Automated Download:**
-```bash
-./bsync -f /dev/shm/test-dst -t user@remote-server:/dev/shm/test-src -d
-```
-
-In download mode, the server/source block size is authoritative. The
-destination client adopts it from transfer metadata.
-
-### 10. Bind to Specific IP
-
-**Use specific network interface:**
-```bash
+# Bind to a specific interface
 ./bsync -f /dev/shm/test-dst -p 8080 -i 192.168.1.50
-```
 
-### 11. Combined Options
-
-**Encrypted, fast compression, multi-worker:**
-```bash
+# Combined: encrypted, fast compression, multi-worker
 ./bsync -e -L fast -w 4 -f /dev/sda -t user@remote:/backup/disk.img
 ```
 
+- `-e` needs SSH mode (`-t`) to auto-share the key; direct `-r`/`-p` rejects `-e` without an explicit `-K`.
+- `-L`: `fast` ~25x faster/~10% larger, `better` ~2x slower/~10% smaller, `best` ~4x slower/~10-15% smaller than `default`. zstd window derives from `-b`, capped at 4 MiB.
+- `-s N` skips verifying/transferring blocks before `N` — use only when they're already correct at the destination.
+- In download mode the source's block size is authoritative; the client adopts it from transfer metadata.
+
 ## 🕳️ Sparse File Support
 
-`bsync` detects zero blocks and does not transfer their payload bytes over the network. For correctness, zero blocks overwrite stale non-zero destination ranges when needed. A new or expanded regular-file upload destination can remain sparse where zero blocks required no overwrite.
+Zero blocks are detected and their payload is never sent; a stale non-zero destination range is still cleared correctly. A new or expanded regular-file upload destination stays sparse where a zero block required no overwrite.
 
 ```bash
-# Create sparse file
 truncate -s 100G /tmp/sparse.img
-
-# Transfer - zero block payloads are omitted
 ./bsync -f /tmp/sparse.img -t user@remote:/backup/sparse.img
 ```
 
 ## Transfer Safety and Compatibility
 
-- A changed upload block completes only after the destination confirms its write; destination write failures cause a nonzero exit.
-- Download writes clear zero ranges in existing destinations instead of leaving stale data behind.
+- A changed upload block completes only after the destination confirms its write; a destination write failure is a nonzero exit.
+- Download writes clear zero ranges in existing destinations instead of leaving stale data.
 - Empty source files are supported and truncate a regular-file destination to zero bytes.
-- The current wire protocol is `ver0.02`; use matching newly built binaries on both endpoints because older `ver0.01` binaries are incompatible.
+- Wire protocol is `ver0.06`; both endpoints need matching newly built binaries.
 
 ## 🔍 Verification
 
-Verify successful transfer:
 ```bash
-md5sum /dev/shm/test-src /dev/shm/test-dst
+md5sum /dev/shm/test-src /dev/shm/test-dst   # manual check
+
+make test          # full suite + edge-case matrix
+make test-fault     # protocol-failure, CLI-validation, sysfs-simulation, vector-I/O tests
+make test-stress    # race detector + concurrent local -t stress matrix
+make bench           # transfer-level benchmarks (real client/server, loopback); compare with benchstat
+make test-remote REMOTE=user@host   # live SSH transfer test, needs non-interactive SSH auth
 ```
 
-Run comprehensive tests:
-```bash
-make test
-```
+`test-remote` drives a broad `-t` upload/download matrix: workers 1/2/4/8, block sizes 4KB/64KB/1MB, data patterns (zero, solid, random+zero-interleaved, non-block-aligned), and compression modes (default/off/fast/best, each with and without encryption). Every case pre-fills the destination with stale data first and verifies by checksum (upload) or byte comparison (download).
 
-Run deterministic protocol-failure, CLI-validation, sysfs-simulation, and
-strict vector-I/O tests:
-```bash
-make test-fault
-```
+## 📊 Performance
 
-Run the opt-in race detector and concurrent local `-t` stress transfer matrix:
-```bash
-make test-stress
-```
+### Block Size
 
-Run the opt-in live SSH transfer test against an accessible temporary-file
-host:
-```bash
-make test-remote REMOTE=cloud@IP
-```
+| Network | Block Size | Why |
+|---|---|---|
+| 1 Gbps | 100-200 MB | balances throughput and memory |
+| 10 Gbps+ | 500 MB-1 GB | maximizes throughput |
+| 100 Mbps | 10-50 MB | finer progress granularity |
 
-The remote test requires non-interactive SSH authentication. It uses a unique
-directory under `/tmp` on the remote host and drives a broad `-t` upload and
-download matrix:
+### Workers (`-w`)
 
-- **Worker counts** `1`, `2`, `4`, and `8`.
-- **Block sizes** spanning small (4 KB), medium (64 KB), and large (1 MB).
-- **Data patterns**: all-zero (fully sparse), all-`0xFF` (fully solid),
-  random with interleaved zero blocks, and non-block-aligned files with a
-  partial trailing block.
-- **Modes**: default, disabled (`-n`), explicit-level (`-L fast`/`-L best`),
-  and encrypted (`-e`, `-e -n`) compression.
+- HDD source: `1` (default) — sequential reads avoid head thrashing
+- HDD destination: higher is safe — writes are reordered into a near-sequential stream
+- SSD/NVMe: `4`-`8` — parallel I/O helps
+- Multiple devices: match worker count to device count
 
-Every matrix case pre-fills the destination with non-zero data first, so each
-transfer also proves stale-data overwrite and zero-range clearing. It
-additionally covers quoted/punctuated remote paths, `-s` resume behavior,
-empty-file truncation in both directions, concurrent multi-worker traffic, and
-remote executable cleanup. Correctness is verified on **every** case by
-comparing source and destination checksums on the server for uploads and
-byte-for-byte comparisons for downloads, before removing the temporary
-artifacts it creates.
+### Compression (`-L`)
 
-## 📊 Performance Tips
+| Level | Speed | Size | Best for |
+|---|---|---|---|
+| `fast` | ~25x faster | ~10% larger | fast networks, CPU-limited |
+| `default` | 1x | 1x | general use |
+| `better` | ~2x slower | ~10% smaller | slow networks |
+| `best` | ~4x slower | ~10-15% smaller | very slow networks |
 
-### Block Size Selection
+### What's optimized internally
 
-| Network Speed | Recommended Block Size | Reason |
-|--------------|----------------------|---------|
-| 1 Gbps | 100-200 MB | Balances throughput and memory overhead |
-| 10 Gbps+ | 500-1000 MB | Maximizes throughput with sufficient bandwidth |
-| 100 Mbps | 10-50 MB | Smaller blocks for better progress granularity |
-
-### Worker Count
-
-- **HDD source**: Use `-w 1` (default) - the sequential reader avoids head thrashing when reading the source
-- **HDD destination**: Higher worker counts are safe - concurrent writes are serialized into a near-sequential stream by the ordered writer, so the destination disk does not seek-thrash
-- **SSD/NVMe**: Use `-w 4` to `-w 8` - parallel I/O beneficial
-- **Multiple Devices**: Worker count should match device count for optimal throughput
-
-### Compression Levels
-
-| Level | Speed vs Default | Size vs Default | Best For |
-|-------|------------------|-----------------|----------|
-| `fast` | ~25x faster | ~10% larger | High-speed networks, CPU-limited systems |
-| `default` | 1x | 1x | General use, balanced performance |
-| `better` | ~2x slower | ~10% smaller | Slow networks, bandwidth-sensitive |
-| `best` | ~4x slower | ~15% smaller | Very slow networks, minimum transfer |
-
-### Other Tips
-
-- **Encryption**: use `-e` with `-t` so the generated key is supplied to both endpoints
-- **SSH mode**: Use `-t` for automatic remote server management and secure key exchange
-- **Bind IP**: Use `-i` to select specific network interface on multi-homed servers
-- **Quiet mode**: Use `-q` when scripting to suppress progress output
-- **Resume capability**: Use `-s N` to skip N blocks and resume interrupted transfers
-
-## ⚡ Performance Optimizations
-
-`bsync` uses the following optimizations in its active transfer path:
-
-### Memory Optimizations
-
-- **Memory Locking**: Reader pool buffers attempt `mlock()` on Linux; transfer continues if locking is unavailable
-- **Huge Pages**: Large reader pool buffers request `MADV_HUGEPAGE` on Linux
-- **Buffer Pools**: Reusable buffer pools minimize allocation overhead and GC pressure
-
-### I/O Optimizations
-
-- **Sequential Advice**: Uses Linux sequential-access advice for opened transfer files
-- **Sequential Reader**: Reads source blocks in order, directly into the buffer that is handed downstream (no extra per-block copy), and prefetches into a bounded queue
-- **Read-Ahead Tuning**: Best-effort raises the kernel read-ahead window to 4MB for block-device endpoints; silently skipped on regular files or without root
-- **Cache Hygiene**: Advises the kernel to drop already-read source pages (`POSIX_FADV_DONTNEED`) so large transfers don't evict useful read-ahead pages
-
-### HDD-Friendly Design
-
-- **Prefetch Window**: Configurable prefetch depth allows overlapping I/O and computation
-- **Ordered Writes**: Destination writes from all concurrent connection handlers are serialized through a single writer into a near-sequential, offset-ordered stream, so a spinning destination disk avoids seek thrashing under `-w > 1` (per-block write acknowledgement is preserved)
-- **Steady Writeback**: Periodic `sync_file_range` writeback keeps dirty pages flushing smoothly instead of in large bursts
-
-### Network Optimizations
-
-- **TCP Buffer Tuning**: Client connections request large send/receive buffers
-- **Keep-Alive**: 30-second TCP keep-alive to detect stale connections early
-- **Acknowledged Upload Writes**: A changed uploaded block succeeds only after destination write confirmation
-- **Upload Retry**: Upload retries changed blocks after connection failure (up to 3 attempts per block)
-- **Per-Operation Deadlines**: 5-minute I/O timeout prevents indefinite hangs
-
-### Sparse File Handling
-
-- **Zero Block Detection**: Zero payload bytes are omitted from the network
-- **Destination Correctness**: Existing non-zero ranges are cleared when the source block is zero
-
-### Concurrency Safety
-
-- **Race Detection**: Full test suite passes with `-race` flag enabled
+- **Memory**: exact-size buffer pools (no over-allocation for small files); single-concurrency zstd encoders — parallelism comes from `-w`, not per-encoder; directory mode keeps only in-flight files in memory; `-delete`'s deferred file list spills to disk; `-memlimit`/`GOMEMLIMIT` as a soft GC ceiling
+- **I/O**: sequential-access advice and read-ahead tuning on transfer files, skipped under 1MB in directory mode; page cache dropped after each read so a large transfer doesn't evict useful read-ahead; a single sequential reader drives both hashing and sending, never a redundant second pass; directory-mode `mkdir` is checked once per directory, not once per file
+- **HDD**: configurable prefetch depth; all destination writes reordered into a near-sequential offset-ordered stream regardless of `-w`; steady `sync_file_range` writeback instead of bursty flushes
+- **Network**: large TCP buffers, keep-alive, per-operation deadlines; acknowledged + retried upload writes (3 attempts); buffered per-connection reads and coalesced small frames cut syscalls per block; a block ready to reuse is handed to the write/network path directly instead of through an extra copy
+- **Compression**: payloads under 512 bytes skip zstd entirely — frame overhead alone would exceed any savings
+- **Sparse files**: zero blocks never cross the network; stale non-zero destination ranges are still cleared correctly
+- **Concurrency**: full test suite passes under `-race`
 
 ## 🖥️ Progress Visualization
 
-`bsync` features a real-time terminal progress display inspired by the classic
-Windows 98 Disk Defragmenter. Each block of the transfer is rendered as a
-colored square in a grid, giving you an at-a-glance view of the transfer state
-and data pattern.
+`-v` renders a real-time Win98 Defragmenter-style grid: each block is a colored square.
 
 ```ansi
 Legend: □ Pending □ Processing ■ Zero ■ Compressed ■ Raw ■ Skipped
@@ -348,34 +204,29 @@ Legend: □ Pending □ Processing ■ Zero ■ Compressed ■ Raw ■ Skipped
 Progress:  37.2% block 3047/8192 89.20 MB/s ETA: 4m12s Each cell: 7 blocks
 ```
 
-### Color Legend
+| Color | Meaning |
+|-------|---------|
+| Dim `□` | Not yet transferred |
+| Grey `■` | Zero block — payload omitted |
+| Blue `■` | Transferred with compression |
+| Orange `■` | Transferred without compression |
+| Green `■` | Skipped — already equal at destination |
 
-| Display | Color  | Meaning |
-|---------|--------|---------|
-| `□` | Dim    | Not yet transferred |
-| `■` | Grey   | Zero block — payload omitted from network |
-| `■` | Blue   | Transferred with compression |
-| `■` | Orange | Transferred without compression |
-| `■` | Green  | Skipped — blocks already equal at destination |
-
-The ANSI escape sequences render in any terminal that supports ECMA-48 / ISO-6429
-color codes. The `ansi` fenced code block also renders on GitHub and other
-platforms with ANSI-aware Markdown renderers.
+See [VISUAL.md](VISUAL.md) for the design (grid aggregation, resize handling, render architecture).
 
 ## 🔧 Technical Details
 
-- **Checksum**: FNV-128a hash for block comparison
-- **Compression**: Zstandard (zstd) with configurable levels
-- **Encryption**: ChaCha20-Poly1305 AEAD cipher
-- **Protocol**: Custom binary protocol over TCP (`ver0.02`; use matching binaries at both endpoints)
-- **Concurrency**: Parallel upload checksum computation and compression
-- **Reliability**: TCP keep-alive (30s), 5-minute I/O deadlines, acknowledged upload writes, and upload retry with reconnect (up to 3 attempts per block)
+- **Checksum**: SHA-256 (truncated to 16 bytes), hardware-accelerated on ARMv8/x86
+- **Compression**: Zstandard (zstd), configurable levels
+- **Encryption**: ChaCha20-Poly1305 AEAD
+- **Protocol**: custom binary over TCP (`ver0.06`; matching binaries required at both endpoints)
+- **Reliability**: TCP keep-alive (30s), 5-minute I/O deadlines, acknowledged + retried (3x) upload writes
 
 ## 🚨 Requirements
 
-- Go 1.25+ (as declared by `go.mod`)
-- Network connectivity between servers
-- SSH access (if using `-t` option)
+- Go 1.25+ to build from source
+- Linux or macOS to run either endpoint; Windows can act as a client for block-device/volume sources (see [WINDOWS.md](WINDOWS.md))
+- Network connectivity between servers; SSH access if using `-t`
 - Read/write permissions on source/destination files
 
 ## 📝 License

@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 )
 
@@ -202,5 +203,85 @@ func TestSyncSessionAddFileConcurrentWithReads(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+// TestSyncSessionReleaseIsIdempotent: releasing an already-released or
+// never-registered id is a harmless no-op, not an error or a panic.
+func TestSyncSessionReleaseIsIdempotent(t *testing.T) {
+	s := NewSyncSession()
+	fe := &FileEntry{ID: 0, RelPath: "a.txt", Kind: KindFile}
+	s.AddFile(fe)
+
+	s.Release(0)
+	if got := s.FileByID(0); got != nil {
+		t.Errorf("FileByID(0) = %+v after Release, want nil", got)
+	}
+	if got := s.LiveCount(); got != 0 {
+		t.Errorf("LiveCount() = %d after releasing the only entry, want 0", got)
+	}
+
+	// Releasing again, and releasing an id that was never added: neither
+	// must panic or otherwise misbehave.
+	s.Release(0)
+	s.Release(999)
+	if got := s.LiveCount(); got != 0 {
+		t.Errorf("LiveCount() = %d after redundant releases, want 0", got)
+	}
+}
+
+// TestSyncSessionClaimDoneIsExactlyOnce is the direct proof of the
+// exactly-one-completion guarantee claimDone replaces sync.Once with: of
+// many concurrent racers claiming the same id, exactly one must see
+// ok==true, matching the invariant sendFileDone/markFileSkippedDone rely on
+// to send OpFileDone (or credit bytesScanned) exactly once per file.
+func TestSyncSessionClaimDoneIsExactlyOnce(t *testing.T) {
+	s := NewSyncSession()
+	fe := &FileEntry{ID: 0, RelPath: "a.txt", Kind: KindFile, Size: 42}
+	s.AddFile(fe)
+
+	const racers = 100
+	var wins atomic.Int32
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for i := 0; i < racers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			if _, ok := s.claimDone(0); ok {
+				wins.Add(1)
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	if wins.Load() != 1 {
+		t.Errorf("claimDone: %d of %d racers won, want exactly 1", wins.Load(), racers)
+	}
+	if got := s.LiveCount(); got != 0 {
+		t.Errorf("LiveCount() = %d after claimDone, want 0", got)
+	}
+}
+
+// TestSyncSessionClaimDoneReturnsTheEntry: the winner gets the FileEntry
+// back directly (used by markFileSkippedDone to credit bytesScanned without
+// a second lookup).
+func TestSyncSessionClaimDoneReturnsTheEntry(t *testing.T) {
+	s := NewSyncSession()
+	fe := &FileEntry{ID: 0, RelPath: "a.txt", Kind: KindFile, Size: 42}
+	s.AddFile(fe)
+
+	got, ok := s.claimDone(0)
+	if !ok {
+		t.Fatal("claimDone on a live entry returned ok=false")
+	}
+	if got != fe {
+		t.Errorf("claimDone returned %+v, want the original entry %+v", got, fe)
+	}
+
+	if _, ok := s.claimDone(0); ok {
+		t.Error("second claimDone on the same id returned ok=true, want false")
 	}
 }
