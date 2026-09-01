@@ -27,6 +27,15 @@ import (
 type liveFile struct {
 	fe        *FileEntry
 	remaining int64 // atomic; blocks left before OpFileDone
+	// changed latches true the first time any of this file's blocks is
+	// reported changed (actually differed and was sent). Read once, at
+	// completion, to decide whether the file counts toward
+	// SyncSession.filesChanged -- a quick-check-skipped file never sets
+	// it (it never reaches recordBlockDone at all), and a file every one
+	// of whose blocks matched the destination leaves it false too, so the
+	// counter answers "how many files actually needed new content", not
+	// "how many files were scanned".
+	changed atomic.Bool
 }
 
 // SyncSession tracks progress and per-file failure state for one
@@ -96,6 +105,7 @@ type SyncSession struct {
 
 	filesDone    atomic.Uint32
 	filesSkipped atomic.Uint32
+	filesChanged atomic.Uint32
 
 	failed sync.Map // FileID (uint32) -> error
 }
@@ -308,6 +318,15 @@ func (s *SyncSession) MarkFileSkipped() {
 	s.filesSkipped.Add(1)
 }
 
+// FilesChanged returns how many KindFile entries actually had at least one
+// block differ and transfer -- as opposed to TotalFilesKnown, which counts
+// every regular file scanned regardless of whether its content changed.
+// A quick-check-skipped file, and a file whose every block matched the
+// destination via the checksum exchange, are both counted as unchanged.
+func (s *SyncSession) FilesChanged() uint32 {
+	return s.filesChanged.Load()
+}
+
 // --- client-side directory transfer (Phase 4: on-demand hashing only) ---
 
 // announceBatchSize caps how many AnnounceRec accumulate before a batch is
@@ -518,7 +537,7 @@ func runAnnounceBatcherQuickCheck(ctrl *ctrlConn, rawConn io.Reader, dt *dirTran
 		if _, err := io.ReadFull(rawConn, ackTrailer); err != nil {
 			return fmt.Errorf("read announce ack trailer: %w", err)
 		}
-		skipped, err := decodeSkipList(ackTrailer)
+		skipped, failedAtAnnounce, err := decodeAnnounceAck(ackTrailer)
 		if err != nil {
 			return fmt.Errorf("decode announce ack: %w", err)
 		}
@@ -526,9 +545,20 @@ func runAnnounceBatcherQuickCheck(ctrl *ctrlConn, rawConn io.Reader, dt *dirTran
 		for _, id := range skipped {
 			skipSet[id] = struct{}{}
 		}
+		failedSet := make(map[uint32]struct{}, len(failedAtAnnounce))
+		for _, id := range failedAtAnnounce {
+			failedSet[id] = struct{}{}
+		}
 		for _, rec := range batch {
 			if _, isSkipped := skipSet[rec.FileID]; isSkipped {
 				dt.markFileSkippedDone(rec.FileID) // already releases via claimDone
+				continue
+			}
+			if _, isFailed := failedSet[rec.FileID]; isFailed {
+				// The destination could not create this entry at all.
+				// Resolve it here instead of letting a worker discover it
+				// via a rejected (and connection-killing) OpFileOpen.
+				dt.markFileFailedAtAnnounce(rec.FileID) // releases via claimDone
 				continue
 			}
 			fe := dt.sess.FileByID(rec.FileID)
@@ -569,6 +599,13 @@ type dirTransferState struct {
 	ctrl       *ctrlConn
 	magicBytes [magicLen]byte
 	noCompress bool
+	// rejects bounds the per-file "server rejected file-open" logging the
+	// same way skipLogger bounds the walk's: one systemic destination
+	// problem (an uncreatable parent directory) cascades to every file
+	// under it, and at -w 512 that is a line per file from 512 goroutines
+	// at once, burying the one server-side line that says why. Nil in the
+	// unit tests that construct a bare state; rejectLogger handles that.
+	rejects *skipLogger
 	// The per-file remaining-block counter and the exactly-one-completion
 	// guard that used to live here as two separate, never-pruned sync.Maps
 	// (remaining, doneOnce) now live on SyncSession's live table itself
@@ -578,16 +615,50 @@ type dirTransferState struct {
 	// the run.
 }
 
+// logReject records one server-side file-open rejection, bounded per
+// distinct reason (see skipLogger). Safe on a state with no logger.
+func (dt *dirTransferState) logReject(fileID uint32, reason string) {
+	if dt.rejects == nil {
+		Log("file %d: %s\n", fileID, reason)
+		return
+	}
+	dt.rejects.log(fmt.Sprintf("file %d", fileID), reason)
+}
+
+// dirErrorMaxText mirrors the server's own cap on OpError payload length
+// (see sendDirErrorFlags), so a corrupt or hostile DataSize cannot drive a
+// large allocation here.
+const dirErrorMaxText = 4096
+
+// readDirErrorText consumes an OpError frame's text payload and returns it.
+// Best-effort by design: the payload is already in the receive buffer when
+// the header arrives, but the server closes its side right after a
+// permanent rejection, so a short read is normal and yields "" rather than
+// an error -- the caller's rejection handling must not depend on it.
+func readDirErrorText(r io.Reader, size uint32) string {
+	if size == 0 || size > dirErrorMaxText {
+		return ""
+	}
+	buf := make([]byte, size)
+	if _, err := io.ReadFull(r, buf); err != nil {
+		return ""
+	}
+	return string(buf)
+}
+
 // sendFileDone marks fileID done in the session and sends OpFileDone,
 // exactly once, regardless of which caller (a block reaching zero
 // remaining, or forceFileDone below) triggers it. claimDone is the guard:
 // of any number of racing callers, exactly one sees ok==true and gets to
 // finalize.
-func (dt *dirTransferState) sendFileDone(fileID uint32) {
+func (dt *dirTransferState) sendFileDone(fileID uint32, changed bool) {
 	if _, ok := dt.sess.claimDone(fileID); !ok {
 		return
 	}
 	dt.sess.MarkFileDone()
+	if changed {
+		dt.sess.filesChanged.Add(1)
+	}
 	if err := dt.ctrl.send(&Msg{Op: uint8(OpFileDone), FileID: fileID}, nil); err != nil {
 		Log("file %d: failed to send file-done: %v\n", fileID, err)
 	}
@@ -604,6 +675,41 @@ func (dt *dirTransferState) sendFileDone(fileID uint32) {
 // size to bytesScanned so the progress line's scanned/total ratio still
 // reaches 100% for a skipped file exactly as if its blocks had actually
 // been read.
+// markFileFailedAtAnnounce records a file the destination reported as
+// failed during announce (its OpAnnounceAck failed-list) and resolves it
+// locally: no OpFileOpen, no blocks, no OpFileDone. The destination already
+// finalized the entry for itself at announce time, exactly as it does for a
+// quick-check skip -- the only difference is that this one is a FAILURE, so
+// it is also recorded via failFile and surfaces in FailedCount/FailedError.
+//
+// Discovering these here rather than through a rejected OpFileOpen is what
+// keeps a systemic destination problem cheap: the server kills the
+// connection after a permanent rejection, so the open-rejection path costs
+// a redial and (pipelined engine) a re-send of that worker's whole
+// in-flight window PER FILE. One uncreatable parent directory cascading to
+// thousands of children turned that into thousands of redials.
+func (dt *dirTransferState) markFileFailedAtAnnounce(fileID uint32) {
+	fe, ok := dt.sess.claimDone(fileID)
+	if !ok {
+		return
+	}
+	if fe.Kind != KindFile {
+		// A directory/symlink/special whose own creation failed. It is
+		// reported by the destination the same way, but it is not a FILE:
+		// counting it in FailedCount would inflate the count past the
+		// file total the progress line and summary are denominated in
+		// (files-only, see totalFilesKnown), and there is no content to
+		// have lost. The cascade it causes IS counted, one entry per
+		// affected file.
+		dt.logReject(fileID, announceFailedReason)
+		return
+	}
+	dt.sess.failFile(fileID, fmt.Errorf("%s", announceFailedReason))
+	dt.logReject(fileID, announceFailedReason)
+	dt.sess.MarkFileDone()
+	dt.sess.bytesScanned.Add(fe.Size)
+}
+
 func (dt *dirTransferState) markFileSkippedDone(fileID uint32) {
 	fe, ok := dt.sess.claimDone(fileID)
 	if !ok {
@@ -620,13 +726,16 @@ func (dt *dirTransferState) markFileSkippedDone(fileID uint32) {
 // this is not necessarily the worker that opened the file. A nil liveEntry
 // means the file has already completed (claimDone already removed it) --
 // nothing left to count, and nothing to do.
-func (dt *dirTransferState) recordBlockDone(fileID uint32) {
+func (dt *dirTransferState) recordBlockDone(fileID uint32, changed bool) {
 	lf := dt.sess.liveEntry(fileID)
 	if lf == nil {
 		return
 	}
+	if changed {
+		lf.changed.Store(true)
+	}
 	if atomic.AddInt64(&lf.remaining, -1) == 0 {
-		dt.sendFileDone(fileID)
+		dt.sendFileDone(fileID, lf.changed.Load())
 	}
 }
 
@@ -669,7 +778,7 @@ func (dt *dirTransferState) forceFileDone(fileID uint32, blocksEmitted uint32) {
 		return // every expected block was actually emitted; nothing to correct
 	}
 	if atomic.AddInt64(&lf.remaining, -neverComing) == 0 {
-		dt.sendFileDone(fileID)
+		dt.sendFileDone(fileID, lf.changed.Load())
 	}
 }
 
@@ -762,6 +871,12 @@ type dirProgressSample struct {
 	at  time.Time
 }
 
+// estimateDelay is how long the pre-scan estimator waits before starting;
+// a walk that completes within it never pays for the second sweep at all.
+// A var, not a constant, so a test can shrink it to force the estimator to
+// actually run without needing a multi-second real tree.
+var estimateDelay = 2 * time.Second
+
 const dirProgressTick = time.Second
 const dirProgressWindow = 5 // ticks averaged for the displayed MB/s and ETA
 
@@ -791,22 +906,27 @@ func resolveProgressTotals(sess *SyncSession) (filesTotal uint32, bytesTotal uin
 }
 
 // TransferSummary renders the end-of-run figures that matter for judging a
-// transfer: how much was scanned, how much actually went on the wire, and
-// what compression bought. The source total alone cannot distinguish a run
-// that sent everything from one that sent almost nothing, which is the whole
-// question on a re-sync or a bandwidth-limited link.
+// transfer: how many files actually differed, how much was scanned, how
+// much actually went on the wire, and what compression bought. The source
+// total alone cannot distinguish a run that sent everything from one that
+// sent almost nothing, which is the whole question on a re-sync or a
+// bandwidth-limited link -- the changed-file count answers the same
+// question at file granularity, which "N bytes sent" alone doesn't (a
+// handful of large changed files and thousands of small changed files can
+// produce the same byte total).
 func (s *SyncSession) TransferSummary() string {
+	filesSeg := fmt.Sprintf("%d/%d file(s) changed", s.filesChanged.Load(), s.totalFilesKnown.Load())
 	scanned := formatBytesShort(s.TotalBytes())
 	net := s.bytesNet.Load()
 	if net == 0 {
-		return fmt.Sprintf("%s scanned, nothing sent (destination already matched)", scanned)
+		return fmt.Sprintf("%s, %s scanned, nothing sent (destination already matched)", filesSeg, scanned)
 	}
 	orig := s.bytesOrig.Load()
 	if orig > net {
-		return fmt.Sprintf("%s scanned, %s sent (×%.2f compression)",
-			scanned, formatBytesShort(net), float64(orig)/float64(net))
+		return fmt.Sprintf("%s, %s scanned, %s sent (×%.2f compression)",
+			filesSeg, scanned, formatBytesShort(net), float64(orig)/float64(net))
 	}
-	return fmt.Sprintf("%s scanned, %s sent", scanned, formatBytesShort(net))
+	return fmt.Sprintf("%s, %s scanned, %s sent", filesSeg, scanned, formatBytesShort(net))
 }
 
 // netSegment renders the wire-rate part of the progress line: what is
@@ -954,10 +1074,20 @@ type skipLogger struct {
 	counts map[string]int
 	order  []string // reasons in first-seen order, so the summary is stable
 	total  int
+	// verb labels each printed line. "skip" for the walk's own skips; the
+	// destination-rejection users pass their own, because calling a file
+	// the destination REFUSED a "skip" reads as a deliberate, harmless
+	// omission rather than the failure it is.
+	verb string
 }
 
 func newSkipLogger() *skipLogger {
-	return &skipLogger{shown: map[string]int{}, counts: map[string]int{}}
+	return &skipLogger{shown: map[string]int{}, counts: map[string]int{}, verb: "skip"}
+}
+
+// newRejectLogger is newSkipLogger for entries the DESTINATION refused.
+func newRejectLogger() *skipLogger {
+	return &skipLogger{shown: map[string]int{}, counts: map[string]int{}, verb: "rejected"}
 }
 
 // skipReasonKey collapses a formatted reason to the part before its first
@@ -989,9 +1119,9 @@ func (s *skipLogger) log(relPath, reason string) {
 	// Log outside the lock: it can block on a slow terminal, and the walk
 	// is the only caller that would then be stalled behind it.
 	if shown < maxSkipLinesPerReason {
-		Log("skip %s: %s\n", relPath, reason)
+		Log("%s %s: %s\n", s.verb, relPath, reason)
 		if shown+1 == maxSkipLinesPerReason {
-			Log("skip: further %q skips will be counted, not listed\n", key)
+			Log("%s: further %q entries will be counted, not listed\n", s.verb, key)
 		}
 	}
 }
@@ -999,6 +1129,13 @@ func (s *skipLogger) log(relPath, reason string) {
 // summary logs one aggregated line for everything the walk skipped, or
 // nothing at all if it skipped nothing.
 func (s *skipLogger) summary() {
+	s.summaryOf("skipped")
+}
+
+// summaryOf is summary with a caller-chosen verb, so the same bounded-tail
+// machinery can report walk skips ("skipped N path(s): ...") and
+// destination rejections ("N path(s) rejected by the destination: ...").
+func (s *skipLogger) summaryOf(what string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.total == 0 {
@@ -1008,7 +1145,11 @@ func (s *skipLogger) summary() {
 	for _, key := range s.order {
 		parts = append(parts, fmt.Sprintf("%d %s", s.counts[key], key))
 	}
-	Log("skipped %d path(s): %s\n", s.total, strings.Join(parts, ", "))
+	if what == "skipped" {
+		Log("skipped %d path(s): %s\n", s.total, strings.Join(parts, ", "))
+		return
+	}
+	Log("%d path(s) %s: %s\n", s.total, what, strings.Join(parts, ", "))
 }
 
 // startDirClient walks srcRoot, announces it to serverAddress, and
@@ -1053,7 +1194,8 @@ func startDirClient(srcRoot, serverAddress string, blockSizeCap uint32, noCompre
 	ctrl := newCtrlConn(rawConn)
 
 	sess := NewSyncSession()
-	dt := &dirTransferState{sess: sess, ctrl: ctrl, magicBytes: ctrl.magicBytes, noCompress: noCompress}
+	rejects := newRejectLogger()
+	dt := &dirTransferState{sess: sess, ctrl: ctrl, magicBytes: ctrl.magicBytes, noCompress: noCompress, rejects: rejects}
 
 	capBS := blockSizeCap
 	if capBS == 0 {
@@ -1082,10 +1224,26 @@ func startDirClient(srcRoot, serverAddress string, blockSizeCap uint32, noCompre
 	// constraint against the pipeline below), and nothing ever waits on it
 	// -- if the transfer finishes first, the leftover goroutine just
 	// finishes its lstat sweep and exits.
-	go estimateTree(srcRoot, excl, func(size uint64) {
-		sess.estFiles.Add(1)
-		sess.estBytes.Add(size)
-	})
+	//
+	// Started DELAYED, and not at all if the real walk finishes first: a
+	// short run (the common quick-check no-op re-sync) completes its whole
+	// walk within the delay, and for it this second readdir+lstat sweep of
+	// the entire source was pure overhead -- measurably so: ~20% of the
+	// no-op benchmark's allocations, and on an HDD a full extra pass of
+	// competing metadata seeks. A run still walking after estimateDelay is
+	// exactly the long run whose ETA the estimate exists to fix, and there
+	// its cost is amortized over minutes.
+	go func() {
+		select {
+		case <-walkDone:
+			return // walk already finished; exact totals are in
+		case <-time.After(estimateDelay):
+		}
+		estimateTree(srcRoot, excl, func(size uint64) {
+			sess.estFiles.Add(1)
+			sess.estBytes.Add(size)
+		})
+	}()
 
 	// Single consumer of the walk: registering each entry with the session
 	// IS what assigns it there (walkSource's IDs are dense in emission
@@ -1410,6 +1568,12 @@ func startDirClient(srcRoot, serverAddress string, blockSizeCap uint32, noCompre
 		return sess, fmt.Errorf("unexpected reply to tree done: op %d", ack.Op)
 	}
 
+	// One aggregated line for every file the destination refused, so a
+	// systemic problem reads as "12043 file(s) rejected by the destination:
+	// 12043 failed at announce time..." instead of 12043 separate lines
+	// (of which only the first 10 per reason were printed).
+	rejects.summaryOf("rejected by the destination")
+
 	return sess, nil
 }
 
@@ -1463,7 +1627,7 @@ func (dt *dirTransferState) handleDirBlock(conn *AutoReconnectTCP, pb Precompute
 		// sent for it, and the server would wait forever for it to
 		// finalize in WaitAllFinalized -- one bad block would hang the
 		// entire tree, not just its own file.
-		dt.recordBlockDone(pb.FileID)
+		dt.recordBlockDone(pb.FileID, false)
 		pb.Release()
 		return
 	}
@@ -1510,7 +1674,7 @@ func (dt *dirTransferState) handleDirBlock(conn *AutoReconnectTCP, pb Precompute
 			// in the receive buffer). Close it here so the next block starts
 			// on a clean redial instead of tripping over a dead, dirty
 			// connection and burning a retry to discover that.
-			Log("file %d block %d: %v\n", pb.FileID, pb.BlockIdx, lastErr)
+			dt.logReject(pb.FileID, lastErr.Error())
 			conn.Close()
 			b.bound = false
 		} else {
@@ -1523,8 +1687,13 @@ func (dt *dirTransferState) handleDirBlock(conn *AutoReconnectTCP, pb Precompute
 	}
 	// Every block handled here, succeeded or not, counts toward the file
 	// being "resolved" -- see the comment above for why a failure must
-	// still be counted.
-	dt.recordBlockDone(pb.FileID)
+	// still be counted. A failed block never reports itself changed here
+	// (lastErr != nil skips straight past outcome, whose zero value is
+	// changed=false) -- if an EARLIER block of the same file already
+	// transferred, the file still correctly counts as changed via
+	// liveFile.changed's latch.
+	changed := lastErr == nil && outcome.changed
+	dt.recordBlockDone(pb.FileID, changed)
 	pb.Release()
 }
 
@@ -1541,6 +1710,14 @@ func (dt *dirTransferState) handleDirBlock(conn *AutoReconnectTCP, pb Precompute
 func runDirTransferWorker(saddr *net.TCPAddr, dt *dirTransferState, dedChan <-chan PrecomputedBlock, sharedChan <-chan PrecomputedBlock) {
 	conn := NewAutoReconnectTCP(saddr)
 	defer conn.Close()
+
+	if !dirPipelineDisabled {
+		// The windowed engine (dirsync_pipeline.go): same sources, same
+		// per-block accounting invariants, but many requests in flight per
+		// connection instead of one lock-step exchange per protocol step.
+		runDirTransferWorkerPipelined(conn, dt, dedChan, sharedChan)
+		return
+	}
 
 	var b dirWorkerBinding
 
@@ -1603,21 +1780,29 @@ func runDirTransferWorker(saddr *net.TCPAddr, dt *dirTransferState, dedChan <-ch
 // bit: the destination created this file fresh during this very open (see
 // dirWorkerBinding.created for what the caller does with it).
 func dirWorkerBind(conn *AutoReconnectTCP, dt *dirTransferState, pb PrecomputedBlock, sameConnDifferentFile bool, prevFileID uint32) (created bool, err error) {
-	if sameConnDifferentFile {
-		closeMsg := &Msg{MagicHead: dt.magicBytes, Op: uint8(OpFileClose), FileID: prevFileID}
-		data, err := pack(closeMsg)
-		if err == nil {
-			connWrite(conn, data) // best-effort: a failure here just means an extra stale ref for the server to reap
-		}
-	}
-
 	openMsg := &Msg{MagicHead: dt.magicBytes, Op: uint8(OpFileOpen), FileID: pb.FileID, BlockSize: pb.BlockSize, FileSize: pb.FileSize}
 	data, err := pack(openMsg)
 	if err != nil {
 		return false, err
 	}
-	if err := connWrite(conn, data); err != nil {
-		return false, fmt.Errorf("send file-open: %w", err)
+	if sameConnDifferentFile {
+		// Coalesce OpFileClose(prev)+OpFileOpen(next) into ONE write: they
+		// always travel back-to-back on a rebind, and two separate writes
+		// cost an extra syscall and TCP segment per file switch. The close
+		// half stays best-effort semantically -- if the combined write
+		// fails, the open failed too and the error below covers both.
+		closeMsg := &Msg{MagicHead: dt.magicBytes, Op: uint8(OpFileClose), FileID: prevFileID}
+		if closeData, cerr := pack(closeMsg); cerr == nil {
+			if err := connWriteFrame(conn, closeData, data); err != nil {
+				return false, fmt.Errorf("send file-open: %w", err)
+			}
+			data = nil // sent
+		}
+	}
+	if data != nil {
+		if err := connWrite(conn, data); err != nil {
+			return false, fmt.Errorf("send file-open: %w", err)
+		}
 	}
 	ack, err := readMsg(conn)
 	if err != nil {
@@ -1632,6 +1817,12 @@ func dirWorkerBind(conn *AutoReconnectTCP, dt *dirTransferState, pb PrecomputedB
 		// beating a still-buffering announce batch, which the retry loop
 		// has always absorbed and must keep absorbing.
 		if ack.Flags&FlagErrPermanent != 0 {
+			// The server's reason text is sitting in the receive buffer
+			// right behind this header; read it before the connection is
+			// closed, so the failure says WHY rather than just "rejected".
+			if text := readDirErrorText(conn, ack.DataSize); text != "" {
+				return false, fmt.Errorf("server rejected file-open for file %d: %s: %w", pb.FileID, text, errPermanent)
+			}
 			return false, fmt.Errorf("server rejected file-open for file %d: %w", pb.FileID, errPermanent)
 		}
 		return false, fmt.Errorf("server rejected file-open for file %d", pb.FileID)

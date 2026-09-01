@@ -359,3 +359,99 @@ func TestPackMatchesBinaryWrite(t *testing.T) {
 		}
 	}
 }
+
+// --- OpAnnounceAck: skip list + announce-failed list ---
+
+// TestAnnounceAckRoundTrip covers the two-section trailer: both lists
+// present, and the wire-compat case where nothing failed (only the
+// skip-list section is emitted, exactly as before the failed list existed).
+func TestAnnounceAckRoundTrip(t *testing.T) {
+	cases := []struct {
+		name            string
+		skipped, failed []uint32
+	}{
+		{"both", []uint32{1, 2, 900}, []uint32{7, 8}},
+		{"only skipped", []uint32{3, 4}, nil},
+		{"only failed", nil, []uint32{5}},
+		{"neither", nil, nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			encoded, err := encodeAnnounceAck(tc.skipped, tc.failed)
+			if err != nil {
+				t.Fatalf("encodeAnnounceAck: %v", err)
+			}
+			skipped, failed, err := decodeAnnounceAck(encoded)
+			if err != nil {
+				t.Fatalf("decodeAnnounceAck: %v", err)
+			}
+			assertUint32SlicesEqual(t, skipped, tc.skipped)
+			assertUint32SlicesEqual(t, failed, tc.failed)
+		})
+	}
+}
+
+// TestAnnounceAckWithNoFailuresIsByteIdenticalToSkipList pins the
+// compatibility property the encoder relies on: the overwhelmingly common
+// ack (nothing failed) is exactly the bytes encodeSkipList always produced,
+// so the second section costs nothing on a healthy run and decodeSkipList
+// still reads such a trailer.
+func TestAnnounceAckWithNoFailuresIsByteIdenticalToSkipList(t *testing.T) {
+	ids := []uint32{11, 22, 33}
+	withFailed, err := encodeAnnounceAck(ids, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	skipOnly, err := encodeSkipList(ids)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(withFailed, skipOnly) {
+		t.Errorf("encodeAnnounceAck(ids, nil) = %v, want byte-identical to encodeSkipList(ids) = %v", withFailed, skipOnly)
+	}
+	decoded, err := decodeSkipList(withFailed)
+	if err != nil {
+		t.Fatalf("decodeSkipList on a no-failures ack: %v", err)
+	}
+	assertUint32SlicesEqual(t, decoded, ids)
+}
+
+// TestDecodeAnnounceAckRejectsTrailingGarbage: a trailer with bytes beyond
+// the two sections is a corrupt/hostile frame, not something to silently
+// ignore.
+func TestDecodeAnnounceAckRejectsTrailingGarbage(t *testing.T) {
+	encoded, err := encodeAnnounceAck([]uint32{1}, []uint32{2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := decodeAnnounceAck(append(encoded, 0xFF)); err == nil {
+		t.Error("decodeAnnounceAck accepted a trailer with trailing bytes")
+	}
+}
+
+// TestDecodeAnnounceAckRejectsTruncatedFailedSection: every prefix that cuts
+// into the second section must error rather than return a partial list.
+func TestDecodeAnnounceAckRejectsTruncatedFailedSection(t *testing.T) {
+	encoded, err := encodeAnnounceAck([]uint32{1, 2}, []uint32{3, 4, 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	skipLen := 4 + 2*4 // count + 2 ids
+	for cut := skipLen + 1; cut < len(encoded); cut++ {
+		if _, _, err := decodeAnnounceAck(encoded[:cut]); err == nil {
+			t.Errorf("decodeAnnounceAck accepted a trailer truncated to %d bytes", cut)
+		}
+	}
+}
+
+func assertUint32SlicesEqual(t *testing.T, got, want []uint32) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Fatalf("length mismatch: got %v, want %v", got, want)
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			t.Fatalf("mismatch at %d: got %v, want %v", i, got, want)
+		}
+	}
+}

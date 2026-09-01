@@ -3,6 +3,7 @@ package main
 import (
 	"container/heap"
 	"os"
+	"sort"
 	"sync"
 )
 
@@ -36,14 +37,15 @@ type writeItem struct {
 	done   chan error // non-nil for SubmitAndWait(File): receives the write result
 
 	// drain, when set, is a barrier request rather than a real write: the
-	// writer goroutine flushes everything currently buffered — any file,
-	// not just this item's — before signaling drainDone. A full barrier
-	// rather than a file-scoped one, since picking a specific file's items
-	// out of the heap without breaking its invariants is real complexity
-	// for no correctness gain here: DrainFile exists as an explicit safety
-	// net before finalize() truncates/closes/chmods a file, and finalize()
-	// only runs once per file, so flushing a little early for unrelated
-	// files in flight is a negligible cost.
+	// writer goroutine flushes everything currently buffered FOR THIS
+	// ITEM'S FILE — file-scoped, not a full barrier — before signaling
+	// drainDone. It used to flush the whole heap, which was correct but
+	// meant every OpFileDone (serialized on the control goroutine) force-
+	// flushed every other in-flight file's buffered writes too, defeating
+	// the reorder window's write locality exactly when many small files
+	// finalize back to back. Correctness only ever needed the drained
+	// file's own bytes settled before finalize() truncates/closes/chmods
+	// it; other files' items stay buffered and keep their ordering.
 	drain     bool
 	drainDone chan struct{}
 }
@@ -142,15 +144,45 @@ func (ow *OrderedWriter) run() {
 
 	handle := func(it writeItem) {
 		if it.drain {
-			for h.Len() > 0 {
-				ow.writeOne(heap.Pop(h).(writeItem))
+			// File-scoped drain: write out only the drained file's buffered
+			// items (in ascending key order), keep everything else exactly
+			// as buffered. A nil drain file falls back to the historical
+			// full barrier.
+			if it.file == nil {
+				for h.Len() > 0 {
+					ow.writeOne(heap.Pop(h).(writeItem))
+				}
+				ow.flushSync()
+				close(it.drainDone)
+				return
 			}
-			// The accumulated sync range may belong to the file the caller
-			// is about to close (or truncate/chmod/chtimes) once drainDone
-			// fires, so it must be flushed and cleared now — leaving a
+			var mine []writeItem
+			rest := (*h)[:0]
+			for _, b := range *h {
+				if b.file == it.file {
+					mine = append(mine, b)
+				} else {
+					rest = append(rest, b)
+				}
+			}
+			if len(mine) > 0 {
+				sort.Slice(mine, func(i, j int) bool { return mine[i].key < mine[j].key })
+				for _, b := range mine {
+					ow.writeOne(b)
+				}
+				*h = rest
+				heap.Init(h)
+			}
+			// The accumulated sync range must be flushed and cleared IF it
+			// belongs to the file the caller is about to close (or
+			// truncate/chmod/chtimes) once drainDone fires — leaving a
 			// stale ow.syncFile pointing at an fd finalize() then closes is
 			// a use-after-close the next unrelated write would trip over.
-			ow.flushSync()
+			// A range accumulated for a DIFFERENT, still-live file is left
+			// to keep growing toward its normal syncEvery flush.
+			if ow.syncFile == it.file {
+				ow.flushSync()
+			}
 			close(it.drainDone)
 			return
 		}
@@ -295,12 +327,12 @@ func (ow *OrderedWriter) SubmitAndWaitFile(f *os.File, key uint64, offset int64,
 	return <-done
 }
 
-// DrainFile blocks until every write submitted so far for ANY file has been
-// durably applied — a full barrier, not a file-scoped one (see writeItem's
-// drain field for why). Used before finalize() truncates, closes, chmods,
-// and chtimes a file, as an explicit safety net beyond the fact that every
+// DrainFile blocks until every write submitted so far FOR f has been
+// applied — file-scoped (see writeItem's drain field); other files' buffered
+// items stay put. Used before finalize() truncates, closes, chmods, and
+// chtimes a file, as an explicit safety net beyond the fact that every
 // individual SubmitAndWaitFile call already blocks until its own block is
-// written.
+// written. Passing a nil f requests the historical full barrier.
 //
 // Deliberately does NOT return ow.Err(): that is the STICKY, GLOBAL first
 // error across every file this writer has ever touched, not anything

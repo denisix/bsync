@@ -72,12 +72,18 @@ func runDirTransferOpts(t *testing.T, srcRoot string, workers int, noCompress, q
 // must exactly reach the files-only denominator (totalFilesKnown -- KindFile
 // entries; dirs and skipped placeholders are excluded from both sides), so
 // a real transfer's final progress line reads N/N rather than stalling
-// short of it; and the pre-scan estimator (startDirClient's estimateTree
-// goroutine) must have actually fed the session's estimate atomics with the
-// same totals -- the source trees in these tests are stable, so estimate
-// and exact must converge. The estimate side is polled briefly: the
-// pre-scan is deliberately fire-and-forget, so on a tiny tree it can still
-// be mid-sweep for a moment after startDirClient returns.
+// short of it; and the pre-scan estimator (startDirClient's delayed
+// estimateTree goroutine), IF it ran at all, must have fed the session's
+// estimate atomics with the same totals -- the source trees in these tests
+// are stable, so estimate and exact must converge. The estimator starts
+// only after estimateDelay and is skipped entirely when the walk finishes
+// first, which is the overwhelmingly common case for these small test
+// trees, so a zero estimate is legitimate; a NONZERO estimate that never
+// converges is the regression this still nets. The estimate side is polled
+// briefly: the pre-scan is deliberately fire-and-forget, so it can still be
+// mid-sweep for a moment after startDirClient returns.
+// (estimateTree's own counting contract is pinned directly by
+// TestEstimateTreeMatchesWalkSource in walk_test.go.)
 func assertProgressReachedTotal(t *testing.T, sess *SyncSession) {
 	t.Helper()
 	done, total := sess.filesDone.Load(), sess.totalFilesKnown.Load()
@@ -86,13 +92,75 @@ func assertProgressReachedTotal(t *testing.T, sess *SyncSession) {
 	}
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		if sess.estFiles.Load() == total && sess.estBytes.Load() == sess.totalBytesKnown.Load() {
+		est := sess.estFiles.Load()
+		if est == 0 {
+			return // estimator skipped (walk beat estimateDelay) -- exact totals rule
+		}
+		if est == total && sess.estBytes.Load() == sess.totalBytesKnown.Load() {
 			return
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
 	t.Errorf("pre-scan estimate = %d files / %d bytes, want %d / %d -- estimateTree's session feed is broken",
 		sess.estFiles.Load(), sess.estBytes.Load(), total, sess.totalBytesKnown.Load())
+}
+
+// TestE2EDirEstimatorActuallyRunsAndConvergesWhenStarted is the direct
+// regression assertProgressReachedTotal can no longer provide on its own:
+// that helper now accepts estFiles==0 as success, because on every real
+// test tree the walk finishes before estimateDelay and the estimator never
+// launches at all -- so it can't tell "estimator skipped, correctly" apart
+// from "estimator's launch-and-feed wiring is broken". This test forces
+// the estimator to actually run (estimateDelay set to 0, so it races
+// walkDone from the very first select) and then requires its atomics to
+// reach the exact real totals -- exercising the launch goroutine at
+// startDirClient's callsite and its sess.estFiles/estBytes.Add wiring,
+// which TestEstimateTreeMatchesWalkSource (counting only, no session) and
+// the resolveProgressTotals unit tests (consumption only, atomics
+// pre-seeded by hand) do not reach.
+func TestE2EDirEstimatorActuallyRunsAndConvergesWhenStarted(t *testing.T) {
+	restore := estimateDelay
+	t.Cleanup(func() { estimateDelay = restore })
+	estimateDelay = 0
+
+	resetEngineGlobals()
+	src := t.TempDir()
+	const nFiles = 200
+	var wantBytes uint64
+	for i := 0; i < nFiles; i++ {
+		content := string(randomBytes(50+i, int64(i)))
+		mustWriteFile(t, filepath.Join(src, fmt.Sprintf("f%03d.bin", i)), content)
+		wantBytes += uint64(len(content))
+	}
+	dst := t.TempDir()
+
+	port := freeTCPPort(t)
+	addr := "127.0.0.1:" + port
+	srvErrCh := make(chan error, 1)
+	go func() { srvErrCh <- startDirServer(dst, "127.0.0.1", port, 2, true) }()
+	waitForListener(t, addr)
+
+	sess, err := startDirClient(src, addr, 0, false, 2, nil, false, false, false, false)
+	if err != nil {
+		t.Fatalf("startDirClient: %v", err)
+	}
+	if err := <-srvErrCh; err != nil {
+		t.Fatalf("startDirServer: %v", err)
+	}
+	if sess.FailedCount() != 0 {
+		t.Fatalf("%d file(s) failed", sess.FailedCount())
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if sess.estFiles.Load() == uint32(nFiles) && sess.estBytes.Load() == wantBytes {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Errorf("pre-scan estimate = %d files / %d bytes, want %d / %d -- with estimateDelay=0 the estimator "+
+		"must run and its session feed must converge exactly (launch-and-feed wiring regression)",
+		sess.estFiles.Load(), sess.estBytes.Load(), nFiles, wantBytes)
 }
 
 // startDirClientAgainst re-runs startDirClient against an EXISTING
@@ -2403,6 +2471,169 @@ func TestE2EDirDeleteProtectsExcludedDirectory(t *testing.T) {
 	}
 }
 
+// TestE2EDirTransferSummaryCountsChangedFiles is the end-to-end pin for
+// SyncSession.FilesChanged()/TransferSummary(): on a re-sync where some
+// files are untouched, some have new content, and one is quick-check
+// skipped, the changed-file count must match reality exactly -- not
+// "how many files were scanned" (that's totalFilesKnown) and not "how many
+// blocks differed" (that's diffs), but "how many files actually needed to
+// transfer new content". Runs against both the strict and the pipelined
+// worker engine, since both must feed the same SyncSession counter.
+func TestE2EDirTransferSummaryCountsChangedFiles(t *testing.T) {
+	for _, disabled := range []bool{false, true} {
+		disabled := disabled
+		name := "pipelined"
+		if disabled {
+			name = "strict"
+		}
+		t.Run(name, func(t *testing.T) {
+			withPipeline(t, disabled, func() {
+				src := t.TempDir()
+				mustWriteFile(t, filepath.Join(src, "untouched.txt"), string(randomBytes(4000, 501)))
+				mustWriteFile(t, filepath.Join(src, "will-change.txt"), string(randomBytes(4000, 502)))
+				mustWriteFile(t, filepath.Join(src, "quickcheck-skip.txt"), string(randomBytes(4000, 503)))
+
+				// First pass: quick-check ON, so the second pass's untouched
+				// files take the announce-time skip path, not the block
+				// checksum path -- both "unchanged" routes are exercised.
+				dst, sess := runDirTransferOpts(t, src, 2, false, true)
+				assertTreesEqual(t, src, dst)
+				if got := sess.FilesChanged(); got != 3 {
+					t.Fatalf("first pass FilesChanged = %d, want 3 (every file is new)", got)
+				}
+
+				mustWriteFile(t, filepath.Join(src, "will-change.txt"), string(randomBytes(4000, 999)))
+				// Same size as before, so quick-check's mtime half of the
+				// (size, mtime) test is what must catch the change -- bump
+				// it explicitly rather than relying on wall-clock drift
+				// between two mustWriteFile calls a few microseconds apart.
+				future := time.Now().Add(3 * time.Second)
+				if err := os.Chtimes(filepath.Join(src, "will-change.txt"), future, future); err != nil {
+					t.Fatal(err)
+				}
+
+				sess2 := startDirClientAgainst(t, src, dst, 2, false, nil, true, false, false)
+				assertTreesEqual(t, src, dst)
+				if got := sess2.FilesChanged(); got != 1 {
+					t.Errorf("second pass FilesChanged = %d, want 1 (only will-change.txt)", got)
+				}
+				if got := sess2.totalFilesKnown.Load(); got != 3 {
+					t.Errorf("totalFilesKnown = %d, want 3", got)
+				}
+				summary := sess2.TransferSummary()
+				if !strings.Contains(summary, "1/3 file(s) changed") {
+					t.Errorf("TransferSummary() = %q, want it to contain %q", summary, "1/3 file(s) changed")
+				}
+			})
+		})
+	}
+}
+
+// TestE2EDirDeleteProtectsExcludedFile is the single-file counterpart of
+// TestE2EDirDeleteProtectsExcludedDirectory: an excluded FILE (not a
+// directory) is still announced as a KindSkipped placeholder, so its
+// destination-side namesake survives a -delete pass with its pre-existing
+// content untouched, while an unrelated stale file is still removed.
+func TestE2EDirDeleteProtectsExcludedFile(t *testing.T) {
+	src := t.TempDir()
+	mustWriteFile(t, filepath.Join(src, "keep.txt"), string(randomBytes(1000, 161)))
+	mustWriteFile(t, filepath.Join(src, "excluded.log"), "should never be read from source")
+
+	dst := t.TempDir()
+	mustWriteFile(t, filepath.Join(dst, "excluded.log"), "pre-existing, unrelated to source")
+	mustWriteFile(t, filepath.Join(dst, "stale.txt"), "must be removed")
+
+	startDirClientAgainst(t, src, dst, 2, false, []string{"*.log"}, false, true, false)
+
+	got, err := os.ReadFile(filepath.Join(dst, "excluded.log"))
+	if err != nil {
+		t.Fatalf("excluded.log was removed: %v", err)
+	}
+	if string(got) != "pre-existing, unrelated to source" {
+		t.Errorf("excluded.log content changed: %q", got)
+	}
+	if _, err := os.Stat(filepath.Join(dst, "stale.txt")); !os.IsNotExist(err) {
+		t.Error("stale.txt should have been removed by -delete")
+	}
+	want, err := os.ReadFile(filepath.Join(src, "keep.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err = os.ReadFile(filepath.Join(dst, "keep.txt"))
+	if err != nil {
+		t.Fatalf("keep.txt was not synced: %v", err)
+	}
+	if string(got) != string(want) {
+		t.Error("keep.txt content mismatch")
+	}
+}
+
+// TestE2EDirDeleteExcludedSubdirCoexistsWithRealDeletion checks the two
+// -delete behaviors together in one run: an excluded directory nested
+// INSIDE a directory that IS synced must keep its pre-existing contents,
+// while a genuinely stale file elsewhere in that same synced directory
+// must still be removed. Protection and deletion are not mutually
+// exclusive -- one excluded subtree must not blind the sweep to real
+// staleness next to it.
+func TestE2EDirDeleteExcludedSubdirCoexistsWithRealDeletion(t *testing.T) {
+	src := t.TempDir()
+	mustMkdirAll(t, filepath.Join(src, "app"))
+	mustWriteFile(t, filepath.Join(src, "app", "keep.txt"), string(randomBytes(1000, 162)))
+	mustMkdirAll(t, filepath.Join(src, "app", "cache"))
+	mustWriteFile(t, filepath.Join(src, "app", "cache", "warm.txt"), "never synced")
+
+	dst := t.TempDir()
+	mustMkdirAll(t, filepath.Join(dst, "app", "cache"))
+	mustWriteFile(t, filepath.Join(dst, "app", "cache", "warm.txt"), "pre-existing cache entry")
+	mustWriteFile(t, filepath.Join(dst, "app", "stale.txt"), "must be removed")
+
+	startDirClientAgainst(t, src, dst, 2, false, []string{"cache"}, false, true, false)
+
+	got, err := os.ReadFile(filepath.Join(dst, "app", "cache", "warm.txt"))
+	if err != nil {
+		t.Fatalf("app/cache/warm.txt was removed: %v", err)
+	}
+	if string(got) != "pre-existing cache entry" {
+		t.Errorf("app/cache/warm.txt content changed: %q", got)
+	}
+	if _, err := os.Stat(filepath.Join(dst, "app", "stale.txt")); !os.IsNotExist(err) {
+		t.Error("app/stale.txt should have been removed by -delete")
+	}
+	want, err := os.ReadFile(filepath.Join(src, "app", "keep.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err = os.ReadFile(filepath.Join(dst, "app", "keep.txt"))
+	if err != nil {
+		t.Fatalf("app/keep.txt was not synced: %v", err)
+	}
+	if string(got) != string(want) {
+		t.Error("app/keep.txt content mismatch")
+	}
+}
+
+// TestE2EDirDeleteRemovesDestOnlyEntryMatchingExcludePattern documents an
+// asymmetry that is easy to assume away: -exclude only protects paths the
+// source WALK actually reaches (announced as a KindSkipped placeholder).
+// A path that exists ONLY on the destination -- never walked on the source
+// side, so never announced in any form -- is not in the keep set at all,
+// even if its name would match an exclude pattern. -delete removes it like
+// any other stale entry.
+func TestE2EDirDeleteRemovesDestOnlyEntryMatchingExcludePattern(t *testing.T) {
+	src := t.TempDir()
+	mustWriteFile(t, filepath.Join(src, "keep.txt"), string(randomBytes(1000, 163)))
+
+	dst := t.TempDir()
+	mustWriteFile(t, filepath.Join(dst, "orphan.log"), "exists only on the destination")
+
+	startDirClientAgainst(t, src, dst, 2, false, []string{"*.log"}, false, true, false)
+
+	if _, err := os.Stat(filepath.Join(dst, "orphan.log")); !os.IsNotExist(err) {
+		t.Error("orphan.log (destination-only, never announced) should have been removed by -delete " +
+			"even though its name matches an exclude pattern -- exclude only protects paths reachable from source")
+	}
+}
+
 // TestE2EDirDeleteProtectsSymlinkNamesake proves a source symlink -- never
 // created on the destination, but still announced as a KindSkipped
 // placeholder -- protects whatever already occupies that path on the
@@ -3331,4 +3562,478 @@ func TestE2EDirExcludedSubtreeLeavesTheRestIntact(t *testing.T) {
 	}
 	// Everything that WAS supposed to travel must match exactly.
 	assertTreesEqual(t, filepath.Join(src, "keep"), filepath.Join(dst, "keep"))
+}
+
+// captureLog redirects Log() output for the duration of fn and returns
+// everything written. Used to assert on what a transfer told the operator,
+// which for the destination-rejection path is the whole point of the
+// feature (the failure itself is invisible in the destination tree).
+func captureLog(t *testing.T, fn func()) string {
+	t.Helper()
+	var buf bytes.Buffer
+	var mu sync.Mutex
+	setLogOutput(&lockedWriter{mu: &mu, w: &buf})
+	t.Cleanup(func() { setLogOutput(os.Stdout) })
+	fn()
+	// (fn is responsible for clearing quiet AFTER its own
+	// resetEngineGlobals, which sets it; Log() drops everything but READY
+	// while quiet is on.)
+	setLogOutput(os.Stdout)
+	mu.Lock()
+	defer mu.Unlock()
+	return buf.String()
+}
+
+// lockedWriter serializes concurrent Log() writes from many workers into one
+// buffer; bytes.Buffer is not safe for concurrent use.
+type lockedWriter struct {
+	mu *sync.Mutex
+	w  *bytes.Buffer
+}
+
+func (l *lockedWriter) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.w.Write(p)
+}
+
+// TestE2EDirAnnounceFailureCascadeIsReportedNotFlooded is the regression for
+// the production report: with a destination path that cannot be created (a
+// regular file standing where a directory must go), EVERY file under it
+// fails at announce time. That is correct behavior -- those files genuinely
+// never reach the destination -- but the operator's experience of it was
+// one unexplained "server rejected file-open permanently" line per file
+// (thousands, at -w 512), each costing a killed connection and a redial,
+// with the real reason logged only server-side and capped at 10 lines.
+//
+// This pins the fix end to end: the client learns the reason from the
+// destination, the per-file logging is bounded with an aggregated summary,
+// and in quick-check mode (the default) the files are resolved from the
+// announce ack WITHOUT any file-open attempt at all.
+func TestE2EDirAnnounceFailureCascadeIsReportedNotFlooded(t *testing.T) {
+	const blocked = 25
+	build := func(t *testing.T) (src, dst string) {
+		src = t.TempDir()
+		mustMkdirAll(t, filepath.Join(src, "blocked"))
+		for i := 0; i < blocked; i++ {
+			mustWriteFile(t, filepath.Join(src, "blocked", fmt.Sprintf("f%02d.bin", i)), string(randomBytes(1200, int64(700+i))))
+		}
+		mustWriteFile(t, filepath.Join(src, "fine.txt"), string(randomBytes(1200, 799)))
+
+		dst = t.TempDir()
+		// A regular FILE where the "blocked" directory must be created:
+		// every announce under it fails its parent mkdir.
+		mustWriteFile(t, filepath.Join(dst, "blocked"), "in the way")
+		return src, dst
+	}
+
+	for _, quickCheck := range []bool{true, false} {
+		quickCheck := quickCheck
+		name := "quickcheck"
+		if !quickCheck {
+			name = "ignore-times"
+		}
+		t.Run(name, func(t *testing.T) {
+			src, dst := build(t)
+			var sess *SyncSession
+			out := captureLog(t, func() {
+				sess = startDirClientExpectFailures(t, src, dst, 2, quickCheck)
+			})
+
+			if got := sess.FailedCount(); got != blocked {
+				t.Errorf("FailedCount = %d, want %d (every file under the blocked parent)", got, blocked)
+			}
+			// The unaffected file must still sync normally.
+			want, err := os.ReadFile(filepath.Join(src, "fine.txt"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := os.ReadFile(filepath.Join(dst, "fine.txt"))
+			if err != nil {
+				t.Fatalf("fine.txt was not synced: %v", err)
+			}
+			if string(got) != string(want) {
+				t.Error("fine.txt content mismatch")
+			}
+			// The blocking file must be untouched.
+			if b, err := os.ReadFile(filepath.Join(dst, "blocked")); err != nil || string(b) != "in the way" {
+				t.Errorf("the pre-existing blocking file was altered: %q, %v", b, err)
+			}
+
+			// The operator must be told WHY, at least once.
+			if !strings.Contains(out, announceFailedReason) {
+				t.Errorf("transfer log never explains the announce-time failure; want it to contain %q.\nLog:\n%s", announceFailedReason, out)
+			}
+			// ...and must NOT be told once per file. The bounded tail
+			// prints at most maxSkipLinesPerReason lines, plus the
+			// "further ... will be counted" notice and the aggregated
+			// summary, so the reason can legitimately appear a few times
+			// past the cap -- but nothing close to once per failed file,
+			// which is the flood this exists to prevent.
+			perFile := strings.Count(out, announceFailedReason)
+			if perFile > maxSkipLinesPerReason+3 {
+				t.Errorf("reason appears %d times in the log for %d failed files, want it bounded to ~%d.\nLog:\n%s",
+					perFile, blocked, maxSkipLinesPerReason, out)
+			}
+			if !strings.Contains(out, "rejected by the destination") {
+				t.Errorf("transfer log has no aggregated rejection summary.\nLog:\n%s", out)
+			}
+
+			// At least one failed file's recorded error must carry the
+			// reason, so FailedError() is useful programmatically.
+			var explained int
+			for id := uint32(0); id < uint32(blocked+8); id++ {
+				if err := sess.FailedError(id); err != nil && strings.Contains(err.Error(), announceFailedReason) {
+					explained++
+				}
+			}
+			if explained == 0 {
+				t.Error("no failed file's FailedError() explains the announce-time failure")
+			}
+
+			// The SERVER's own per-connection error line is bounded too:
+			// it is the other half of what the operator sees, and it used
+			// to print once per refused open with no cap.
+			if n := strings.Count(out, "connection error: acquire"); n > maxSkipLinesPerReason {
+				t.Errorf("server logged %d unbounded per-connection acquire errors, want <= %d.\nLog:\n%s",
+					n, maxSkipLinesPerReason, out)
+			}
+
+			if quickCheck {
+				// The whole point of the ack's failed-list: these files are
+				// resolved from the announce reply, so no worker ever tries
+				// to open them (which would kill its connection and force a
+				// redial, per file).
+				if n := strings.Count(out, "server rejected file-open"); n != 0 {
+					t.Errorf("quick-check mode attempted %d file-open(s) for announce-failed files; "+
+						"the announce ack must resolve them without any open.\nLog:\n%s", n, out)
+				}
+				// ...and nothing was transferred for them.
+				if got := sess.bytesNet.Load(); got == 0 && sess.FilesChanged() == 0 {
+					t.Error("nothing at all was transferred; the unaffected file should still have been sent")
+				}
+			} else {
+				// Without quick-check there is no ack to carry the failed
+				// list, so these ARE discovered via a refused open -- but
+				// the server must summarize rather than print one line per
+				// file.
+				if !strings.Contains(out, "refused by this server") {
+					t.Errorf("server has no aggregated refusal summary for the opens it refused.\nLog:\n%s", out)
+				}
+			}
+
+			// An announce-failed file never transferred content, so it must
+			// never be counted as a CHANGED file.
+			if got := sess.FilesChanged(); got != 1 {
+				t.Errorf("FilesChanged = %d, want 1 (only fine.txt); announce-failed files must not count as changed", got)
+			}
+		})
+	}
+}
+
+// startDirClientExpectFailures is startDirClientAgainst for a transfer that
+// is EXPECTED to end with failed files: it drives the same in-process
+// server/client pair but does not assert FailedCount()==0, and returns the
+// session so the caller can inspect the failures.
+func startDirClientExpectFailures(t *testing.T, srcRoot, dstRoot string, workers int, quickCheck bool) *SyncSession {
+	t.Helper()
+	resetEngineGlobals()
+	port := freeTCPPort(t)
+	addr := "127.0.0.1:" + port
+	srvErrCh := make(chan error, 1)
+	go func() { srvErrCh <- startDirServer(dstRoot, "127.0.0.1", port, workers, false) }()
+	waitForListener(t, addr)
+	// resetEngineGlobals turns quiet ON, which drops every Log line but
+	// READY -- and what this transfer TELLS the operator is exactly what
+	// the caller asserts on.
+	setQuiet(false)
+	t.Cleanup(func() { setQuiet(true) })
+
+	sess, err := startDirClient(srcRoot, addr, 0, false, workers, nil, quickCheck, false, false, false)
+	if err != nil {
+		t.Fatalf("startDirClient: %v", err)
+	}
+	// The server reports the first announce-time failure as its own run
+	// error; that is expected here, so it is not asserted clean.
+	<-srvErrCh
+	return sess
+}
+
+// TestE2EDirDeeplyNestedRecursiveTree exercises real recursion depth rather
+// than the two-or-three-level trees most tests use: a 12-level chain, each
+// level holding files AND a subdirectory, plus sibling branches at several
+// depths. This is where per-directory state (mkdirAllOnce's createdDirs
+// memo, rejectSymlinkedAncestors' verifiedDirs memo, the keep-set, and the
+// walker's relative-path construction) either composes correctly or quietly
+// desynchronizes at depth.
+func TestE2EDirDeeplyNestedRecursiveTree(t *testing.T) {
+	const depth = 12
+	src := t.TempDir()
+
+	dir := src
+	var wantPaths []string
+	for lvl := 0; lvl < depth; lvl++ {
+		dir = filepath.Join(dir, fmt.Sprintf("level%02d", lvl))
+		mustMkdirAll(t, dir)
+		for f := 0; f < 3; f++ {
+			rel := filepath.Join(dir, fmt.Sprintf("f%d.bin", f))
+			mustWriteFile(t, rel, string(randomBytes(500+lvl*37+f, int64(lvl*10+f))))
+			wantPaths = append(wantPaths, rel)
+		}
+		// A sibling branch every few levels, so the tree is not a single
+		// chain and sibling ordering at depth is covered too.
+		if lvl%4 == 0 {
+			sib := filepath.Join(dir, "branch")
+			mustMkdirAll(t, filepath.Join(sib, "inner"))
+			mustWriteFile(t, filepath.Join(sib, "inner", "deep.txt"), string(randomBytes(800, int64(900+lvl))))
+		}
+	}
+	// An empty directory at maximum depth must be recreated too.
+	mustMkdirAll(t, filepath.Join(dir, "empty-leaf"))
+
+	dst, sess := runDirTransferOpts(t, src, 4, false, false)
+	assertTreesEqual(t, src, dst)
+	if sess.FailedCount() != 0 {
+		t.Fatalf("%d file(s) failed", sess.FailedCount())
+	}
+	if _, err := os.Stat(filepath.Join(strings.Replace(dir, src, dst, 1), "empty-leaf")); err != nil {
+		t.Errorf("empty directory at depth %d was not recreated: %v", depth, err)
+	}
+
+	// Idempotent re-run over the same deep tree must transfer nothing.
+	sess2 := startDirClientAgainst(t, src, dst, 4, false, nil, true, false, false)
+	assertTreesEqual(t, src, dst)
+	if got := sess2.FilesChanged(); got != 0 {
+		t.Errorf("re-run FilesChanged = %d, want 0 over an unchanged deep tree", got)
+	}
+}
+
+// TestE2EDirRecursiveTreeWithDeleteAndExcludeAtDepth combines recursion with
+// the two features that mutate the destination: an excluded subtree nested
+// deep inside a synced one must keep its pre-existing contents, while stale
+// entries at several different depths are all removed in the same pass.
+func TestE2EDirRecursiveTreeWithDeleteAndExcludeAtDepth(t *testing.T) {
+	src := t.TempDir()
+	deep := filepath.Join(src, "a", "b", "c", "d")
+	mustMkdirAll(t, deep)
+	mustWriteFile(t, filepath.Join(src, "a", "top.txt"), string(randomBytes(600, 11)))
+	mustWriteFile(t, filepath.Join(src, "a", "b", "mid.txt"), string(randomBytes(600, 12)))
+	mustWriteFile(t, filepath.Join(deep, "leaf.txt"), string(randomBytes(600, 13)))
+	mustMkdirAll(t, filepath.Join(src, "a", "b", "cache"))
+	mustWriteFile(t, filepath.Join(src, "a", "b", "cache", "junk.txt"), "never synced")
+
+	dst := t.TempDir()
+	// Pre-existing destination content: one protected (under the excluded
+	// dir) and three stale entries at different depths.
+	mustMkdirAll(t, filepath.Join(dst, "a", "b", "cache"))
+	mustWriteFile(t, filepath.Join(dst, "a", "b", "cache", "keepme.txt"), "pre-existing cache")
+	mustWriteFile(t, filepath.Join(dst, "stale-root.txt"), "x")
+	mustMkdirAll(t, filepath.Join(dst, "a", "b", "c", "d"))
+	mustWriteFile(t, filepath.Join(dst, "a", "b", "c", "d", "stale-deep.txt"), "x")
+	mustMkdirAll(t, filepath.Join(dst, "a", "stale-dir", "nested"))
+
+	startDirClientAgainst(t, src, dst, 4, false, []string{"cache"}, false, true, false)
+
+	// Protected by the exclude, at depth.
+	got, err := os.ReadFile(filepath.Join(dst, "a", "b", "cache", "keepme.txt"))
+	if err != nil || string(got) != "pre-existing cache" {
+		t.Errorf("excluded nested dir's contents were disturbed: %q, %v", got, err)
+	}
+	// Removed by -delete, at three different depths.
+	for _, gone := range []string{
+		filepath.Join(dst, "stale-root.txt"),
+		filepath.Join(dst, "a", "b", "c", "d", "stale-deep.txt"),
+		filepath.Join(dst, "a", "stale-dir"),
+	} {
+		if _, err := os.Stat(gone); !os.IsNotExist(err) {
+			t.Errorf("%s should have been removed by -delete (stat err = %v)", gone, err)
+		}
+	}
+	// Everything real still matches.
+	for _, rel := range []string{"a/top.txt", "a/b/mid.txt", "a/b/c/d/leaf.txt"} {
+		want, err := os.ReadFile(filepath.Join(src, filepath.FromSlash(rel)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := os.ReadFile(filepath.Join(dst, filepath.FromSlash(rel)))
+		if err != nil {
+			t.Fatalf("%s missing at destination: %v", rel, err)
+		}
+		if string(got) != string(want) {
+			t.Errorf("%s content mismatch", rel)
+		}
+	}
+}
+
+// TestE2EDirManyWorkersRacingSharedTree is the concurrency stress for the
+// paths this session changed: far more workers than files (so workers
+// contend for the same files and rebind constantly), a mix of file sizes
+// spanning single-block and many-block, run through both transfer engines.
+// Under -race this is what exercises the pipelined engine's window/gate,
+// the per-file remaining counter, the fd budget, and the OrderedWriter's
+// file-scoped drain all at once.
+func TestE2EDirManyWorkersRacingSharedTree(t *testing.T) {
+	for _, disabled := range []bool{false, true} {
+		disabled := disabled
+		name := "pipelined"
+		if disabled {
+			name = "strict"
+		}
+		t.Run(name, func(t *testing.T) {
+			withPipeline(t, disabled, func() {
+				src := t.TempDir()
+				mustMkdirAll(t, filepath.Join(src, "sub", "deeper"))
+				// Single-block files (the affinity-routed case).
+				for i := 0; i < 30; i++ {
+					mustWriteFile(t, filepath.Join(src, fmt.Sprintf("small%02d.bin", i)), string(randomBytes(400+i, int64(i))))
+				}
+				// Multi-block files (the shared-channel case, where several
+				// workers legitimately work on ONE file concurrently).
+				for i := 0; i < 3; i++ {
+					mustWriteFile(t, filepath.Join(src, "sub", fmt.Sprintf("big%d.bin", i)),
+						string(randomBytes(400*1024+i*7919, int64(500+i))))
+				}
+				mustWriteFile(t, filepath.Join(src, "sub", "deeper", "leaf.bin"), string(randomBytes(70*1024, 42)))
+				// A sparse file: zero blocks take their own code path.
+				sparse := make([]byte, 300*1024)
+				copy(sparse[200*1024:], randomBytes(20*1024, 43))
+				mustWriteFile(t, filepath.Join(src, "sub", "sparse.bin"), string(sparse))
+
+				// 24 workers over ~35 files: heavy rebinding and contention.
+				dst, sess := runDirTransferOpts(t, src, 24, false, false)
+				assertTreesEqual(t, src, dst)
+				if sess.FailedCount() != 0 {
+					t.Fatalf("%d file(s) failed", sess.FailedCount())
+				}
+
+				// Re-run with quick-check: nothing may change, and the
+				// counters must agree exactly across all those workers.
+				sess2 := startDirClientAgainst(t, src, dst, 24, false, nil, true, false, false)
+				assertTreesEqual(t, src, dst)
+				if got := sess2.FilesChanged(); got != 0 {
+					t.Errorf("FilesChanged = %d, want 0 on an unchanged re-run", got)
+				}
+				if got := sess2.FailedCount(); got != 0 {
+					t.Errorf("FailedCount = %d, want 0", got)
+				}
+
+				// Mutate a subset and re-run again: exactly those files,
+				// no more, must be reported changed despite the worker
+				// count exceeding the changed-file count.
+				changed := []string{"small01.bin", "small02.bin", "small03.bin"}
+				future := time.Now().Add(3 * time.Second)
+				for i, rel := range changed {
+					p := filepath.Join(src, rel)
+					mustWriteFile(t, p, string(randomBytes(400+i+1, int64(9000+i))))
+					if err := os.Chtimes(p, future, future); err != nil {
+						t.Fatal(err)
+					}
+				}
+				sess3 := startDirClientAgainst(t, src, dst, 24, false, nil, true, false, false)
+				assertTreesEqual(t, src, dst)
+				if got := sess3.FilesChanged(); got != uint32(len(changed)) {
+					t.Errorf("FilesChanged = %d, want %d", got, len(changed))
+				}
+			})
+		})
+	}
+}
+
+// TestE2EDirAnnounceFailureUnderManyWorkers is the reported production shape
+// in miniature: a large cascade of announce-failed files with far more
+// workers than files. Every failed file must be accounted exactly once (no
+// double-counting, no lost file, no hang) no matter how many workers race
+// the ack path, and the unaffected subtree must still sync completely.
+func TestE2EDirAnnounceFailureUnderManyWorkers(t *testing.T) {
+	const blocked, fine = 40, 10
+	src := t.TempDir()
+	mustMkdirAll(t, filepath.Join(src, "blocked", "nested"))
+	for i := 0; i < blocked/2; i++ {
+		mustWriteFile(t, filepath.Join(src, "blocked", fmt.Sprintf("f%02d.bin", i)), string(randomBytes(700, int64(i))))
+		mustWriteFile(t, filepath.Join(src, "blocked", "nested", fmt.Sprintf("n%02d.bin", i)), string(randomBytes(700, int64(100+i))))
+	}
+	mustMkdirAll(t, filepath.Join(src, "ok"))
+	for i := 0; i < fine; i++ {
+		mustWriteFile(t, filepath.Join(src, "ok", fmt.Sprintf("g%02d.bin", i)), string(randomBytes(700, int64(200+i))))
+	}
+
+	dst := t.TempDir()
+	mustWriteFile(t, filepath.Join(dst, "blocked"), "in the way")
+
+	sess := startDirClientExpectFailures(t, src, dst, 32, true)
+
+	if got := sess.FailedCount(); got != blocked {
+		t.Errorf("FailedCount = %d, want %d -- every blocked file exactly once under 32 workers", got, blocked)
+	}
+	if got := sess.FilesChanged(); got != fine {
+		t.Errorf("FilesChanged = %d, want %d (only the unaffected subtree)", got, fine)
+	}
+	// The whole unaffected subtree must be byte-identical.
+	assertTreesEqual(t, filepath.Join(src, "ok"), filepath.Join(dst, "ok"))
+	// The blocking file is untouched and nothing was created under it.
+	if b, err := os.ReadFile(filepath.Join(dst, "blocked")); err != nil || string(b) != "in the way" {
+		t.Errorf("blocking file altered: %q, %v", b, err)
+	}
+}
+
+// TestE2EDirAnnounceFailureRecoversAfterFix is the positive counterpart: the
+// destination-side obstruction is a transient environmental condition, so
+// once it is cleared a plain re-run must sync everything with no residue of
+// the previous failed attempt (no poisoned keep-set, no stale finalized
+// state, no files silently skipped as "already handled").
+func TestE2EDirAnnounceFailureRecoversAfterFix(t *testing.T) {
+	src := t.TempDir()
+	mustMkdirAll(t, filepath.Join(src, "blocked"))
+	for i := 0; i < 6; i++ {
+		mustWriteFile(t, filepath.Join(src, "blocked", fmt.Sprintf("f%d.bin", i)), string(randomBytes(900, int64(i))))
+	}
+	mustWriteFile(t, filepath.Join(src, "fine.txt"), string(randomBytes(900, 77)))
+
+	dst := t.TempDir()
+	mustWriteFile(t, filepath.Join(dst, "blocked"), "in the way")
+
+	first := startDirClientExpectFailures(t, src, dst, 4, true)
+	if first.FailedCount() != 6 {
+		t.Fatalf("first run FailedCount = %d, want 6", first.FailedCount())
+	}
+
+	// Clear the obstruction and re-run normally.
+	if err := os.Remove(filepath.Join(dst, "blocked")); err != nil {
+		t.Fatal(err)
+	}
+	second := startDirClientAgainst(t, src, dst, 4, false, nil, true, false, false)
+	if got := second.FailedCount(); got != 0 {
+		t.Errorf("second run FailedCount = %d, want 0 after the obstruction was removed", got)
+	}
+	assertTreesEqual(t, src, dst)
+}
+
+// TestE2EDirAllFilesFailAtAnnounceStillCompletes is the degenerate negative
+// case: NOTHING can be created at the destination. The transfer must still
+// terminate cleanly (rather than hanging in WaitAllFinalized waiting for
+// files that will never be transferred) and report every file failed.
+func TestE2EDirAllFilesFailAtAnnounceStillCompletes(t *testing.T) {
+	const n = 8
+	src := t.TempDir()
+	mustMkdirAll(t, filepath.Join(src, "top"))
+	for i := 0; i < n; i++ {
+		mustWriteFile(t, filepath.Join(src, "top", fmt.Sprintf("f%d.bin", i)), string(randomBytes(500, int64(i))))
+	}
+
+	dst := t.TempDir()
+	mustWriteFile(t, filepath.Join(dst, "top"), "everything is blocked")
+
+	done := make(chan *SyncSession, 1)
+	go func() { done <- startDirClientExpectFailures(t, src, dst, 8, true) }()
+	select {
+	case sess := <-done:
+		if got := sess.FailedCount(); got != n {
+			t.Errorf("FailedCount = %d, want %d (every file)", got, n)
+		}
+		if got := sess.FilesChanged(); got != 0 {
+			t.Errorf("FilesChanged = %d, want 0 -- nothing could be written", got)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("transfer hung when every file failed at announce time")
+	}
 }

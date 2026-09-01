@@ -311,6 +311,19 @@ type fileTable struct {
 	// doubling; ~4 MB at 32M entries, pointer-free.
 	announcedBits []uint64
 
+	// announceFailedBits marks, among announced IDs, the ones whose announce
+	// FAILED environmentally (mkdir/path/permission/space) and were born
+	// finalized without ever entering byID. Same shape and lifetime as
+	// announcedBits, and likewise never freed by freeAnnounceScratch: it is
+	// consulted by Acquire long after the announce phase, to tell a client
+	// WHY its open is being rejected. Without it every retired entry -- a
+	// completed file, a quick-check skip, and an announce-time failure --
+	// answers the identical "already finalized", which under a systemic
+	// failure (one uncreatable parent directory cascading to thousands of
+	// children) floods the client with rejections whose real cause was
+	// logged once, server-side, thousands of lines earlier.
+	announceFailedBits []uint64
+
 	// keep is the `-delete` keep-set AND, until announceClosed, the
 	// duplicate-path detector that used to be byPath's job (see
 	// keepSet's own doc comment for why a 128-bit digest set replaces a
@@ -423,11 +436,44 @@ const maxAnnounceFileID = 1 << 27
 // in announcedBits) -- including one that has since retired and left byID.
 // Caller must hold ft.mu.
 func (ft *fileTable) announcedSeen(id uint32) bool {
+	return bitmapHas(ft.announcedBits, id)
+}
+
+// announceFailed reports whether id's announce failed environmentally (see
+// announceFailedBits). Caller must hold ft.mu.
+func (ft *fileTable) announceFailed(id uint32) bool {
+	return bitmapHas(ft.announceFailedBits, id)
+}
+
+// markAnnounceFailed sets id's announce-failed bit. Caller must hold ft.mu.
+func (ft *fileTable) markAnnounceFailed(id uint32) {
+	bitmapSet(&ft.announceFailedBits, id)
+}
+
+// bitmapHas reports bit id of a dense uint64 bitmap; out of range is false.
+func bitmapHas(bits []uint64, id uint32) bool {
 	word := id / 64
-	if int(word) >= len(ft.announcedBits) {
+	if int(word) >= len(bits) {
 		return false
 	}
-	return ft.announcedBits[word]&(1<<(id%64)) != 0
+	return bits[word]&(1<<(id%64)) != 0
+}
+
+// bitmapSet sets bit id, growing the bitmap by doubling (never to exact
+// size: IDs arrive densely ascending, so exact-size growth reallocated and
+// copied the whole bitmap every 64 entries -- quadratic in the file count).
+func bitmapSet(bits *[]uint64, id uint32) {
+	word := int(id / 64)
+	if word >= len(*bits) {
+		newLen := 2 * len(*bits)
+		if newLen < word+1 {
+			newLen = word + 1
+		}
+		grown := make([]uint64, newLen)
+		copy(grown, *bits)
+		*bits = grown
+	}
+	(*bits)[word] |= 1 << (id % 64)
 }
 
 // markAnnounced sets id's bit, growing the bitmap if needed. Caller must
@@ -435,21 +481,7 @@ func (ft *fileTable) announcedSeen(id uint32) bool {
 // lets byID safely drop a retired entry without lookup mistaking "retired"
 // for "never announced" (see lookup).
 func (ft *fileTable) markAnnounced(id uint32) {
-	word := int(id / 64)
-	if word >= len(ft.announcedBits) {
-		// Double (at least), never grow to exact size: IDs arrive densely
-		// ascending, so exact-size growth reallocated and copied the whole
-		// bitmap every 64 entries -- quadratic in the file count, on the
-		// single announce goroutine.
-		newLen := 2 * len(ft.announcedBits)
-		if newLen < word+1 {
-			newLen = word + 1
-		}
-		grown := make([]uint64, newLen)
-		copy(grown, ft.announcedBits)
-		ft.announcedBits = grown
-	}
-	ft.announcedBits[word] |= 1 << (id % 64)
+	bitmapSet(&ft.announcedBits, id)
 }
 
 // retire is called once finalizeIO has actually returned for df (see
@@ -545,7 +577,7 @@ func (ft *fileTable) mkdirAllOnce(relDir, absDir string) error {
 // behaviour: announce is called with quickCheck=false, and its skip result
 // is always false so is discarded here.
 func (ft *fileTable) Announce(rec AnnounceRec) error {
-	_, err := ft.announce(rec, false)
+	_, _, err := ft.announce(rec, false)
 	return err
 }
 
@@ -561,16 +593,16 @@ func (ft *fileTable) Announce(rec AnnounceRec) error {
 // so there is nothing left for quick-check to add for them and rec.MTimeSec
 // wouldn't be meaningfully comparable against a file quick-check never
 // bothers to look at anyway.
-func (ft *fileTable) announce(rec AnnounceRec, quickCheck bool) (skip bool, err error) {
+func (ft *fileTable) announce(rec AnnounceRec, quickCheck bool) (skip, failed bool, err error) {
 	clean, sanErr := sanitizeRelPath(rec.Path)
 	if sanErr != nil && !errors.Is(sanErr, errPathUnrepresentable) {
 		// Structurally unsafe (traversal, absolute, NUL, ...): a hostile or
 		// corrupt stream, so kill the connection.
-		return false, fmt.Errorf("announce %d: unsafe path %q: %w", rec.FileID, rec.Path, sanErr)
+		return false, false, fmt.Errorf("announce %d: unsafe path %q: %w", rec.FileID, rec.Path, sanErr)
 	}
 	abs := filepath.Join(ft.root, filepath.FromSlash(clean))
 	if !isWithinRoot(ft.root, abs) {
-		return false, fmt.Errorf("announce %d: path %q escapes the destination root", rec.FileID, clean)
+		return false, false, fmt.Errorf("announce %d: path %q escapes the destination root", rec.FileID, clean)
 	}
 
 	// announceErr collects an ENVIRONMENTAL failure (a MkdirAll hitting
@@ -644,7 +676,7 @@ func (ft *fileTable) announce(rec AnnounceRec, quickCheck bool) (skip bool, err 
 			announceErr = fmt.Errorf("announce %d: %w", rec.FileID, err)
 			break
 		}
-		if err := clearConflictingDest(abs, KindDir); err != nil {
+		if _, err := clearConflictingDest(abs, KindDir); err != nil {
 			announceErr = fmt.Errorf("announce %d: %q: %w", rec.FileID, clean, err)
 			break
 		}
@@ -665,13 +697,15 @@ func (ft *fileTable) announce(rec AnnounceRec, quickCheck bool) (skip bool, err 
 		// Drop a stale symlink sitting at the file's own path BEFORE the
 		// quick-check stat below, so quick-check can never match against
 		// the link's TARGET (same size and mtime) and skip the file,
-		// leaving the link in place forever.
-		if err := clearConflictingDest(abs, KindFile); err != nil {
-			announceErr = fmt.Errorf("announce %d: %q: %w", rec.FileID, clean, err)
+		// leaving the link in place forever. Its Lstat doubles as the
+		// quick-check's stat -- one path lookup per announced file, not two.
+		destInfo, clearErr := clearConflictingDest(abs, KindFile)
+		if clearErr != nil {
+			announceErr = fmt.Errorf("announce %d: %q: %w", rec.FileID, clean, clearErr)
 			break
 		}
 		if announceErr == nil && quickCheck && rec.FileSize > 0 {
-			if fi, statErr := os.Stat(abs); statErr == nil && fi.Mode().IsRegular() &&
+			if fi := destInfo; fi != nil && fi.Mode().IsRegular() &&
 				uint64(fi.Size()) == rec.FileSize && fi.ModTime().Unix() == rec.MTimeSec {
 				skip = true
 				// rsync's quick-check still corrects a permission mismatch
@@ -695,7 +729,7 @@ func (ft *fileTable) announce(rec AnnounceRec, quickCheck bool) (skip bool, err 
 		// path out of the root. An empty target, though, is a corrupt
 		// record: the walker never emits one, so reject the stream.
 		if rec.LinkTarget == "" {
-			return false, fmt.Errorf("announce %d: symlink %q has an empty target", rec.FileID, clean)
+			return false, false, fmt.Errorf("announce %d: symlink %q has an empty target", rec.FileID, clean)
 		}
 		if err := ft.rejectSymlinkedAncestors(clean); err != nil {
 			announceErr = fmt.Errorf("announce %d: %w", rec.FileID, err)
@@ -730,7 +764,7 @@ func (ft *fileTable) announce(rec AnnounceRec, quickCheck bool) (skip bool, err 
 		// is created on disk for it, so there is no MkdirAll/open to
 		// mitigate here.
 	default:
-		return false, fmt.Errorf("announce %d: unknown entry kind %d", rec.FileID, rec.Kind)
+		return false, false, fmt.Errorf("announce %d: unknown entry kind %d", rec.FileID, rec.Kind)
 	}
 
 	df := &destFile{
@@ -774,21 +808,24 @@ func (ft *fileTable) announce(rec AnnounceRec, quickCheck bool) (skip bool, err 
 	ft.mu.Lock()
 	if ft.announceClosed {
 		ft.mu.Unlock()
-		return false, fmt.Errorf("announce %d: announce stream already closed by OpAnnounceEnd", rec.FileID)
+		return false, false, fmt.Errorf("announce %d: announce stream already closed by OpAnnounceEnd", rec.FileID)
 	}
 	if rec.FileID >= maxAnnounceFileID {
 		ft.mu.Unlock()
-		return false, fmt.Errorf("announce %d: FileID exceeds the maximum of %d", rec.FileID, maxAnnounceFileID-1)
+		return false, false, fmt.Errorf("announce %d: FileID exceeds the maximum of %d", rec.FileID, maxAnnounceFileID-1)
 	}
 	if ft.announcedSeen(rec.FileID) {
 		ft.mu.Unlock()
-		return false, fmt.Errorf("announce %d: file ID already announced", rec.FileID)
+		return false, false, fmt.Errorf("announce %d: file ID already announced", rec.FileID)
 	}
 	if ft.keep.add(clean, rec.Kind) {
 		ft.mu.Unlock()
-		return false, fmt.Errorf("announce %d: path %q was already announced", rec.FileID, clean)
+		return false, false, fmt.Errorf("announce %d: path %q was already announced", rec.FileID, clean)
 	}
 	ft.markAnnounced(rec.FileID)
+	if announceErr != nil {
+		ft.markAnnounceFailed(rec.FileID)
+	}
 	ft.announced++
 	if df.finalizeComplete {
 		// Born finalized (a dir, symlink, special, skipped placeholder, a
@@ -821,7 +858,7 @@ func (ft *fileTable) announce(rec AnnounceRec, quickCheck bool) (skip bool, err 
 			Log("directory server: replaying early file-done for %d: %v\n", rec.FileID, err)
 		}
 	}
-	return skip, nil
+	return skip, announceErr != nil, nil
 }
 
 // clearConflictingDest removes a destination SYMLINK standing where this run
@@ -841,21 +878,28 @@ func (ft *fileTable) announce(rec AnnounceRec, quickCheck bool) (skip bool, err 
 // regular file is the ordinary resume/update case, and an existing directory
 // where a file is wanted is reported so the caller can fail just that entry
 // rather than silently destroying a tree.
-func clearConflictingDest(abs string, want EntryKind) error {
+//
+// On success it returns the Lstat of whatever now occupies abs (nil when the
+// path is missing, unreadable, or was a symlink just removed), so the caller
+// can reuse it -- the quick-check needs exactly this stat and used to pay a
+// second path lookup for it on every announced file. Any symlink at abs has
+// been removed by the time the info is returned, so for the surviving entry
+// Lstat and Stat agree.
+func clearConflictingDest(abs string, want EntryKind) (os.FileInfo, error) {
 	fi, statErr := os.Lstat(abs)
 	if statErr != nil {
-		return nil // missing (the common case), or unreadable -- the caller's own operation reports it
+		return nil, nil // missing (the common case), or unreadable -- the caller's own operation reports it
 	}
 	if fi.Mode()&os.ModeSymlink != 0 {
 		if err := os.Remove(abs); err != nil {
-			return fmt.Errorf("remove stale symlink: %w", err)
+			return nil, fmt.Errorf("remove stale symlink: %w", err)
 		}
-		return nil
+		return nil, nil
 	}
 	if want == KindFile && fi.IsDir() {
-		return fmt.Errorf("a directory occupies the file's path")
+		return nil, fmt.Errorf("a directory occupies the file's path")
 	}
-	return nil
+	return fi, nil
 }
 
 // createSymlinkAt idempotently makes abs a symlink pointing at target:
@@ -948,15 +992,30 @@ func (ft *fileTable) lookup(id uint32) (*destFile, error) {
 	ft.mu.Lock()
 	df, ok := ft.byID[id]
 	announced := ft.announcedSeen(id)
+	failedAtAnnounce := announced && ft.announceFailed(id)
 	ft.mu.Unlock()
 	if ok {
 		return df, nil
+	}
+	if failedAtAnnounce {
+		// Still errAlreadyFinalized (so FlagErrPermanent and every
+		// errors.Is check are unchanged), but the text now says WHY -- this
+		// is what the client logs, and "already finalized" alone reads as
+		// a duplicate-transfer bug rather than what it is: the destination
+		// could not create/enter this path at announce time, and said so
+		// in its own log (rate-limited; see maxAnnounceErrLines).
+		return nil, fmt.Errorf("file %d: %w (%s)", id, errAlreadyFinalized, announceFailedReason)
 	}
 	if announced {
 		return nil, fmt.Errorf("file %d: %w", id, errAlreadyFinalized)
 	}
 	return nil, fmt.Errorf("file %d was never announced", id)
 }
+
+// announceFailedReason is the client-facing explanation appended to an
+// "already finalized" rejection for an entry whose announce failed. Kept a
+// constant so the client can key its rate-limited rejection log on it.
+const announceFailedReason = "failed at announce time on the destination; see the server's 'skipping this entry' lines for the cause"
 
 // waitForBudget blocks until fewer than openBudget files are currently
 // open, then reserves a slot. Always pair with releaseBudget.
@@ -1546,6 +1605,16 @@ type dirServerState struct {
 	// matching treeDoneSeen above.
 	fileCount       uint32 // atomic
 	announceEndSeen int32  // atomic; 0/1
+
+	// rejectLog bounds the per-connection error logging for the ONE
+	// connection error that is both expected and self-inflicted at scale:
+	// a file-open refused because the entry is already finalized. A single
+	// uncreatable destination directory cascades to every file under it,
+	// and each of those files' opens is refused on its own connection --
+	// so without bounding, one destination problem prints a line per file
+	// (thousands, at -w 512), burying the announce-time lines that say
+	// why. Every other connection error is still logged individually.
+	rejectLog *skipLogger
 }
 
 // startDirServer listens on bindIp:port and serves as the destination for a
@@ -1576,7 +1645,7 @@ func startDirServer(root, bindIp, port string, workers int, quiet bool) error {
 	// poison every other file's writes (see writeOne's perItemErr comment).
 	ow.EnablePerItemErrors()
 	defer ow.Close()
-	st := &dirServerState{ft: newFileTable(root, workers, ow)}
+	st := &dirServerState{ft: newFileTable(root, workers, ow), rejectLog: newRejectLogger()}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -1661,6 +1730,15 @@ func startDirServer(root, bindIp, port string, workers int, quiet bool) error {
 					}
 				}()
 				if handlerErr := dirHandleConn(c, st, doneChan); handlerErr != nil {
+					if errors.Is(handlerErr, errAlreadyFinalized) {
+						// Expected and already explained elsewhere: the
+						// entry was finalized before this open (most often
+						// because its own announce failed, which was logged
+						// then). Counted and summarized instead of printed
+						// once per affected file -- see rejectLog.
+						st.rejectLog.log("", "file-open refused: entry already finalized (see the announce-time rejections above)")
+						return
+					}
 					// A per-connection error (a dropped link, a malformed
 					// frame, a rejected protocol violation) must not abort
 					// the whole multi-connection, multi-file transfer: the
@@ -1700,6 +1778,7 @@ func startDirServer(root, bindIp, port string, workers int, quiet bool) error {
 			// OpTreeDone handled successfully and acked; wait for that
 			// connection's handler goroutine to finish closing out, then
 			// exit cleanly.
+			st.rejectLog.summaryOf("refused by this server")
 			if ferr := st.ft.FirstFinalizeErr(); ferr != nil {
 				return ferr
 			}
@@ -1717,6 +1796,12 @@ type dirSession struct {
 	fileID   uint32
 	df       *destFile
 	blockBuf []byte
+	// plainBuf is the reusable decompress destination for this connection's
+	// compressed blocks (blockBuf can't serve: it holds the compressed
+	// input while DecodeAll writes the output). Same lifetime argument as
+	// blockBuf: SubmitAndWaitFile blocks until the bytes are on disk, and
+	// nothing touches it again before the next frame is read.
+	plainBuf []byte
 }
 
 // dirHandleConn services one connection for the lifetime of a directory
@@ -1985,24 +2070,30 @@ func handleAnnounce(conn net.Conn, r *bufio.Reader, msg *Msg, ft *fileTable) err
 		return fmt.Errorf("decode announce batch: %w", err)
 	}
 	quickCheck := msg.Flags&FlagQuickCheck != 0
-	var skipped []uint32
+	var skipped, failed []uint32
 	for _, rec := range recs {
-		skip, err := ft.announce(rec, quickCheck)
+		skip, failedAtAnnounce, err := ft.announce(rec, quickCheck)
 		if err != nil {
 			return err
 		}
 		if skip {
 			skipped = append(skipped, rec.FileID)
 		}
+		if failedAtAnnounce {
+			failed = append(failed, rec.FileID)
+		}
 	}
 	if !quickCheck {
 		return nil
 	}
 	// One OpAnnounceAck per OpAnnounce that requested quick-check, always
-	// sent (even with an empty skip list): the client blocks on exactly one
-	// reply per batch, so a batch with nothing to skip still needs one to
-	// unblock it.
-	ackTrailer, err := encodeSkipList(skipped)
+	// sent (even with empty lists): the client blocks on exactly one reply
+	// per batch, so a batch with nothing to report still needs one to
+	// unblock it. The failed list lets the client fail those entries
+	// locally instead of discovering each one via a rejected OpFileOpen --
+	// which costs a killed connection, a redial, and (pipelined engine) a
+	// re-send of that worker's whole in-flight window, per file.
+	ackTrailer, err := encodeAnnounceAck(skipped, failed)
 	if err != nil {
 		return fmt.Errorf("encode announce ack: %w", err)
 	}
@@ -2168,10 +2259,11 @@ func handleBlockData(conn net.Conn, r *bufio.Reader, magicBytes [magicLen]byte, 
 
 	var payload []byte
 	if msg.Flags&FlagCompressed != 0 {
-		decompressed, err := decompressData(raw)
+		decompressed, err := decompressDataInto(sess.plainBuf[:0], raw)
 		if err != nil {
 			return fmt.Errorf("decompress file %d block %d: %w", msg.FileID, msg.BlockIdx, err)
 		}
+		sess.plainBuf = decompressed // keep the (possibly grown) scratch for the next block
 		payload = decompressed
 	} else if IsEncryptionEnabled() {
 		plain, err := decryptBlock(raw)

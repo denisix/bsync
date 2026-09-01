@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -799,6 +800,83 @@ func TestFileTableAnnounceParentExistsAsRegularFile(t *testing.T) {
 	}
 }
 
+// TestFileTableAcquireExplainsAnnounceTimeFailure pins the diagnosability
+// fix: a file whose announce failed environmentally is rejected by Acquire
+// with a reason, not the bare "already finalized" that a genuinely
+// completed transfer produces. Both remain errAlreadyFinalized (so the
+// permanent-rejection flag and every errors.Is check are unchanged) -- the
+// difference is only that the client can now see WHY, which at scale is the
+// difference between "thousands of unexplained rejections" and "one
+// destination directory could not be created".
+func TestFileTableAcquireExplainsAnnounceTimeFailure(t *testing.T) {
+	ft, root := newTestFileTable(t, 1)
+	if err := os.WriteFile(filepath.Join(root, "f"), []byte("x"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	// FileID 1: announce fails (its parent path is a regular file).
+	if err := ft.Announce(AnnounceRec{FileID: 1, Kind: KindFile, Path: "f/x.txt", FileSize: 1}); err != nil {
+		t.Fatal(err)
+	}
+	// FileID 2: announces fine, then completes normally and finalizes. Size
+	// 0 so finalize needs no transferred blocks to succeed -- this file
+	// exists only to produce a genuinely-completed "already finalized".
+	if err := ft.Announce(AnnounceRec{FileID: 2, Kind: KindFile, Path: "ok.txt", FileSize: 0}); err != nil {
+		t.Fatal(err)
+	}
+	if err := ft.MarkDone(2); err != nil {
+		t.Fatal(err)
+	}
+
+	_, _, failedErr := ft.Acquire(1)
+	if failedErr == nil {
+		t.Fatal("Acquire on an announce-failed file unexpectedly succeeded")
+	}
+	if !errors.Is(failedErr, errAlreadyFinalized) {
+		t.Errorf("Acquire error %v does not wrap errAlreadyFinalized -- the permanent-rejection mapping would change", failedErr)
+	}
+	if !strings.Contains(failedErr.Error(), announceFailedReason) {
+		t.Errorf("Acquire error = %q, want it to explain the announce-time failure (%q)", failedErr, announceFailedReason)
+	}
+
+	_, _, doneErr := ft.Acquire(2)
+	if doneErr == nil {
+		t.Fatal("Acquire on a finalized file unexpectedly succeeded")
+	}
+	if !errors.Is(doneErr, errAlreadyFinalized) {
+		t.Errorf("Acquire error %v does not wrap errAlreadyFinalized", doneErr)
+	}
+	if strings.Contains(doneErr.Error(), announceFailedReason) {
+		t.Errorf("Acquire error for a genuinely COMPLETED file = %q, must not claim an announce-time failure", doneErr)
+	}
+}
+
+// TestFileTableAnnounceReportsFailedFlag pins announce's third return value,
+// which is what handleAnnounce puts in the OpAnnounceAck failed-list: true
+// exactly for an environmental announce failure, false for an ordinary
+// entry and for a quick-check skip (which is a success, not a failure).
+func TestFileTableAnnounceReportsFailedFlag(t *testing.T) {
+	ft, root := newTestFileTable(t, 1)
+	if err := os.WriteFile(filepath.Join(root, "blocked"), []byte("x"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, failed, err := ft.announce(AnnounceRec{FileID: 1, Kind: KindFile, Path: "blocked/x.txt", FileSize: 1}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !failed {
+		t.Error("announce of an entry whose parent cannot be created reported failed=false")
+	}
+
+	_, failed, err = ft.announce(AnnounceRec{FileID: 2, Kind: KindFile, Path: "fine.txt", FileSize: 1}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if failed {
+		t.Error("announce of an ordinary entry reported failed=true")
+	}
+}
+
 // TestFileTableAnnounceMkdirFailedDirCascades: a KindDir whose own mkdir
 // fails registers as failed, and its children each fail their own
 // parent-mkdir the same way -- every entry registered, none erroring the
@@ -1120,7 +1198,7 @@ func TestFileTableAnnounceQuickCheckSkipsMatchingFile(t *testing.T) {
 	mtime := time.Unix(1700000000, 0)
 	writeQuickCheckDest(t, root, "f.txt", content, 0644, mtime)
 
-	skip, err := ft.announce(AnnounceRec{
+	skip, _, err := ft.announce(AnnounceRec{
 		FileID: 1, Kind: KindFile, Path: "f.txt",
 		FileSize: uint64(len(content)), Mode: 0644, MTimeSec: mtime.Unix(),
 	}, true)
@@ -1148,7 +1226,7 @@ func TestFileTableAnnounceQuickCheckSkipsWithSubSecondMtimeDifference(t *testing
 	mtime := time.Unix(1700000000, 900000000)
 	writeQuickCheckDest(t, root, "f.txt", content, 0644, mtime)
 
-	skip, err := ft.announce(AnnounceRec{
+	skip, _, err := ft.announce(AnnounceRec{
 		FileID: 1, Kind: KindFile, Path: "f.txt",
 		FileSize: uint64(len(content)), Mode: 0644,
 		MTimeSec: 1700000000, MTimeNs: 100000000, // same second, different ns
@@ -1167,7 +1245,7 @@ func TestFileTableAnnounceQuickCheckDoesNotSkipOnSizeMismatch(t *testing.T) {
 	mtime := time.Unix(1700000000, 0)
 	writeQuickCheckDest(t, root, "f.txt", content, 0644, mtime)
 
-	skip, err := ft.announce(AnnounceRec{
+	skip, _, err := ft.announce(AnnounceRec{
 		FileID: 1, Kind: KindFile, Path: "f.txt",
 		FileSize: uint64(len(content)) + 1, Mode: 0644, MTimeSec: mtime.Unix(),
 	}, true)
@@ -1185,7 +1263,7 @@ func TestFileTableAnnounceQuickCheckDoesNotSkipOnMtimeMismatch(t *testing.T) {
 	mtime := time.Unix(1700000000, 0)
 	writeQuickCheckDest(t, root, "f.txt", content, 0644, mtime)
 
-	skip, err := ft.announce(AnnounceRec{
+	skip, _, err := ft.announce(AnnounceRec{
 		FileID: 1, Kind: KindFile, Path: "f.txt",
 		FileSize: uint64(len(content)), Mode: 0644, MTimeSec: mtime.Unix() + 1,
 	}, true)
@@ -1199,7 +1277,7 @@ func TestFileTableAnnounceQuickCheckDoesNotSkipOnMtimeMismatch(t *testing.T) {
 
 func TestFileTableAnnounceQuickCheckDoesNotSkipMissingDest(t *testing.T) {
 	ft, _ := newTestFileTable(t, 1)
-	skip, err := ft.announce(AnnounceRec{
+	skip, _, err := ft.announce(AnnounceRec{
 		FileID: 1, Kind: KindFile, Path: "f.txt",
 		FileSize: 10, Mode: 0644, MTimeSec: 1700000000,
 	}, true)
@@ -1216,7 +1294,7 @@ func TestFileTableAnnounceQuickCheckDoesNotSkipWhenDestIsDir(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(root, "f.txt"), 0777); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
-	skip, err := ft.announce(AnnounceRec{
+	skip, _, err := ft.announce(AnnounceRec{
 		FileID: 1, Kind: KindFile, Path: "f.txt",
 		FileSize: 0, Mode: 0644, MTimeSec: 1700000000,
 	}, true)
@@ -1237,7 +1315,7 @@ func TestFileTableAnnounceQuickCheckIgnoresZeroByteFiles(t *testing.T) {
 	// from quick-check: zero-byte files already have their own always-skip
 	// mechanism elsewhere (startDirClient's empty-file loop), so this path
 	// must leave them alone rather than double-handle them.
-	skip, err := ft.announce(AnnounceRec{
+	skip, _, err := ft.announce(AnnounceRec{
 		FileID: 1, Kind: KindFile, Path: "f.txt",
 		FileSize: 0, Mode: 0644, MTimeSec: mtime.Unix(),
 	}, true)
@@ -1257,7 +1335,7 @@ func TestFileTableAnnounceQuickCheckOffNeverSkips(t *testing.T) {
 
 	// Same call as the matching-skip test above, but quickCheck=false: must
 	// never skip, and the legacy Announce wrapper must agree.
-	skip, err := ft.announce(AnnounceRec{
+	skip, _, err := ft.announce(AnnounceRec{
 		FileID: 1, Kind: KindFile, Path: "f.txt",
 		FileSize: uint64(len(content)), Mode: 0644, MTimeSec: mtime.Unix(),
 	}, false)
@@ -1293,7 +1371,7 @@ func TestFileTableAnnounceQuickCheckCorrectsPermissions(t *testing.T) {
 	mtime := time.Unix(1700000000, 0)
 	writeQuickCheckDest(t, root, "f.txt", content, 0600, mtime)
 
-	skip, err := ft.announce(AnnounceRec{
+	skip, _, err := ft.announce(AnnounceRec{
 		FileID: 1, Kind: KindFile, Path: "f.txt",
 		FileSize: uint64(len(content)), Mode: 0644, MTimeSec: mtime.Unix(),
 	}, true)
@@ -1464,6 +1542,51 @@ func TestFileTableDeleteExtraneousProtectsSkippedPathAndDoesNotRecurseIntoIt(t *
 		if _, err := os.Stat(filepath.Join(root, rel)); err != nil {
 			t.Errorf("%s was removed or altered: %v", rel, err)
 		}
+	}
+}
+
+// TestFileTableDeleteExtraneousProtectsSkippedFileAtRoot is the single-file
+// counterpart of the directory-placeholder test above: a KindSkipped
+// placeholder for an excluded FILE (not a directory) must protect whatever
+// already occupies that exact destination path, in the same sweep that
+// removes a genuinely stale, unrelated sibling.
+func TestFileTableDeleteExtraneousProtectsSkippedFileAtRoot(t *testing.T) {
+	ft, root := newTestFileTable(t, 1)
+	if err := ft.Announce(AnnounceRec{FileID: 1, Kind: KindFile, Path: "keep.txt", FileSize: 3}); err != nil {
+		t.Fatal(err)
+	}
+	if err := ft.Announce(AnnounceRec{FileID: 2, Kind: KindSkipped, Path: "excluded.log"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "keep.txt"), []byte("abc"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "excluded.log"), []byte("pre-existing, unrelated to source"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "stale.txt"), []byte("stale"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	removed, err := ft.deleteExtraneous()
+	if err != nil {
+		t.Fatalf("deleteExtraneous: %v", err)
+	}
+	if removed != 1 {
+		t.Errorf("removed = %d, want 1 (only stale.txt)", removed)
+	}
+	if _, err := os.Stat(filepath.Join(root, "stale.txt")); !os.IsNotExist(err) {
+		t.Errorf("stale.txt still exists (stat err = %v)", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "keep.txt")); err != nil {
+		t.Errorf("keep.txt was removed: %v", err)
+	}
+	got, err := os.ReadFile(filepath.Join(root, "excluded.log"))
+	if err != nil {
+		t.Fatalf("excluded.log (skipped placeholder) was removed: %v", err)
+	}
+	if string(got) != "pre-existing, unrelated to source" {
+		t.Errorf("excluded.log content changed: %q", got)
 	}
 }
 
@@ -1761,7 +1884,7 @@ func TestFileTableAnnounceQuickCheckIgnoresStaleSymlink(t *testing.T) {
 	}
 
 	// Same size and mtime as the link's target: the quick-check match.
-	skip, err := ft.announce(AnnounceRec{
+	skip, _, err := ft.announce(AnnounceRec{
 		FileID: 1, Kind: KindFile, Path: "f.txt",
 		FileSize: 8, MTimeSec: fi.ModTime().Unix(),
 	}, true)

@@ -115,7 +115,7 @@ func TestDirTransferStateRecordBlockDoneSendsExactlyOneFileDone(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			dt.recordBlockDone(0)
+			dt.recordBlockDone(0, false)
 		}()
 	}
 	wg.Wait()
@@ -130,13 +130,97 @@ func TestDirTransferStateRecordBlockDoneDoesNotFireEarly(t *testing.T) {
 	dt, log := newTestDirTransferState(t, sess)
 
 	done := make(chan struct{})
-	go func() { dt.recordBlockDone(0); close(done) }()
+	go func() { dt.recordBlockDone(0, false); close(done) }()
 	select {
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("recordBlockDone did not return")
 	}
 	assertFileDoneCountStays(t, log, 0, 0)
+}
+
+// --- recordBlockDone: filesChanged latch ---
+
+// TestDirTransferStateRecordBlockDoneLatchesChanged pins the counter this
+// round added: SyncSession.FilesChanged() must count a file exactly once
+// it completes with at least one block reported changed, regardless of
+// which block (first, middle, or last) carried the change and regardless
+// of how many other blocks of the same file were unchanged.
+func TestDirTransferStateRecordBlockDoneLatchesChanged(t *testing.T) {
+	sess := NewSyncSession()
+	sess.AddFile(newTestFileEntry(0, 3))
+	dt, _ := newTestDirTransferState(t, sess)
+
+	dt.recordBlockDone(0, false) // unchanged
+	dt.recordBlockDone(0, true)  // changed -- latches
+	if got := sess.FilesChanged(); got != 0 {
+		t.Fatalf("FilesChanged = %d, want 0 before the file completes", got)
+	}
+	dt.recordBlockDone(0, false) // unchanged, completes the file
+	if got := sess.FilesChanged(); got != 1 {
+		t.Errorf("FilesChanged = %d, want 1 -- one block reported changed", got)
+	}
+	if got := sess.filesDone.Load(); got != 1 {
+		t.Errorf("filesDone = %d, want 1", got)
+	}
+}
+
+// TestDirTransferStateRecordBlockDoneAllUnchangedDoesNotCountAsChanged is
+// the mirror: a file whose every block matched the destination (the
+// ordinary re-sync case) must NOT be counted in FilesChanged, even though
+// it still completes normally and counts in filesDone.
+func TestDirTransferStateRecordBlockDoneAllUnchangedDoesNotCountAsChanged(t *testing.T) {
+	sess := NewSyncSession()
+	sess.AddFile(newTestFileEntry(0, 3))
+	dt, _ := newTestDirTransferState(t, sess)
+
+	dt.recordBlockDone(0, false)
+	dt.recordBlockDone(0, false)
+	dt.recordBlockDone(0, false)
+
+	if got := sess.FilesChanged(); got != 0 {
+		t.Errorf("FilesChanged = %d, want 0 -- every block matched", got)
+	}
+	if got := sess.filesDone.Load(); got != 1 {
+		t.Errorf("filesDone = %d, want 1", got)
+	}
+}
+
+// TestDirTransferStateForceFileDoneCountsChangedFromEarlierBlocks proves
+// the latch survives into forceFileDone's completion path too: a file
+// that sent one real changed block before a mid-file read failure force-
+// completes it must still count toward FilesChanged (real bytes DID
+// reach the destination), not just the never-triggered ordinary path.
+func TestDirTransferStateForceFileDoneCountsChangedFromEarlierBlocks(t *testing.T) {
+	sess := NewSyncSession()
+	sess.AddFile(newTestFileEntry(0, 3))
+	dt, _ := newTestDirTransferState(t, sess)
+
+	dt.recordBlockDone(0, true) // one real change lands before the read fails
+	dt.forceFileDone(0, 1)      // only 1 of 3 blocks was ever emitted
+
+	if got := sess.FilesChanged(); got != 1 {
+		t.Errorf("FilesChanged = %d, want 1 -- a real block change transferred before the forced completion", got)
+	}
+}
+
+// TestMarkFileSkippedDoneDoesNotCountAsChanged pins the other half of the
+// contract: a file quick-check skipped at announce time never reaches
+// recordBlockDone at all, so it must never be counted in FilesChanged --
+// that path exists precisely because its content is known unchanged.
+func TestMarkFileSkippedDoneDoesNotCountAsChanged(t *testing.T) {
+	sess := NewSyncSession()
+	sess.AddFile(newTestFileEntry(0, 3))
+	dt, _ := newTestDirTransferState(t, sess)
+
+	dt.markFileSkippedDone(0)
+
+	if got := sess.FilesChanged(); got != 0 {
+		t.Errorf("FilesChanged = %d, want 0 -- quick-check skip means unchanged", got)
+	}
+	if got := sess.filesDone.Load(); got != 1 {
+		t.Errorf("filesDone = %d, want 1", got)
+	}
 }
 
 // --- runDirTransferWorker's dual-source receive loop ---
@@ -323,7 +407,7 @@ func TestDirTransferStateForceFileDoneWaitsForEmittedBlocksBeforeSending(t *test
 
 	// First of the 2 emitted blocks completes -- still not done (1 of 2).
 	b1 := make(chan struct{})
-	go func() { dt.recordBlockDone(0); close(b1) }()
+	go func() { dt.recordBlockDone(0, false); close(b1) }()
 	select {
 	case <-b1:
 	case <-time.After(2 * time.Second):
@@ -334,7 +418,7 @@ func TestDirTransferStateForceFileDoneWaitsForEmittedBlocksBeforeSending(t *test
 	// Second (last) emitted block completes -- NOW it must fire, exactly
 	// once.
 	b2 := make(chan struct{})
-	go func() { dt.recordBlockDone(0); close(b2) }()
+	go func() { dt.recordBlockDone(0, false); close(b2) }()
 	select {
 	case <-b2:
 	case <-time.After(2 * time.Second):
@@ -374,7 +458,7 @@ func TestDirTransferStateForceFileDoneThenNormalCompletionSendsExactlyOnce(t *te
 	dt, log := newTestDirTransferState(t, sess)
 
 	b1 := make(chan struct{})
-	go func() { dt.recordBlockDone(0); close(b1) }()
+	go func() { dt.recordBlockDone(0, false); close(b1) }()
 	<-b1
 	assertFileDoneCountStays(t, log, 0, 0)
 
@@ -445,7 +529,7 @@ func TestDirTransferStateMarkFileSkippedDoneSharesGuardWithSendFileDone(t *testi
 	sess.AddFile(newTestFileEntry(0, 3))
 	dt, log := newTestDirTransferState(t, sess)
 
-	dt.sendFileDone(0)
+	dt.sendFileDone(0, false)
 	waitForFileDoneCount(t, log, 0, 1, 2*time.Second)
 
 	dt.markFileSkippedDone(0)
@@ -1457,5 +1541,184 @@ func TestBatchRecordsDrainsOnFinalFlushError(t *testing.T) {
 	err := batchRecords(records, &batch, func() int { return 100 }, func() error { return wantErr })
 	if !errors.Is(err, wantErr) {
 		t.Errorf("err = %v, want %v", err, wantErr)
+	}
+}
+
+// --- markFileFailedAtAnnounce (announce-failed files reported via the ack) ---
+
+// TestMarkFileFailedAtAnnounceIsExactlyOnce: the ack path shares claimDone
+// with every other completion path, so a duplicate failed-ID (a retransmit,
+// or an ID present in both the skip and failed lists of a malformed ack)
+// can never double-count a file into filesDone/FailedCount.
+func TestMarkFileFailedAtAnnounceIsExactlyOnce(t *testing.T) {
+	sess := NewSyncSession()
+	sess.AddFile(newTestFileEntry(0, 2))
+	dt, _ := newTestDirTransferState(t, sess)
+
+	dt.markFileFailedAtAnnounce(0)
+	dt.markFileFailedAtAnnounce(0)
+	dt.markFileFailedAtAnnounce(0)
+
+	if got := sess.filesDone.Load(); got != 1 {
+		t.Errorf("filesDone = %d, want 1", got)
+	}
+	if got := sess.FailedCount(); got != 1 {
+		t.Errorf("FailedCount = %d, want 1", got)
+	}
+}
+
+// TestMarkFileFailedAtAnnounceRecordsReason: FailedError must explain the
+// failure, since for these files there is no block-level error to inspect.
+func TestMarkFileFailedAtAnnounceRecordsReason(t *testing.T) {
+	sess := NewSyncSession()
+	sess.AddFile(newTestFileEntry(0, 1))
+	dt, _ := newTestDirTransferState(t, sess)
+
+	dt.markFileFailedAtAnnounce(0)
+
+	err := sess.FailedError(0)
+	if err == nil {
+		t.Fatal("FailedError = nil, want the announce-time failure")
+	}
+	if !strings.Contains(err.Error(), announceFailedReason) {
+		t.Errorf("FailedError = %q, want it to contain %q", err, announceFailedReason)
+	}
+}
+
+// TestMarkFileFailedAtAnnounceSendsNoFileDone: the destination finalized the
+// entry itself at announce time, so an OpFileDone for it would be a frame
+// for a file the server has already retired.
+func TestMarkFileFailedAtAnnounceSendsNoFileDone(t *testing.T) {
+	sess := NewSyncSession()
+	sess.AddFile(newTestFileEntry(0, 1))
+	dt, log := newTestDirTransferState(t, sess)
+
+	dt.markFileFailedAtAnnounce(0)
+
+	assertFileDoneCountStays(t, log, 0, 0)
+}
+
+// TestMarkFileFailedAtAnnounceOnNonFileDoesNotCountAsFailedFile: a
+// directory/symlink whose own creation failed is reported by the
+// destination the same way, but it is not a FILE -- counting it would push
+// FailedCount past the files-only totals the summary is denominated in.
+func TestMarkFileFailedAtAnnounceOnNonFileDoesNotCountAsFailedFile(t *testing.T) {
+	sess := NewSyncSession()
+	fe := newTestFileEntry(0, 1)
+	fe.Kind = KindDir
+	sess.AddFile(fe)
+	dt, _ := newTestDirTransferState(t, sess)
+
+	dt.markFileFailedAtAnnounce(0)
+
+	if got := sess.FailedCount(); got != 0 {
+		t.Errorf("FailedCount = %d, want 0 -- a failed DIRECTORY is not a failed file", got)
+	}
+	if got := sess.filesDone.Load(); got != 0 {
+		t.Errorf("filesDone = %d, want 0 -- a directory never counts toward the files-done total", got)
+	}
+}
+
+// TestMarkFileFailedAtAnnounceDoesNotCountAsChanged: no content ever
+// transferred, so these must not inflate the "N/M file(s) changed" summary.
+func TestMarkFileFailedAtAnnounceDoesNotCountAsChanged(t *testing.T) {
+	sess := NewSyncSession()
+	sess.AddFile(newTestFileEntry(0, 1))
+	dt, _ := newTestDirTransferState(t, sess)
+
+	dt.markFileFailedAtAnnounce(0)
+
+	if got := sess.FilesChanged(); got != 0 {
+		t.Errorf("FilesChanged = %d, want 0", got)
+	}
+}
+
+// TestMarkFileFailedAtAnnounceConcurrent hammers the ack path from many
+// goroutines on the same and different files at once -- the shape the
+// quick-check batcher produces at high worker counts. Under -race this is
+// what would catch an unguarded map/counter in the failed-ID handling.
+func TestMarkFileFailedAtAnnounceConcurrent(t *testing.T) {
+	const files = 64
+	sess := NewSyncSession()
+	for i := 0; i < files; i++ {
+		sess.AddFile(newTestFileEntry(uint32(i), 1))
+	}
+	dt, _ := newTestDirTransferState(t, sess)
+
+	var wg sync.WaitGroup
+	for i := 0; i < files; i++ {
+		for dup := 0; dup < 4; dup++ { // each file claimed by 4 racers
+			wg.Add(1)
+			go func(id uint32) {
+				defer wg.Done()
+				dt.markFileFailedAtAnnounce(id)
+			}(uint32(i))
+		}
+	}
+	wg.Wait()
+
+	if got := sess.FailedCount(); got != files {
+		t.Errorf("FailedCount = %d, want %d -- exactly one failure per file despite concurrent duplicate claims", got, files)
+	}
+	if got := sess.filesDone.Load(); got != files {
+		t.Errorf("filesDone = %d, want %d", got, files)
+	}
+}
+
+// --- skipLogger bounding (shared by walk skips and destination rejections) ---
+
+// TestSkipLoggerBoundsPerReasonAndCountsAll: the property both flood fixes
+// rely on -- the printed tail is capped per distinct reason, but nothing is
+// lost from the totals the summary reports.
+func TestSkipLoggerBoundsPerReasonAndCountsAll(t *testing.T) {
+	l := newSkipLogger()
+	const n = 500
+	for i := 0; i < n; i++ {
+		l.log(fmt.Sprintf("file %d", i), "rejected: some detail that varies per file")
+	}
+	// Different reason key -> its own allowance.
+	l.log("other", "a different reason entirely")
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if got := l.total; got != n+1 {
+		t.Errorf("total = %d, want %d -- every entry must be counted even when not printed", got, n+1)
+	}
+	if got := l.shown["rejected"]; got != maxSkipLinesPerReason {
+		t.Errorf("shown[rejected] = %d, want %d", got, maxSkipLinesPerReason)
+	}
+	if got := l.counts["rejected"]; got != n {
+		t.Errorf("counts[rejected] = %d, want %d", got, n)
+	}
+	if got := len(l.order); got != 2 {
+		t.Errorf("distinct reasons = %d, want 2", got)
+	}
+}
+
+// TestSkipLoggerConcurrent: the rejection logger is written by every
+// transfer worker at once (512 of them in the reported production case).
+func TestSkipLoggerConcurrent(t *testing.T) {
+	l := newSkipLogger()
+	const workers, per = 32, 40
+
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			for i := 0; i < per; i++ {
+				l.log(fmt.Sprintf("file %d-%d", w, i), "rejected: detail")
+			}
+		}(w)
+	}
+	wg.Wait()
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if got := l.total; got != workers*per {
+		t.Errorf("total = %d, want %d", got, workers*per)
+	}
+	if got := l.shown["rejected"]; got > maxSkipLinesPerReason {
+		t.Errorf("shown = %d, want the cap %d to hold under concurrency", got, maxSkipLinesPerReason)
 	}
 }

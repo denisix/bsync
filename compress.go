@@ -42,12 +42,6 @@ var (
 			return enc
 		},
 	}
-	// Buffer pool for compression output (reduces GC pressure)
-	compressOutputPool = sync.Pool{
-		New: func() interface{} {
-			return make([]byte, 0, 10*1024*1024)
-		},
-	}
 	decoderPool = sync.Pool{
 		New: func() interface{} {
 			dec, err := zstd.NewReader(nil,
@@ -165,15 +159,12 @@ func compressData(data []byte) ([]byte, error) {
 	encoder := encoderPool.Get().(*zstd.Encoder)
 	defer encoderPool.Put(encoder)
 
-	// Get buffer from pool to reduce allocations
-	buf := compressOutputPool.Get().([]byte)
-	buf = buf[:cap(buf)] // Use full capacity
-	result := encoder.EncodeAll(data, buf[:0])
-
-	// Copy result since we need to return the buffer to pool
-	output := make([]byte, len(result))
-	copy(output, result)
-	compressOutputPool.Put(buf[:0])
+	// One allocation, sized by zstd itself, owned by the caller. This used
+	// to encode into a pooled 10 MiB scratch and then COPY the result out
+	// so the scratch could go back to the pool -- a full extra copy per
+	// compressed block, and 10 MiB pool objects for what are typically
+	// 64 KiB tree blocks. decompressData already works this way.
+	output := encoder.EncodeAll(data, nil)
 
 	// Encrypt after compression if enabled
 	if IsEncryptionEnabled() {
@@ -184,6 +175,19 @@ func compressData(data []byte) ([]byte, error) {
 }
 
 func decompressData(data []byte) ([]byte, error) {
+	return decompressDataInto(nil, data)
+}
+
+// decompressDataInto is decompressData with a caller-supplied destination:
+// the plaintext is appended to dst (usually dst[:0] of a reused scratch),
+// so a caller that processes blocks strictly one at a time -- the directory
+// server's per-connection session, where SubmitAndWaitFile blocks until the
+// bytes are on disk -- can amortize the destination allocation across all
+// its blocks. The returned slice may or may not alias dst (DecodeAll grows
+// it as needed); callers reusing a scratch must store the result back.
+// Passing nil dst gives the old behavior: one allocation sized by the
+// frame's real content size.
+func decompressDataInto(dst, data []byte) ([]byte, error) {
 	// Decrypt before decompression if enabled
 	if IsEncryptionEnabled() {
 		decrypted, err := decryptBlock(data)
@@ -196,15 +200,7 @@ func decompressData(data []byte) ([]byte, error) {
 	decoder := decoderPool.Get().(*zstd.Decoder)
 	defer decoderPool.Put(decoder)
 
-	// No pooled destination buffer: DecodeAll's result is handed straight to
-	// the caller and never returned here (it goes on to be written to disk),
-	// so a pool backing it would need every caller to give the buffer back
-	// once it's done -- and nothing did. That made decompressBufPool
-	// permanently empty in practice (its Put only ran on the error path
-	// below), so every call already paid for a fresh 10 MiB allocation
-	// regardless of the actual block size. Passing nil lets DecodeAll size
-	// the allocation to the frame's real content size instead.
-	decompressed, err := decoder.DecodeAll(data, nil)
+	decompressed, err := decoder.DecodeAll(data, dst)
 	if err != nil {
 		return nil, err
 	}

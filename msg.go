@@ -519,21 +519,73 @@ func encodeSkipList(ids []uint32) ([]byte, error) {
 
 // decodeSkipList is encodeSkipList's inverse, with the same
 // never-trust-the-claimed-count-before-validating posture as
-// decodeAnnounceBatch.
+// decodeAnnounceBatch. It reads only the FIRST section, so it is also the
+// skip-list half of decodeAnnounceAck.
 func decodeSkipList(b []byte) ([]uint32, error) {
+	ids, _, err := readIDSection(b, "skip list")
+	return ids, err
+}
+
+// readIDSection decodes one [uint32 count][count x uint32 id] section from
+// the head of b and returns the ids plus the remaining bytes.
+func readIDSection(b []byte, what string) (ids []uint32, rest []byte, err error) {
 	buf := bytes.NewReader(b)
 	var count uint32
 	if err := binary.Read(buf, binary.LittleEndian, &count); err != nil {
-		return nil, fmt.Errorf("decode skip-list count: %w", err)
+		return nil, nil, fmt.Errorf("decode %s count: %w", what, err)
 	}
 	if count > skipListMaxRecs {
-		return nil, fmt.Errorf("skip list claims %d entries, exceeds sanity limit %d", count, skipListMaxRecs)
+		return nil, nil, fmt.Errorf("%s claims %d entries, exceeds sanity limit %d", what, count, skipListMaxRecs)
 	}
-	ids := make([]uint32, count)
+	ids = make([]uint32, count)
 	for i := range ids {
 		if err := binary.Read(buf, binary.LittleEndian, &ids[i]); err != nil {
-			return nil, fmt.Errorf("decode skip-list entry %d: %w", i, err)
+			return nil, nil, fmt.Errorf("decode %s entry %d: %w", what, i, err)
 		}
 	}
-	return ids, nil
+	return ids, b[len(b)-buf.Len():], nil
+}
+
+// encodeAnnounceAck serializes the full OpAnnounceAck trailer: the
+// quick-check skip list, then the list of entries whose announce FAILED
+// environmentally on the destination. Two independent sections rather than
+// one tagged list because they mean opposite things -- a skipped file is
+// already correct at the destination, a failed one will never exist there.
+func encodeAnnounceAck(skipped, failed []uint32) ([]byte, error) {
+	head, err := encodeSkipList(skipped)
+	if err != nil {
+		return nil, err
+	}
+	// Omit the second section entirely when empty: the overwhelmingly
+	// common case is zero announce failures, and decodeAnnounceAck treats a
+	// missing section as empty, so the ordinary ack stays exactly the
+	// bytes it has always been.
+	if len(failed) == 0 {
+		return head, nil
+	}
+	tail, err := encodeSkipList(failed)
+	if err != nil {
+		return nil, fmt.Errorf("encode announce-failed list: %w", err)
+	}
+	return append(head, tail...), nil
+}
+
+// decodeAnnounceAck is encodeAnnounceAck's inverse. A trailer carrying only
+// the skip-list section (nothing failed) decodes with an empty failed list.
+func decodeAnnounceAck(b []byte) (skipped, failed []uint32, err error) {
+	skipped, rest, err := readIDSection(b, "skip list")
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(rest) == 0 {
+		return skipped, nil, nil
+	}
+	failed, rest, err = readIDSection(rest, "announce-failed list")
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(rest) != 0 {
+		return nil, nil, fmt.Errorf("announce ack has %d trailing byte(s)", len(rest))
+	}
+	return skipped, failed, nil
 }
