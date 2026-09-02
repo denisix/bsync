@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -4036,4 +4037,181 @@ func TestE2EDirAllFilesFailAtAnnounceStillCompletes(t *testing.T) {
 	case <-time.After(30 * time.Second):
 		t.Fatal("transfer hung when every file failed at announce time")
 	}
+}
+
+// withInjectedOpenErr makes the destination server's file opens fail with
+// err for any path containing marker, for the duration of fn. This is the
+// only way to exercise ENOSPC/EROFS handling in a test: they cannot be
+// produced without root or a dedicated filesystem, and a read-only
+// directory yields EACCES, which is deliberately classified differently.
+func withInjectedOpenErr(t *testing.T, marker string, err error, fn func()) {
+	t.Helper()
+	restore := openDestFile
+	t.Cleanup(func() { openDestFile = restore })
+	openDestFile = func(name string, flag int, perm os.FileMode) (*os.File, error) {
+		if strings.Contains(name, marker) {
+			return nil, &os.PathError{Op: "open", Path: name, Err: err}
+		}
+		return restore(name, flag, perm)
+	}
+	fn()
+	openDestFile = restore
+}
+
+// TestE2EDirOutOfSpaceFailsFilesWithoutRetryStorm is the regression for the
+// production report: on a destination that cannot accept writes (out of
+// space, over quota, read-only mount), every affected file used to be
+// treated as a TRANSIENT network fault -- three connection kills, three
+// redials and seconds of backoff each, plus unbounded logging on both
+// sides, multiplied by every file in the tree and by the worker count.
+//
+// Now such a file must fail on its FIRST refused open: no retries, no
+// redials, bounded logging, the rest of the tree still synced, the
+// destination left untouched, and the run terminating promptly.
+func TestE2EDirOutOfSpaceFailsFilesWithoutRetryStorm(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"enospc", syscall.ENOSPC},
+		{"edquot", syscall.EDQUOT},
+		{"erofs", syscall.EROFS},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			// Enough doomed files that bounded logging is distinguishable
+			// from unbounded: at maxSkipLinesPerReason=10, a bound holds
+			// the line count near ~12 while no bound would give ~40.
+			const doomed, fine = 40, 6
+			src := t.TempDir()
+			mustMkdirAll(t, filepath.Join(src, "full"))
+			mustMkdirAll(t, filepath.Join(src, "ok"))
+			for i := 0; i < doomed; i++ {
+				mustWriteFile(t, filepath.Join(src, "full", fmt.Sprintf("d%02d.bin", i)), string(randomBytes(900, int64(i))))
+			}
+			for i := 0; i < fine; i++ {
+				mustWriteFile(t, filepath.Join(src, "ok", fmt.Sprintf("g%02d.bin", i)), string(randomBytes(900, int64(100+i))))
+			}
+			dst := t.TempDir()
+
+			var sess *SyncSession
+			start := time.Now()
+			out := captureLog(t, func() {
+				withInjectedOpenErr(t, filepath.Join("full", "d"), tc.err, func() {
+					sess = startDirClientExpectFailures(t, src, dst, 4, true)
+				})
+			})
+			elapsed := time.Since(start)
+
+			if got := sess.FailedCount(); got != doomed {
+				t.Errorf("FailedCount = %d, want %d", got, doomed)
+			}
+			// The heart of it: not one retry, so not one redial.
+			if n := strings.Count(out, "failed after"); n != 0 {
+				t.Errorf("%d block(s) burned their retry budget on an unwritable destination; "+
+					"such a failure must be permanent on the first refused open.\nLog:\n%s", n, out)
+			}
+			if n := strings.Count(out, "transfer window aborted"); n != 0 {
+				t.Errorf("%d window abort(s) on an unwritable destination, want 0.\nLog:\n%s", n, out)
+			}
+			// The old path slept ~6s per failed file; this must not.
+			if elapsed > 20*time.Second {
+				t.Errorf("transfer took %v for %d doomed files -- retry backoff appears to still be in play", elapsed, doomed)
+			}
+			// Logging bounded on both sides: the count must not scale with
+			// the number of failed files. The few lines past the cap are
+			// the "further ... will be counted" notice and the end-of-run
+			// summary, both of which name the reason.
+			if n := strings.Count(out, "connection error"); n > maxSkipLinesPerReason+3 {
+				t.Errorf("server logged %d connection-error lines for %d failed files; bounded logging "+
+					"should hold this near %d regardless of file count.\nLog:\n%s",
+					n, doomed, maxSkipLinesPerReason, out)
+			}
+			// The unaffected subtree still synced, byte for byte.
+			assertTreesEqual(t, filepath.Join(src, "ok"), filepath.Join(dst, "ok"))
+			if got := sess.FilesChanged(); got != fine {
+				t.Errorf("FilesChanged = %d, want %d (only the writable subtree)", got, fine)
+			}
+			// Nothing was left behind for the doomed files.
+			for i := 0; i < doomed; i++ {
+				p := filepath.Join(dst, "full", fmt.Sprintf("d%02d.bin", i))
+				if fi, err := os.Stat(p); err == nil && fi.Size() > 0 {
+					t.Errorf("%s exists with %d bytes; a file that never transferred must not be created", p, fi.Size())
+				}
+			}
+		})
+	}
+}
+
+// TestE2EDirOutOfSpaceUnderManyWorkers is the same condition at the worker
+// count that made it pathological in production: every worker must fail its
+// files cheaply and the run must still converge, with each file accounted
+// exactly once despite heavy concurrency.
+func TestE2EDirOutOfSpaceUnderManyWorkers(t *testing.T) {
+	const doomed, fine = 40, 10
+	src := t.TempDir()
+	mustMkdirAll(t, filepath.Join(src, "full"))
+	mustMkdirAll(t, filepath.Join(src, "ok"))
+	for i := 0; i < doomed; i++ {
+		mustWriteFile(t, filepath.Join(src, "full", fmt.Sprintf("d%02d.bin", i)), string(randomBytes(700, int64(i))))
+	}
+	for i := 0; i < fine; i++ {
+		mustWriteFile(t, filepath.Join(src, "ok", fmt.Sprintf("g%02d.bin", i)), string(randomBytes(700, int64(200+i))))
+	}
+	dst := t.TempDir()
+
+	done := make(chan *SyncSession, 1)
+	withInjectedOpenErr(t, filepath.Join("full", "d"), syscall.ENOSPC, func() {
+		go func() { done <- startDirClientExpectFailures(t, src, dst, 32, true) }()
+		select {
+		case sess := <-done:
+			if got := sess.FailedCount(); got != doomed {
+				t.Errorf("FailedCount = %d, want %d -- exactly once per file under 32 workers", got, doomed)
+			}
+			if got := sess.FilesChanged(); got != fine {
+				t.Errorf("FilesChanged = %d, want %d", got, fine)
+			}
+			assertTreesEqual(t, filepath.Join(src, "ok"), filepath.Join(dst, "ok"))
+		case <-time.After(60 * time.Second):
+			t.Fatal("transfer hung on an unwritable destination with many workers")
+		}
+	})
+}
+
+// TestE2EDirTooManyOpenFilesStaysRetryable is the counterpart: fd
+// exhaustion is NOT permanent. It frees itself as connections close, so a
+// file that hits EMFILE once must still be retried and must ultimately
+// succeed -- classifying it permanent would fail files a retry would have
+// saved.
+func TestE2EDirTooManyOpenFilesStaysRetryable(t *testing.T) {
+	src := t.TempDir()
+	mustWriteFile(t, filepath.Join(src, "flaky.bin"), string(randomBytes(1500, 31)))
+	mustWriteFile(t, filepath.Join(src, "steady.bin"), string(randomBytes(1500, 32)))
+	dst := t.TempDir()
+
+	// Fail the first open of flaky.bin only; every later attempt succeeds.
+	restore := openDestFile
+	t.Cleanup(func() { openDestFile = restore })
+	var mu sync.Mutex
+	failsLeft := 1
+	openDestFile = func(name string, flag int, perm os.FileMode) (*os.File, error) {
+		if strings.Contains(name, "flaky.bin") {
+			mu.Lock()
+			if failsLeft > 0 {
+				failsLeft--
+				mu.Unlock()
+				return nil, &os.PathError{Op: "open", Path: name, Err: syscall.EMFILE}
+			}
+			mu.Unlock()
+		}
+		return restore(name, flag, perm)
+	}
+
+	sess := startDirClientAgainst(t, src, dst, 2, false, nil, false, false, false)
+	openDestFile = restore
+
+	if got := sess.FailedCount(); got != 0 {
+		t.Errorf("FailedCount = %d, want 0 -- EMFILE must be retried, not treated as permanent", got)
+	}
+	assertTreesEqual(t, src, dst)
 }

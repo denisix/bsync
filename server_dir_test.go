@@ -9,6 +9,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -2476,5 +2477,121 @@ func TestDeleteExtraneousAfterFreeAnnounceScratchFailsCleanly(t *testing.T) {
 	}
 	if _, statErr := os.Stat(filepath.Join(root, "keep.txt")); statErr != nil {
 		t.Errorf("keep.txt was removed despite deleteExtraneous returning an error: %v", statErr)
+	}
+}
+
+// --- permanent destination-error classification / fd budget ---
+
+// TestIsPermanentDestErr pins which open failures are worth retrying. The
+// distinction is not cosmetic: a permanent one costs a single refused open,
+// while a retryable one costs three connection kills, three redials and
+// seconds of backoff -- per file, across the whole tree.
+func TestIsPermanentDestErr(t *testing.T) {
+	permanent := []error{
+		syscall.ENOSPC,
+		syscall.EDQUOT,
+		syscall.EROFS,
+		fmt.Errorf("open /data/x: %w", syscall.ENOSPC),                  // wrapped, as Acquire returns it
+		&os.PathError{Op: "open", Path: "/data/x", Err: syscall.ENOSPC}, // as os.OpenFile returns it
+	}
+	for _, err := range permanent {
+		if !isPermanentDestErr(err) {
+			t.Errorf("isPermanentDestErr(%v) = false, want true -- retrying cannot fix this", err)
+		}
+	}
+
+	retryable := []error{
+		nil,
+		syscall.EMFILE, // fd exhaustion frees itself; must stay retryable
+		syscall.ENFILE,
+		syscall.EACCES,
+		syscall.EPERM,
+		syscall.EIO,
+		errors.New("some transient network problem"),
+		fmt.Errorf("open /data/x: %w", syscall.EMFILE),
+	}
+	for _, err := range retryable {
+		if isPermanentDestErr(err) {
+			t.Errorf("isPermanentDestErr(%v) = true, want false -- this must stay retryable", err)
+		}
+	}
+}
+
+// TestResolveOpenBudget covers the descriptor-limit clamp: the budget must
+// stay inside RLIMIT_NOFILE once the per-worker sockets and the fixed
+// reserve are accounted, never drop below the floor, and be left alone when
+// no limit is discoverable (Windows) or when it comfortably fits.
+func TestResolveOpenBudget(t *testing.T) {
+	tests := []struct {
+		name        string
+		workers     int
+		limit       uint64
+		haveLimit   bool
+		wantBudget  int
+		wantClamped bool
+	}{
+		{name: "no limit available keeps worker sizing", workers: 512, haveLimit: false, wantBudget: 2048},
+		{name: "generous limit is not clamped", workers: 16, limit: 65536, haveLimit: true, wantBudget: 64},
+		{name: "small worker count keeps the floor", workers: 1, limit: 65536, haveLimit: true, wantBudget: 64},
+		{
+			// The reported case: 512 workers want 2048 destination fds, but
+			// the default 1024 limit must also cover 512 sockets + reserve.
+			name: "high workers clamped to the limit", workers: 512, limit: 1024, haveLimit: true,
+			wantBudget: 1024 - 512 - fdReserve, wantClamped: true,
+		},
+		{
+			name: "limit below overhead falls back to the floor", workers: 512, limit: 256, haveLimit: true,
+			wantBudget: 64, wantClamped: true,
+		},
+		{
+			// Exactly fits: 68 + 400 sockets + reserve == 500.
+			name: "clamp uses every descriptor available", workers: 400, limit: 500, haveLimit: true,
+			wantBudget: 68, wantClamped: true,
+		},
+		{
+			// Overhead leaves less than the floor; the floor wins, and the
+			// operator's warning (plus any resulting EMFILE) is the signal.
+			name: "clamp never goes under the floor", workers: 440, limit: 500, haveLimit: true,
+			wantBudget: 64, wantClamped: true,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			budget, clamped := resolveOpenBudget(tc.workers, tc.limit, tc.haveLimit)
+			if budget != tc.wantBudget {
+				t.Errorf("budget = %d, want %d", budget, tc.wantBudget)
+			}
+			if clamped != tc.wantClamped {
+				t.Errorf("clamped = %v, want %v", clamped, tc.wantClamped)
+			}
+			if budget < 64 {
+				t.Errorf("budget = %d, must never drop below the floor of 64", budget)
+			}
+			// The whole point: the budget plus this run's other descriptors
+			// must fit inside the limit whenever one is known -- except
+			// when the floor had to win, which is a deliberate overshoot on
+			// a pathologically small limit.
+			if tc.haveLimit && budget > 64 && tc.limit > uint64(tc.workers)+fdReserve {
+				if total := uint64(budget) + uint64(tc.workers) + fdReserve; total > tc.limit {
+					t.Errorf("budget %d + %d sockets + %d reserve = %d exceeds RLIMIT_NOFILE %d",
+						budget, tc.workers, fdReserve, total, tc.limit)
+				}
+			}
+		})
+	}
+}
+
+// TestResolveOpenBudgetMatchesLegacySizingWhenUnconstrained: the clamp must
+// not change behavior for the ordinary worker counts the docs recommend.
+func TestResolveOpenBudgetMatchesLegacySizingWhenUnconstrained(t *testing.T) {
+	for _, workers := range []int{1, 2, 4, 8, 16, 32, 64} {
+		want := workers * 4
+		if want < 64 {
+			want = 64
+		}
+		got, clamped := resolveOpenBudget(workers, 1<<20, true)
+		if got != want || clamped {
+			t.Errorf("workers=%d: budget=%d clamped=%v, want %d and no clamping", workers, got, clamped, want)
+		}
 	}
 }

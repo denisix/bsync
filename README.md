@@ -80,6 +80,7 @@ Upload mode (default): server receives, client sends. `-d` reverses it: server r
 - **`-specials`** (rsync `--specials`): recreates FIFOs/sockets via `mkfifo`/`mknod` at announce time (no block traffic, no root needed); leaves a correct-type node alone, replaces a wrong-type one. Device nodes are never synced.
 - **Path safety**: traversal, absolute/UNC/drive-prefixed paths, NUL bytes, backslashes are always refused. Windows-only-invalid names (reserved device names, trailing dot/space) are refused only when the **destination** is Windows — an ordinary Linux file like `example.net.` fails cleanly for that one entry rather than being silently dropped.
 - **Skip logging**: a bounded tail per distinct reason, then one aggregated line (`skipped 4213 path(s): 4198 unsupported file type, 15 excluded`).
+- **Unwritable destination**: out of space, over quota, or a read-only mount fails the affected file on its first refused open — no retries, no reconnects — while the rest of the tree continues. Such files are left untouched at the destination rather than created empty or truncated. Transient conditions (a momentarily exhausted file-descriptor table) are still retried normally.
 - **Destination-side failures**: if the destination can't create a path (a file where a directory must go, permissions, no space), that entry and everything under it fail there. The destination reports them in its announce reply, so the client fails them locally without attempting a transfer — no per-file connection churn — and logs a bounded tail plus one summary (`N path(s) rejected by the destination: ...`). `FailedError(id)` and the log carry the reason; the destination's own `skipping this entry` lines name the exact cause. Affected files are left untouched at the destination rather than created empty.
 - **Completion summary**: logs `N/M file(s) changed` alongside bytes scanned/sent — how many regular files actually differed and transferred, distinct from how many were scanned or how many bytes moved (a few large changed files and thousands of small ones can move the same byte total). A quick-check-skipped file and a file whose every block matched via checksum both count as unchanged.
 
@@ -172,6 +173,7 @@ make test-remote REMOTE=user@host   # live SSH transfer test, needs non-interact
 - HDD destination: higher is safe — writes are reordered into a near-sequential stream
 - SSD/NVMe: `4`-`8` — parallel I/O helps
 - Multiple devices: match worker count to device count
+- Large directory trees: `16`-`64` is the practical ceiling. Past that, workers stop buying throughput (the disk and the link are the bottleneck, not connection count) and start costing real resources: each one holds a socket on both sides with its own TCP buffers, and the destination allows up to 4 concurrently open files per worker. A server needs roughly `workers × 5 + 32` file descriptors — `-w 512` wants ~2600 against a typical `ulimit -n` of 1024. bsync clamps its own open-file budget to fit `RLIMIT_NOFILE` and warns when `-w` is above what the system can support, but it never overrides your `-w`; raise the limit with `ulimit -n` or lower `-w`.
 
 ### Compression (`-L`)
 

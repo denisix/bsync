@@ -615,14 +615,24 @@ type dirTransferState struct {
 	// the run.
 }
 
-// logReject records one server-side file-open rejection, bounded per
-// distinct reason (see skipLogger). Safe on a state with no logger.
+// logReject records one server-side rejection or per-file failure, bounded
+// per distinct reason (see skipLogger). Safe on a state with no logger.
 func (dt *dirTransferState) logReject(fileID uint32, reason string) {
 	if dt.rejects == nil {
 		Log("file %d: %s\n", fileID, reason)
 		return
 	}
 	dt.rejects.log(fmt.Sprintf("file %d", fileID), reason)
+}
+
+// logRejectReason is logReject for a message that names no single file
+// (a whole-window event), bounded by the same per-reason budget.
+func (dt *dirTransferState) logRejectReason(reason string) {
+	if dt.rejects == nil {
+		Log("%s\n", reason)
+		return
+	}
+	dt.rejects.log("", reason)
 }
 
 // dirErrorMaxText mirrors the server's own cap on OpError payload length

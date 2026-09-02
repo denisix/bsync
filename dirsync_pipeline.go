@@ -218,7 +218,11 @@ func (w *pipeWorker) abortWindow(err error, extra *dirExpect, extraFirst, charge
 			p.retries++
 		}
 		if p.retries >= maxRetries {
-			Log("file %d block %d: failed after %d retries: %v\n", p.pb.FileID, p.pb.BlockIdx, maxRetries, err)
+			// Bounded: a systemic destination or link fault exhausts the
+			// retry budget of every block in the tree, and one line each
+			// buries the reason. The reason text leads the message so the
+			// bounded logger buckets by CAUSE rather than by file.
+			w.dt.logReject(p.pb.FileID, fmt.Sprintf("failed after %d retries: %v", maxRetries, err))
 			w.dt.sess.failFile(p.pb.FileID, fmt.Errorf("block %d: %w", p.pb.BlockIdx, err))
 			w.resolveFailed(p.pb)
 			continue
@@ -229,7 +233,8 @@ func (w *pipeWorker) abortWindow(err error, extra *dirExpect, extraFirst, charge
 
 	if chargeRetry {
 		w.failStreak++
-		Log("transfer window aborted (%d block(s) requeued): %v\n", requeued, err)
+		// Also bounded (see above): one abort per failed file at scale.
+		w.dt.logRejectReason(fmt.Sprintf("transfer window aborted (%d block(s) requeued): %v", requeued, err))
 		// Same backoff shape as withRetry: 0s before the 2nd attempt's
 		// dial has already been paid once here as 1s, growing linearly,
 		// capped so a long outage doesn't sleep unboundedly.

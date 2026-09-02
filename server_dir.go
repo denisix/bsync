@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -154,6 +155,45 @@ func (ft *fileTable) markVerifiedDir(cleanRel string) {
 // the pipeline legitimately produces transiently when a worker's open
 // races ahead of a still-buffering announce batch), which stays retryable.
 var errAlreadyFinalized = errors.New("already finalized")
+
+// isPermanentDestErr reports whether an error from opening/creating a
+// destination file is one that retrying cannot possibly fix, so the client
+// should fail that file immediately instead of redialing.
+//
+// This exists because a full destination disk is not a rare event on a
+// large backup, and treating it as a transient network fault is
+// catastrophically expensive at scale: every affected file cost three
+// connection kills, three redials and several seconds of retry backoff
+// before failing anyway, multiplied by every file in the tree and by the
+// worker count. withRetry's own doc comment names exactly this scenario as
+// the reason errPermanent exists; these errnos simply were never mapped
+// onto it.
+//
+// Deliberately NOT listed:
+//
+//   - EMFILE/ENFILE (fd exhaustion): self-inflicted and genuinely
+//     transient -- closing a connection frees a descriptor, so a retry can
+//     legitimately succeed. Keeping it retryable is correct; the real fix
+//     for it is the open-file budget clamp in newFileTable.
+//   - EACCES/EPERM: may be specific to one path rather than the whole
+//     destination, and a systemic permission problem already surfaces at
+//     announce time (see announce's mkdir handling), which is the cheap
+//     path already.
+//
+// openDestFile is os.OpenFile, indirected solely so tests can inject the
+// environmental open failures this code must classify correctly -- ENOSPC,
+// EDQUOT and EROFS cannot be produced from a unit test without root or a
+// dedicated filesystem. Production code never reassigns it.
+var openDestFile = os.OpenFile
+
+func isPermanentDestErr(err error) bool {
+	// ENOSPC: no space. EDQUOT: over quota (the same condition on a
+	// quota'd filesystem). EROFS: mounted read-only, often how a failing
+	// disk presents itself mid-run.
+	return errors.Is(err, syscall.ENOSPC) ||
+		errors.Is(err, syscall.EDQUOT) ||
+		errors.Is(err, syscall.EROFS)
+}
 
 // destFile is one destination-side file or directory known to a fileTable,
 // keyed by FileID.
@@ -405,10 +445,59 @@ type fileTable struct {
 // per fileTable; see announceErrShown.
 const maxAnnounceErrLines = 10
 
+// fdReserve is how many descriptors the open-file budget leaves for
+// everything on the server that is NOT a destination file: the listener,
+// the control connection, finalize's deliberately-unbudgeted transient
+// opens, and headroom for the runtime itself. Worker sockets are accounted
+// separately (one per worker), since they scale with -w.
+const fdReserve = 32
+
+// resolveOpenBudget sizes the concurrent-open-files budget from the worker
+// count, then clamps it to what RLIMIT_NOFILE can actually support.
+//
+// Without the clamp a high -w silently asks for more descriptors than the
+// process may hold: the budget alone is workers*4, and each worker also
+// holds a socket, so -w 512 wants ~2560 descriptors against a default soft
+// limit of 1024. The budget is what throttles concurrent opens, so an
+// oversized one does not fail cleanly -- it lets the server keep opening
+// until every open returns EMFILE, which is retryable and so turns into a
+// redial storm that flaps at the descriptor ceiling instead of applying
+// backpressure. Clamping makes the budget the backpressure it was meant to
+// be. Pure and total, so it is directly unit-testable.
+func resolveOpenBudget(workers int, limit uint64, haveLimit bool) (budget int, clamped bool) {
+	budget = workers * 4
+	if budget < 64 {
+		budget = 64
+	}
+	if !haveLimit {
+		return budget, false
+	}
+	// Everything the server needs beyond destination files: one socket per
+	// worker, plus the fixed reserve.
+	overhead := uint64(workers) + fdReserve
+	if limit <= overhead {
+		// Pathologically low limit: keep the floor and let the operator's
+		// warning (and any resulting EMFILE) speak for itself rather than
+		// computing a nonsensical or negative budget.
+		return 64, true
+	}
+	if allowed := limit - overhead; uint64(budget) > allowed {
+		if allowed < 64 {
+			allowed = 64
+		}
+		return int(allowed), true
+	}
+	return budget, false
+}
+
 func newFileTable(root string, workers int, ow *OrderedWriter) *fileTable {
-	openBudget := workers * 4
-	if openBudget < 64 {
-		openBudget = 64
+	limit, haveLimit := maxOpenFiles()
+	openBudget, clamped := resolveOpenBudget(workers, limit, haveLimit)
+	if clamped {
+		Log("directory server: %d workers would need more open files than this process may hold "+
+			"(RLIMIT_NOFILE=%d); limiting concurrent destination files to %d. "+
+			"Raise it with `ulimit -n` or lower -w if the transfer is slow.\n",
+			workers, limit, openBudget)
 	}
 	ft := &fileTable{
 		root:         root,
@@ -1106,7 +1195,7 @@ func (ft *fileTable) Acquire(id uint32) (df *destFile, created bool, err error) 
 		// 0666&^umask, not df.mode: the final permission (which may be
 		// read-only) is applied at finalize, after every write; creating
 		// with it up front could lock the transfer out of its own file.
-		f, openErr := os.OpenFile(abs, os.O_RDWR|os.O_CREATE|openNoFollow, 0666)
+		f, openErr := openDestFile(abs, os.O_RDWR|os.O_CREATE|openNoFollow, 0666)
 		if openErr != nil {
 			if tookBudget {
 				ft.releaseBudget()
@@ -1615,6 +1704,16 @@ type dirServerState struct {
 	// (thousands, at -w 512), burying the announce-time lines that say
 	// why. Every other connection error is still logged individually.
 	rejectLog *skipLogger
+
+	// connErrLog and finalizeErrLog bound the other two per-file server
+	// logs for the same reason: a systemic destination fault (ENOSPC, fd
+	// exhaustion, a read-only mount) makes every file in the tree produce
+	// one of each, so unbounded they are a flood that hides the handful of
+	// lines naming the actual cause. Both keep the first
+	// maxSkipLinesPerReason lines per distinct reason verbatim and report
+	// the rest as counts in the end-of-run summary.
+	connErrLog     *skipLogger
+	finalizeErrLog *skipLogger
 }
 
 // startDirServer listens on bindIp:port and serves as the destination for a
@@ -1645,7 +1744,12 @@ func startDirServer(root, bindIp, port string, workers int, quiet bool) error {
 	// poison every other file's writes (see writeOne's perItemErr comment).
 	ow.EnablePerItemErrors()
 	defer ow.Close()
-	st := &dirServerState{ft: newFileTable(root, workers, ow), rejectLog: newRejectLogger()}
+	st := &dirServerState{
+		ft:             newFileTable(root, workers, ow),
+		rejectLog:      newRejectLogger(),
+		connErrLog:     newRejectLogger(),
+		finalizeErrLog: newRejectLogger(),
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -1749,7 +1853,15 @@ func startDirServer(root, bindIp, port string, workers int, quiet bool) error {
 					// serving every other connection. Only listener.Accept
 					// failing (below) is treated as fatal to the server as
 					// a whole.
-					Log("directory server: connection error: %v\n", handlerErr)
+					// Bounded, for the same reason the finalized case above
+					// is: a systemic destination fault (out of space, fd
+					// exhaustion) fails every file in the tree, and this
+					// used to be one synchronous terminal write per
+					// affected file -- millions of them, burying the first
+					// few lines that actually name the path and errno.
+					// Those first lines are still printed verbatim; the
+					// rest are counted into the end-of-run summary.
+					st.connErrLog.log("", "connection error: "+handlerErr.Error())
 				}
 			}(conn)
 
@@ -1779,6 +1891,8 @@ func startDirServer(root, bindIp, port string, workers int, quiet bool) error {
 			// connection's handler goroutine to finish closing out, then
 			// exit cleanly.
 			st.rejectLog.summaryOf("refused by this server")
+			st.connErrLog.summaryOf("ended in a connection error")
+			st.finalizeErrLog.summaryOf("failed to finalize")
 			if ferr := st.ft.FirstFinalizeErr(); ferr != nil {
 				return ferr
 			}
@@ -1937,15 +2051,19 @@ func dirHandleConn(conn net.Conn, st *dirServerState, doneChan chan struct{}) er
 			}
 			df, created, err := st.ft.Acquire(msg.FileID)
 			if err != nil {
-				// FlagErrPermanent only for the finalized case: that state
-				// can never change, so the client should fail the file
-				// immediately. Every other rejection -- above all "never
-				// announced", which the pipeline produces TRANSIENTLY when a
-				// worker's open races ahead of a still-buffering announce
-				// batch -- must stay retryable, or that ordinary race turns
-				// into a spurious permanent file failure.
+				// FlagErrPermanent for the two states retrying cannot
+				// change: the file is already finalized, or the destination
+				// itself cannot accept it (out of space, over quota, read
+				// only -- see isPermanentDestErr). The client fails such a
+				// file immediately, at the cost of one refused open.
+				// Every other rejection -- above all "never announced",
+				// which the pipeline produces TRANSIENTLY when a worker's
+				// open races ahead of a still-buffering announce batch, and
+				// fd exhaustion, which frees itself -- must stay retryable,
+				// or that ordinary race turns into a spurious permanent
+				// file failure.
 				var errFlags uint8
-				if errors.Is(err, errAlreadyFinalized) {
+				if errors.Is(err, errAlreadyFinalized) || isPermanentDestErr(err) {
 					errFlags = FlagErrPermanent
 				}
 				sendDirErrorFlags(conn, magicBytes, err, errFlags)
@@ -2013,7 +2131,10 @@ func dirHandleConn(conn net.Conn, st *dirServerState, doneChan chan struct{}) er
 			// control connection out from under every other file still in
 			// flight.
 			if err := st.ft.MarkDone(msg.FileID); err != nil {
-				Log("directory server: finalize error for file %d: %v\n", msg.FileID, err)
+				// Bounded like the connection-error path above: on a full
+				// or read-only destination EVERY file finalizes with an
+				// error, and one line each is a flood, not a diagnosis.
+				st.finalizeErrLog.log(fmt.Sprintf("file %d", msg.FileID), "finalize error: "+err.Error())
 			}
 
 		case OpTreeDone:

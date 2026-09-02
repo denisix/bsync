@@ -204,6 +204,7 @@ func main() {
 	if workers == 0 {
 		Err("Worker count must be at least 1\n")
 	}
+	warnHighWorkerCount(int(workers))
 	if prefetchDepth < 0 {
 		Err("Prefetch depth cannot be negative\n")
 	}
@@ -555,4 +556,34 @@ func main() {
 			}
 		}
 	}
+}
+
+// highWorkerCountWarn is the -w value above which the warning fires. Well
+// past the 4-8 the docs recommend and past the 16-64 that is defensible for
+// a huge tree, so an ordinary tuned run never sees it.
+const highWorkerCountWarn = 64
+
+// warnHighWorkerCount tells the operator when -w is high enough to cost
+// more than it buys, and specifically when it exceeds what the process's
+// descriptor limit can support. It only warns -- the requested worker count
+// is always honored, since the server clamps its own open-file budget to
+// stay safe (see resolveOpenBudget) and the operator may know something
+// about their setup that this heuristic does not.
+func warnHighWorkerCount(workers int) {
+	if workers <= highWorkerCountWarn {
+		return
+	}
+	// Each worker costs a socket on both sides plus up to 4 concurrently
+	// open destination files on the server, and its own TCP buffers.
+	need := uint64(workers)*4 + uint64(workers) + fdReserve
+	if limit, ok := maxOpenFiles(); ok && need > limit {
+		Log("warning: -w %d needs about %d open files but this process may hold %d "+
+			"(RLIMIT_NOFILE); the destination will throttle itself and may still hit "+
+			"\"too many open files\". Raise it with `ulimit -n`, or use -w 16..64.\n",
+			workers, need, limit)
+		return
+	}
+	Log("warning: -w %d is far above the recommended range; 16..64 is enough to saturate "+
+		"a fast link and a fast disk, and each worker costs sockets, buffers and open "+
+		"files on both sides.\n", workers)
 }
